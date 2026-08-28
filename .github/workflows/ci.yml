@@ -57,3 +57,78 @@ jobs:
         run: |
           export CADENCE_DB_PATH="$RUNNER_TEMP/cadence-ci-mcp.db"
           timeout 5 cadence mcp < /dev/null
+
+  pypi-install-and-drive:
+    name: Install from PyPI registry (no editable/local source) + drive end-to-end
+    runs-on: ubuntu-latest
+    # This is the job R-06 needs: build-and-test above only ever exercises
+    # `pip install -e .` against the checkout, so a fix that lands on main
+    # but never actually reaches PyPI (or reaches it broken) would go
+    # undetected. This job never touches the checkout's source tree -- it
+    # resolves the version from pyproject.toml, waits for that exact
+    # version to be live on PyPI (publish.yml races this workflow on every
+    # push to main), installs it into a brand-new venv straight from the
+    # registry, and drives the installed console script from a directory
+    # outside the repo. If the version on main was never actually
+    # published, or the published wheel is broken, this job -- not a human
+    # -- is what turns red.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Wait for pyproject.toml's version to be live on PyPI
+        id: version
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Waiting for cadence-todo==$VERSION to be available on PyPI (publish.yml may still be running)..."
+          for i in $(seq 1 40); do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/cadence-todo/$VERSION/json")
+            if [ "$STATUS" = "200" ]; then
+              echo "cadence-todo $VERSION is live on PyPI."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "cadence-todo $VERSION never appeared on PyPI within the timeout."
+          exit 1
+
+      - name: Install cadence-todo from PyPI into a fresh venv (no -e, no local source)
+        run: |
+          python -m venv "$RUNNER_TEMP/pypi-venv"
+          source "$RUNNER_TEMP/pypi-venv/bin/activate"
+          python -m pip install --upgrade pip
+          pip install "cadence-todo==${{ steps.version.outputs.version }}"
+          echo "$RUNNER_TEMP/pypi-venv/bin" >> "$GITHUB_PATH"
+
+      - name: CLI smoke check against the PyPI-installed package, run outside the repo
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p pypi-drive && cd pypi-drive
+          which cadence
+          cadence --version || true
+          export CADENCE_DB_PATH="$RUNNER_TEMP/cadence-pypi-ci.db"
+          cadence add "PyPI CI smoke task" --priority high
+          cadence list
+          cadence done 1
+          cadence list
+          set +e
+          cadence done 999
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit code 1 for a malformed/unknown id, got $code"
+            exit 1
+          fi
+
+      - name: MCP server starts cleanly over stdio (PyPI-installed package)
+        working-directory: ${{ runner.temp }}
+        run: |
+          cd pypi-drive
+          export CADENCE_DB_PATH="$RUNNER_TEMP/cadence-pypi-ci-mcp.db"
+          timeout 5 cadence mcp < /dev/null
