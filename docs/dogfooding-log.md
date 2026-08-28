@@ -78,3 +78,17 @@ Store contents as of this entry (`cadence list`, `COLUMNS=120`,
 yet. Full command transcript for this session is in
 `/workspace/dogfood_mcp_add.py` (the MCP seed) plus shell history captured
 in the task evidence for `task_01a049385447118fa9bce0f6`.
+
+## Week 1 — 2026-08-28 (Rafael Okonkwo, Build): cmd_add exit-code fix
+
+Friction found through the team's own CLI use of `cadence add`, not a
+synthetic fuzz case: `cadence add "x" --priority ""` exited 2 (the
+store/internal code) instead of 1 (the user-input code) per
+docs/human-surface.md §4.4, because `cmd_add`'s exception handler hardcoded
+`code=2` for *every* `CadenceError` raised by `store.add()`, not just a
+genuine store failure. Independently reproduced by Noor and Dov (Red Team)
+against a clean checkout. Fixed by only overriding to code 2 when the
+exception is `StoreUnavailable`, matching how `cmd_done`/`cmd_schedule`
+already behaved; a real store failure still exits 2 because `Store()`
+raises before `cmd_add`'s own try block even starts, so it escapes to
+`main()`'s top-level catch-all regardless of this change.

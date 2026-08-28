@@ -250,3 +250,39 @@ def test_task_not_found_hint_points_at_a_real_command(store):
     with pytest.raises(TaskNotFound) as excinfo:
         store.complete(999)
     assert excinfo.value.hint == "Run 'cadence list' to see valid ids."
+
+
+def test_cli_add_empty_priority_exits_1_not_2(tmp_path):
+    # Red Team pass-3 addendum: `--priority ""` is falsy, so the CLI's own
+    # `if args.priority and ...` fast-path pre-check (a user-input error,
+    # correctly exit 1) never runs, and store.add() raises InvalidTask --
+    # still a user-input error, so it must still exit 1 per §4.4, not the
+    # store/internal exit code 2 that cmd_add used to hardcode for every
+    # CadenceError it caught.
+    env = {**os.environ, "CADENCE_DB_PATH": str(tmp_path / "cli_empty_priority.db")}
+    result = subprocess.run(
+        [sys.executable, "-m", "cadence.cli", "add", "x", "--priority", ""],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 1, result.stderr
+    assert result.stdout.startswith("Error: ")
+    assert "priority" in result.stdout
+
+
+def test_cli_add_bad_db_path_directory_still_exits_2(tmp_path):
+    # A genuine store failure reaching cmd_add's except CadenceError handler
+    # (StoreUnavailable) must still be the internal/store exit code, 2 --
+    # the fix must not turn every CadenceError into exit 1.
+    bad_dir = tmp_path / "not_a_file_for_add"
+    bad_dir.mkdir()
+    env = {**os.environ, "CADENCE_DB_PATH": str(bad_dir)}
+    result = subprocess.run(
+        [sys.executable, "-m", "cadence.cli", "add", "x"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 2, result.stderr
+    assert result.stdout.startswith("Error: ")

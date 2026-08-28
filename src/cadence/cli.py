@@ -22,7 +22,7 @@ import shutil
 import sys
 import textwrap
 
-from cadence.store import CadenceError, Store
+from cadence.store import CadenceError, Store, StoreUnavailable
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -135,7 +135,11 @@ def cmd_add(args: argparse.Namespace) -> int:
     try:
         task = store.add(args.text, due=due, priority=args.priority)
     except CadenceError as exc:
-        _err(_format_err(exc), code=2)
+        # §4.4: code 2 is reserved for internal/store failures; everything
+        # store.add() can otherwise raise (bad title/priority/due that slipped
+        # past the fast-path pre-checks above, e.g. an empty --priority "")
+        # is a user-input error and must exit 1, matching cmd_done/cmd_schedule.
+        _err(_format_err(exc), code=2 if isinstance(exc, StoreUnavailable) else 1)
     print(f"Added #{task.id}: {task.title}")
     return 0
 
