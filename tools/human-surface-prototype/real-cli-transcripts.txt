@@ -1,0 +1,72 @@
+
+=== empty state (fresh install, no tasks) -- $ cadence list ===
+No tasks yet. Add one:
+  cadence add "Buy milk"
+
+=== add (happy path) -- $ cadence add ... ===
+Added #1: Buy milk
+Added #2: Renegotiate the lease
+Added #3: Renew passport
+Added #4: This is a two-hundred character task title that a real person might paste in verbatim from a meeting note instead of summarizing it, because summarizing takes a moment they did not feel like spendingg
+Done #2: Renegotiate the lease
+
+=== list, WIDE (120 cols), color-capable TTY -- $ COLUMNS=120 cadence list ===
+  ○  [2m  1[0m   Buy milk                                                                           [2m·[0m  due 2026-09-01
+  [32m✓[0m  [2m  2[0m   Renegotiate the lease                                                              [2m·[0m  done 2026-08-28
+  [31m![0m  [2m  3[0m   Renew passport                                                                     [2m·[0m  [31moverdue 27d[0m
+  ○  [2m  4[0m   This is a two-hundred character task title that a real person might paste in
+           verbatim from a meeting note instead of summarizing it, because summarizing takes
+           a moment they did not feel like spendingg
+
+=== list, NARROW (40 cols), color-capable TTY -- $ COLUMNS=40 cadence list (200-char title must wrap, never truncate) ===
+  ○  [2m  1[0m   Buy milk    [2m·[0m  due 2026-09-01
+  [32m✓[0m  [2m  2[0m   Renegotiate  [2m·[0m  done 2026-08-28
+           the lease
+  [31m![0m  [2m  3[0m   Renew       [2m·[0m  [31moverdue 27d[0m
+           passport
+  ○  [2m  4[0m   This is a
+           two-
+           hundred
+           character
+           task title
+           that a
+           real
+           person
+           might
+           paste in
+           verbatim
+           from a
+           meeting
+           note
+           instead of
+           summarizing
+           it,
+           because
+           summarizing
+           takes a
+           moment
+           they did
+           not feel
+           like
+           spendingg
+
+=== list, WIDE (120 cols), NO_COLOR=1 fallback, still a TTY -- $ NO_COLOR=1 COLUMNS=120 cadence list ===
+  [ ]    1   Buy milk                                                                           |  due 2026-09-01
+  [x]    2   Renegotiate the lease                                                              |  done 2026-08-28
+  [!]    3   Renew passport                                                                     |  overdue 27d
+  [ ]    4   This is a two-hundred character task title that a real person might paste in
+           verbatim from a meeting note instead of summarizing it, because summarizing takes
+           a moment they did not feel like spendingg
+
+=== field errors (malformed input), §4.4 ===
+$ cadence add
+Error: 'add' needs a task description. Try: cadence add "Buy milk"
+[exit code: 1]
+
+$ cadence schedule 3 tomorrow-ish
+Error: can't parse 'tomorrow-ish' as a date. Try: cadence schedule 3 2026-09-01
+[exit code: 1]
+
+$ cadence done 99
+Error: no task with id 99. Run 'cadence list' to see valid ids.
+[exit code: 1]
