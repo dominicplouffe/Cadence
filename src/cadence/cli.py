@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import shutil
 import sys
 import textwrap
 
@@ -83,7 +84,11 @@ def _render_row(task, width: int) -> str:
     id_col = f"{task.id:>3}"
     id_col = _c(DIM, id_col) if USE_COLOR else id_col
     title_col_width = max(10, width - 3 - 2 - 4 - 30)
-    wrapped = textwrap.wrap(task.title, width=title_col_width) or [""]
+    # break_long_words=False: a single word wider than the title column
+    # (e.g. "Renegotiate" at a narrow width) overflows its own line rather
+    # than being sliced mid-word -- a word cut in half is a worse defect
+    # than a line that runs a bit wide.
+    wrapped = textwrap.wrap(task.title, width=title_col_width, break_long_words=False) or [""]
     divider = _c(DIM, "·") if USE_COLOR else "|"
 
     if meta:
@@ -129,10 +134,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     if not tasks:
         print('No tasks yet. Add one:\n  cadence add "Buy milk"')
         return 0
-    try:
-        width = os.get_terminal_size().columns
-    except OSError:
-        width = 80
+    # shutil.get_terminal_size() checks the COLUMNS/LINES env vars before
+    # falling back to an ioctl query and then to (80, 24) -- os.get_
+    # terminal_size() skips the env-var check and can also return an
+    # unreliable size off a pty with no window size set, which silently
+    # produced wrong (too-narrow) wrapping. This is what makes
+    # `COLUMNS=100 cadence list` behave as documented for scripts/tests,
+    # and what a real user's terminal-width override should always do.
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
     for task in tasks:
         print(_render_row(task, width))
     return 0
