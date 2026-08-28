@@ -1,0 +1,28 @@
+name: CI
+
+# Placeholder CI scaffold. This will be replaced with the real build/test
+# pipeline once the Build team has picked the implementation stack (see
+# docs/bakeoff.md for the concept decision). Until then this workflow only
+# proves that Actions runs green from a fresh checkout on a clean runner —
+# it does not yet build, test, or publish anything.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  placeholder:
+    name: Placeholder (no-op until stack is chosen)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Confirm checkout and note pending work
+        run: |
+          echo "Fresh checkout succeeded on a clean GitHub-hosted runner."
+          echo "Real build/test/e2e steps land once the Build stage picks a stack."
+          ls -la
