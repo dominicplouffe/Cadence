@@ -36,6 +36,20 @@ def _err(exc: CadenceError) -> dict:
     return {"ok": False, "error": exc.code, "message": exc.message, "hint": exc.hint}
 
 
+def _err_unexpected(exc: Exception) -> dict:
+    """Last-resort net: turn anything CadenceError doesn't already cover
+    into the same {ok, error, message, hint} shape instead of letting it
+    escape the tool call, where FastMCP would otherwise return it as
+    isError=true with the raw exception text -- a shape no agent's `ok`
+    branch is written to expect (Red Team pass-1 finding #2, case d)."""
+    return {
+        "ok": False,
+        "error": "internal_error",
+        "message": f"{type(exc).__name__}: {exc}",
+        "hint": "Run list_tasks to check current state, or check CADENCE_DB_PATH.",
+    }
+
+
 @mcp.tool()
 def add_task(
     title: str, due: Optional[str] = None, priority: Optional[str] = None
@@ -57,6 +71,8 @@ def add_task(
         return {"ok": True, "task": task.to_dict()}
     except CadenceError as exc:
         return _err(exc)
+    except Exception as exc:
+        return _err_unexpected(exc)
 
 
 @mcp.tool()
@@ -75,6 +91,8 @@ def list_tasks(status: str = "pending") -> dict:
         return {"ok": True, "tasks": [t.to_dict() for t in tasks], "count": len(tasks)}
     except CadenceError as exc:
         return _err(exc)
+    except Exception as exc:
+        return _err_unexpected(exc)
 
 
 @mcp.tool()
@@ -94,6 +112,8 @@ def complete_task(id: int) -> dict:
         return {"ok": True, "task": task.to_dict()}
     except CadenceError as exc:
         return _err(exc)
+    except Exception as exc:
+        return _err_unexpected(exc)
 
 
 @mcp.tool()
@@ -114,6 +134,8 @@ def schedule_task(id: int, due: str) -> dict:
         return {"ok": True, "task": task.to_dict()}
     except CadenceError as exc:
         return _err(exc)
+    except Exception as exc:
+        return _err_unexpected(exc)
 
 
 def run() -> None:

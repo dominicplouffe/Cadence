@@ -42,6 +42,18 @@ def _err(msg: str, code: int = 1) -> "NoReturn":
     sys.exit(code)
 
 
+def _format_err(exc: CadenceError) -> str:
+    """Render a CadenceError as the two-sentence shape docs/human-surface.md
+    §4.4 specifies: (1) what was wrong, (2) the exact next step -- using the
+    message/hint the error was raised with, verbatim, rather than a second
+    hand-written copy of the same idea drifting out of sync with it."""
+    msg = exc.message
+    if exc.hint:
+        sep = "" if msg.rstrip().endswith((".", "!", "?")) else "."
+        msg = f"{msg}{sep} {exc.hint}"
+    return msg
+
+
 def _parse_date(s: str):
     try:
         return datetime.date.fromisoformat(s).isoformat()
@@ -123,7 +135,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     try:
         task = store.add(args.text, due=due, priority=args.priority)
     except CadenceError as exc:
-        _err(exc.message, code=2)
+        _err(_format_err(exc), code=2)
     print(f"Added #{task.id}: {task.title}")
     return 0
 
@@ -152,8 +164,8 @@ def cmd_done(args: argparse.Namespace) -> int:
     store = Store()
     try:
         task = store.complete(task_id)
-    except CadenceError:
-        _err(f"no task with id {args.id}. Run 'cadence list' to see valid ids.")
+    except CadenceError as exc:
+        _err(_format_err(exc))
     print(f"Done #{task.id}: {task.title}")
     return 0
 
@@ -166,8 +178,8 @@ def cmd_schedule(args: argparse.Namespace) -> int:
     store = Store()
     try:
         task = store.schedule(task_id, due)
-    except CadenceError:
-        _err(f"no task with id {args.id}. Run 'cadence list' to see valid ids.")
+    except CadenceError as exc:
+        _err(_format_err(exc))
     print(f"Scheduled #{task.id} for {due}: {task.title}")
     return 0
 
@@ -220,7 +232,17 @@ def main(argv=None) -> int:
     try:
         return args.func(args)
     except CadenceError as exc:
-        _err(exc.message, code=2)
+        _err(_format_err(exc), code=2)
+    except Exception as exc:  # pragma: no cover -- last-resort net, not a
+        # designed path. docs/human-surface.md §4.4: "Never a stack trace,
+        # never a bare exit code, never generic invalid input." Anything
+        # that reaches here is a bug in Cadence, not the user's request, so
+        # it gets the store/internal exit code (2), not the input one (1).
+        _err(
+            f"something went wrong on Cadence's end ({type(exc).__name__}: {exc}). "
+            "Run 'cadence list' to check your tasks, or check CADENCE_DB_PATH.",
+            code=2,
+        )
     return 0
 
 

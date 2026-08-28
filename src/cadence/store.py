@@ -10,7 +10,7 @@ import os
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +51,14 @@ class InvalidTask(CadenceError):
     code = "invalid_task"
 
 
+class StoreUnavailable(CadenceError):
+    """The store file itself can't be opened/read (bad CADENCE_DB_PATH,
+    corrupt file) -- distinct from a bad request, this is an internal/store
+    error per docs/human-surface.md §4.4 (exit code 2, not 1)."""
+
+    code = "store_unavailable"
+
+
 def default_db_path() -> Path:
     """Resolve the store location, honoring CADENCE_DB_PATH for tests/agents
     that want an isolated scratch store instead of the user's real data."""
@@ -64,6 +72,32 @@ def default_db_path() -> Path:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _validate_due(due: str) -> str:
+    """Validate/normalize a due-date string to ISO 'YYYY-MM-DD'.
+
+    Store-side, so every writer of `due` -- the CLI's `schedule`/`add`, the
+    MCP `schedule_task`/`add_task` tools, or any future surface -- hits the
+    same rule and none of them can write a value the other can't render.
+    The CLI already pre-validates for a fast, contextual error message; this
+    is the guard that makes that pre-validation a UX nicety rather than the
+    only thing standing between an agent and a permanently broken `list`
+    (Red Team pass-1 finding #1).
+    """
+    due = (due or "").strip()
+    if not due:
+        raise InvalidTask(
+            "due must be a non-empty date/time string",
+            hint="Use an ISO date like 2026-09-01.",
+        )
+    try:
+        return date.fromisoformat(due).isoformat()
+    except ValueError:
+        raise InvalidTask(
+            f"can't parse '{due}' as a date",
+            hint="Use an ISO date like 2026-09-01.",
+        )
 
 
 @dataclass
@@ -86,9 +120,19 @@ class Store:
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = Path(db_path) if db_path else default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(self._connect()) as conn:
-            conn.execute(SCHEMA)
-            conn.commit()
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute(SCHEMA)
+                conn.commit()
+        except sqlite3.Error as exc:
+            # e.g. CADENCE_DB_PATH points at a directory ("unable to open
+            # database file") or a non-sqlite file ("file is not a
+            # database") -- both otherwise surface as a raw sqlite3
+            # traceback on every command (Red Team pass-1 finding #2).
+            raise StoreUnavailable(
+                f"can't open the task store at '{self.db_path}' ({exc})",
+                hint="Check CADENCE_DB_PATH, or unset it to use the default store.",
+            ) from exc
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -124,6 +168,8 @@ class Store:
                 f"priority must be one of {VALID_PRIORITIES}, got {priority!r}",
                 hint="Use one of: low, med, high.",
             )
+        if due is not None:
+            due = _validate_due(due)
         with closing(self._connect()) as conn:
             cur = conn.execute(
                 "INSERT INTO tasks (title, status, priority, due, created_at) "
@@ -165,11 +211,21 @@ class Store:
         owns_conn = _conn is None
         conn = _conn or self._connect()
         try:
-            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+            except OverflowError:
+                # sqlite's C API caps bound integers at 64 bits; an id an
+                # agent could plausibly pass (e.g. copy-pasted from the
+                # wrong field) overflows that and previously raised a raw
+                # OverflowError instead of the same "not found" an
+                # out-of-range-but-small id gets (Red Team pass-1 #2).
+                row = None
             if row is None:
                 raise TaskNotFound(
                     f"no task with id {task_id}",
-                    hint="Run `cadence list --all` to see valid ids.",
+                    hint="Run 'cadence list' to see valid ids.",
                 )
             return self._row_to_task(row)
         finally:
@@ -187,12 +243,7 @@ class Store:
             return self.get(task_id, _conn=conn)
 
     def schedule(self, task_id: int, due: str) -> Task:
-        due = (due or "").strip()
-        if not due:
-            raise InvalidTask(
-                "due must be a non-empty date/time string",
-                hint="Use an ISO date like 2026-09-01.",
-            )
+        due = _validate_due(due)
         with closing(self._connect()) as conn:
             self.get(task_id, _conn=conn)
             conn.execute("UPDATE tasks SET due = ? WHERE id = ?", (due, int(task_id)))

@@ -3,6 +3,7 @@
 Each test uses a fresh scratch DB (tmp_path) via CADENCE_DB_PATH so nothing
 here touches a real user's ~/.cadence store.
 """
+import os
 import subprocess
 import sys
 
@@ -133,3 +134,119 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     )
     assert empty_add.returncode == 1
     assert "Try: cadence add" in empty_add.stdout
+
+
+# --- Regression tests: Red Team pass-1 findings #1 (critical), #2 (high),
+# and #4 (low-medium), all confirmed reproduced against the shipped wheel
+# in pass-2. See /workspace/redteam_run1/findings_pass1.md and
+# findings_pass2.md for the original repros these are drawn from.
+
+
+def test_schedule_rejects_invalid_due_store_side(store):
+    # #1: the agent surface (schedule_task) must be rejected by the *store*,
+    # not only by the CLI's own pre-check -- this calls Store.schedule
+    # directly, bypassing the CLI entirely, the way MCP's schedule_task does.
+    task = store.add("Ship it")
+    with pytest.raises(InvalidTask):
+        store.schedule(task.id, "banana")
+
+
+def test_add_rejects_invalid_due_store_side(store):
+    with pytest.raises(InvalidTask):
+        store.add("Bad due", due="banana")
+
+
+def test_mcp_schedule_task_rejects_bad_due_and_list_survives(tmp_path, monkeypatch):
+    # The actual pass-1/pass-2 repro: schedule_task used to write the
+    # garbage due date, then every future list_tasks/`cadence list` crashed
+    # forever with no recovery. Confirms both halves: the write is rejected,
+    # and a subsequent list still works.
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_due.db"))
+    from cadence.mcp_server import add_task, list_tasks, schedule_task
+
+    task_id = add_task("test")["task"]["id"]
+
+    result = schedule_task(task_id, "banana")
+    assert result["ok"] is False
+    assert result["error"] == "invalid_task"
+    assert "banana" in result["message"]
+    assert result["hint"]
+
+    listed = list_tasks(status="all")
+    assert listed["ok"] is True
+    assert listed["tasks"][0]["due"] is None
+
+
+def test_mcp_add_task_rejects_bad_due(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_add_due.db"))
+    from cadence.mcp_server import add_task
+
+    result = add_task("garbage due via add", due="banana")
+    assert result["ok"] is False
+    assert result["error"] == "invalid_task"
+
+
+def test_overflow_id_raises_named_error_not_a_crash(store):
+    # #2 case (a)/(d): a huge id (e.g. copy-pasted from the wrong field)
+    # previously raised a raw OverflowError out of sqlite3's C binding
+    # instead of the same "not found" a normal unknown id gets.
+    huge_id = 999999999999999999999999
+    with pytest.raises(TaskNotFound):
+        store.complete(huge_id)
+
+
+def test_mcp_complete_task_overflow_id_is_structured(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_overflow.db"))
+    from cadence.mcp_server import complete_task
+
+    result = complete_task(999999999999999999999999)
+    assert result["ok"] is False
+    assert result["error"] == "task_not_found"
+
+
+def test_cli_overflow_id_returns_structured_error_not_traceback(tmp_path):
+    env = {**os.environ, "CADENCE_DB_PATH": str(tmp_path / "cli_overflow.db")}
+    result = subprocess.run(
+        [sys.executable, "-m", "cadence.cli", "done", "999999999999999999999999"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 1, result.stderr
+    assert result.stdout.startswith("Error: no task with id")
+    assert "Traceback" not in result.stderr
+    assert "Traceback" not in result.stdout
+
+
+def test_cli_bad_db_path_directory_returns_structured_error_not_traceback(tmp_path):
+    # #2 case (b): CADENCE_DB_PATH pointing at a directory instead of a file.
+    bad_dir = tmp_path / "not_a_file"
+    bad_dir.mkdir()
+    env = {**os.environ, "CADENCE_DB_PATH": str(bad_dir)}
+    result = subprocess.run(
+        [sys.executable, "-m", "cadence.cli", "list"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 2, result.stderr
+    assert result.stdout.startswith("Error: ")
+    assert "Traceback" not in result.stderr
+    assert "Traceback" not in result.stdout
+
+
+def test_store_bad_db_path_directory_raises_named_error(tmp_path):
+    from cadence.store import StoreUnavailable
+
+    bad_dir = tmp_path / "another_dir"
+    bad_dir.mkdir()
+    with pytest.raises(StoreUnavailable):
+        Store(db_path=bad_dir)
+
+
+def test_task_not_found_hint_points_at_a_real_command(store):
+    # #4: the hint used to say `cadence list --all`, a flag that doesn't
+    # exist.
+    with pytest.raises(TaskNotFound) as excinfo:
+        store.complete(999)
+    assert excinfo.value.hint == "Run 'cadence list' to see valid ids."
