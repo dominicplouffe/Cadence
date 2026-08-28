@@ -4,13 +4,15 @@ name: Publish
 # (vX.Y.Z) is pushed. This is a single-button release: tag the commit,
 # push the tag, this workflow does the rest.
 #
-# Authentication supports EITHER of two paths, whichever has actually been
-# configured -- neither is hardcoded in a way that blocks the other:
-#   1. PyPI Trusted Publishing (OIDC): no secret needed. Configure the
-#      "pypi" publisher on the PyPI project settings page pointing at this
-#      repo/workflow, and leave the PYPI_API_TOKEN secret unset.
-#   2. A classic API-token secret named PYPI_API_TOKEN (repo or
-#      environment secret). If it is set, it takes precedence.
+# Publishes with the classic PYPI_API_TOKEN repo secret. (An earlier
+# version of this workflow tried to branch between that and Trusted
+# Publishing/OIDC using `if: secrets.PYPI_API_TOKEN != ''` on each step --
+# GitHub's workflow parser rejects the `secrets` context inside an `if:`
+# conditional for any job that also declares `environment:`, which made
+# every run of this workflow fail at parse time with zero jobs queued,
+# on every push, silently. Keeping it to one unconditional path avoids
+# that trap. Switch to Trusted Publishing by removing the `password:`
+# line below once a "pypi" publisher is configured on the PyPI project.
 
 on:
   push:
@@ -53,12 +55,8 @@ jobs:
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
     permissions:
-      # Needed for Trusted Publishing (OIDC). No-op / harmless if the
-      # PYPI_API_TOKEN secret path is used instead.
-      id-token: write
+      contents: read
     steps:
       - name: Download built distributions
         uses: actions/download-artifact@v4
@@ -66,12 +64,7 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish to PyPI (API-token secret)
-        if: ${{ secrets.PYPI_API_TOKEN != '' }}
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
-
-      - name: Publish to PyPI (Trusted Publishing / OIDC)
-        if: ${{ secrets.PYPI_API_TOKEN == '' }}
-        uses: pypa/gh-action-pypi-publish@release/v1
