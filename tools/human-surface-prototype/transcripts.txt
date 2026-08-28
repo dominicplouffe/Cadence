@@ -1,0 +1,66 @@
+Cadence human-surface prototype -- captured transcripts
+Run at: 2026-08-28T16:15:05Z
+
+=== empty state ===
+No tasks yet. Add one:
+  cadence add "Buy milk"
+
+=== add (happy path) ===
+Added #1: Buy milk
+Added #2: Renegotiate the lease
+Added #3: Renew passport
+Added #4: This is a very long task title that a real user might plausibly type when venting a whole request into the box instead of writing a short summary of it up front for once in their life.
+Done #2: Renegotiate the lease
+
+=== list, WIDE (120 cols), color-capable TTY ===
+  ○  [2m  1[0m   Buy milk                                                                           [2m·[0m  due 2026-09-01
+  [32m✓[0m  [2m  2[0m   Renegotiate the lease                                                              [2m·[0m  done 2026-08-28
+  [31m![0m  [2m  3[0m   Renew passport                                                                     [2m·[0m  [31moverdue 27d[0m
+  ○  [2m  4[0m   This is a very long task title that a real user might plausibly type when venting
+           a whole request into the box instead of writing a short summary of it up front
+           for once in their life.
+
+=== list, NARROW (40 cols), color-capable TTY (wrap, no truncation, no mid-word breaks) ===
+  ○  [2m  1[0m   Buy milk    [2m·[0m  due 2026-09-01
+  [32m✓[0m  [2m  2[0m   Renegotiate  [2m·[0m  done 2026-08-28
+           the lease
+  [31m![0m  [2m  3[0m   Renew       [2m·[0m  [31moverdue 27d[0m
+           passport
+  ○  [2m  4[0m   This is a
+           very long
+           task title
+           that a
+           real user
+           might
+           plausibly
+           type when
+           venting a
+           whole
+           request
+           into the
+           box
+           instead of
+           writing a
+           short
+           summary of
+           it up
+           front for
+           once in
+           their
+           life.
+
+=== list, WIDE, NO_COLOR=1 fallback ===
+  [ ]    1   Buy milk                                                                           |  due 2026-09-01
+  [x]    2   Renegotiate the lease                                                              |  done 2026-08-28
+  [!]    3   Renew passport                                                                     |  overdue 27d
+  [ ]    4   This is a very long task title that a real user might plausibly type when venting
+           a whole request into the box instead of writing a short summary of it up front
+           for once in their life.
+
+=== field errors (malformed input) ===
+Error: 'add' needs a task description. Try: cadence add "Buy milk"
+[exit code: 1]
+Error: can't parse 'tomorrow-ish' as a date. Try: cadence schedule 3 2026-09-01
+[exit code: 1]
+Error: no task with id 99. Run 'cadence list' to see valid ids.
+[exit code: 1]
