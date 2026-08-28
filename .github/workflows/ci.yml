@@ -1,10 +1,9 @@
 name: CI
 
-# Placeholder CI scaffold. This will be replaced with the real build/test
-# pipeline once the Build team has picked the implementation stack (see
-# docs/bakeoff.md for the concept decision). Until then this workflow only
-# proves that Actions runs green from a fresh checkout on a clean runner —
-# it does not yet build, test, or publish anything.
+# Builds and tests the real Cadence package (CLI + MCP server) on a clean
+# GitHub-hosted runner from a fresh checkout: install, then run the test
+# suite, which drives the actual CLI subprocess and the actual MCP tool
+# functions -- not a mock of either surface.
 
 on:
   push:
@@ -14,15 +13,47 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  placeholder:
-    name: Placeholder (no-op until stack is chosen)
+  build-and-test:
+    name: Install + test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Confirm checkout and note pending work
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Cadence (editable) + test deps
         run: |
-          echo "Fresh checkout succeeded on a clean GitHub-hosted runner."
-          echo "Real build/test/e2e steps land once the Build stage picks a stack."
-          ls -la
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run test suite
+        run: pytest -q
+
+      - name: CLI smoke check (fresh install, real subprocess, scratch store)
+        run: |
+          export CADENCE_DB_PATH="$RUNNER_TEMP/cadence-ci.db"
+          cadence add "CI smoke task" --priority high
+          cadence list
+          cadence done 1
+          cadence list
+          set +e
+          cadence done 999
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit code 1 for a malformed/unknown id, got $code"
+            exit 1
+          fi
+
+      - name: MCP server starts cleanly over stdio
+        run: |
+          export CADENCE_DB_PATH="$RUNNER_TEMP/cadence-ci-mcp.db"
+          timeout 5 cadence mcp < /dev/null

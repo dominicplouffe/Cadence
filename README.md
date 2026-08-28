@@ -9,10 +9,42 @@ by **6 November 2026**. That date is a delivery commitment, not an estimate.
 
 ## Status
 
-This repository is in its bake-off / early-build phase. Nothing here is
-installable yet. See [`docs/bakeoff.md`](docs/bakeoff.md) for the five
-candidate concepts we researched, the evidence behind each, and which one we
-chose and why.
+Early build. Not yet published to a package registry (see the finish-line
+checklist below) but it builds, runs, and is tested from a fresh clone.
+See [`docs/bakeoff.md`](docs/bakeoff.md) for the five candidate concepts we
+researched, the evidence behind each, and which one we chose and why, and
+[`docs/human-surface.md`](docs/human-surface.md) for the CLI's binding
+design spec.
+
+## Try it from a fresh clone
+
+```
+git clone https://github.com/dominicplouffe/Cadence.git
+cd Cadence
+pip install -e .
+cadence add "Buy milk" --due 2026-09-01 --priority high
+cadence list
+cadence done 1
+```
+
+By default tasks live in `~/.cadence/cadence.db` (a local SQLite file).
+Set `CADENCE_DB_PATH` to point at a scratch file instead (used by the test
+suite and useful for an agent that wants an isolated store).
+
+Start the MCP server (agent surface) over stdio, exposing `add_task`,
+`list_tasks`, `complete_task`, and `schedule_task` as tools with structured
+JSON returns:
+
+```
+cadence mcp
+```
+
+Run the test suite:
+
+```
+pip install pytest
+pytest -q
+```
 
 ## What "agentic-first" means here
 
