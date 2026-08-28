@@ -22,7 +22,7 @@ import shutil
 import sys
 import textwrap
 
-from cadence.store import CadenceError, Store, StoreUnavailable
+from cadence.store import CadenceError, MAX_TITLE_LEN, Store, StoreUnavailable
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -118,6 +118,11 @@ def cmd_add(args: argparse.Namespace) -> int:
     text = (args.text or "").strip()
     if not text:
         _err('\'add\' needs a task description. Try: cadence add "Buy milk"')
+    if len(text) > MAX_TITLE_LEN:
+        # Fast-path pre-check, same shape as the due/priority checks below:
+        # reject before opening the store, using the exact wording
+        # store.add() would raise anyway (Red Team pass-3 finding #5).
+        _err(f"title is {len(text)} characters, max {MAX_TITLE_LEN}. Try a shorter one.")
     due = None
     if args.due:
         due = _parse_date(args.due)

@@ -92,3 +92,22 @@ exception is `StoreUnavailable`, matching how `cmd_done`/`cmd_schedule`
 already behaved; a real store failure still exits 2 because `Store()`
 raises before `cmd_add`'s own try block even starts, so it escapes to
 `main()`'s top-level catch-all regardless of this change.
+
+## Week 1 — 2026-08-28 (Rafael Okonkwo, Build): title has no max length
+
+Friction-driven, found via Red Team's own use of the CLI (pass-3 finding
+#5, a 5000-char repro), not a synthetic edge case dreamed up in isolation:
+`cadence add` accepted a title of any length, and `cadence list` then
+dumped hundreds of wrapped lines for that one row, breaking the table
+layout the whole point of `list` is to keep scannable. docs/human-surface.md
+never set a ceiling, but it had already tested wrap behavior against a
+200-character title (§6/§7), so 200 is a documented, exercised limit, not
+an arbitrary new one. Fixed store-side in `Store.add()` (`MAX_TITLE_LEN`,
+same "single source of truth for every writer" pattern already used for
+due-date validation), with matching fast-path pre-checks in both `cmd_add`
+(cli.py) and `add_task` (mcp_server.py) so a human and an agent get the
+same two-sentence §4.4-shaped rejection before either surface touches the
+store: `Error: title is 201 characters, max 200. Try a shorter one.` on
+the CLI, `{"ok": false, "error": "invalid_task", "message": "title is 201
+characters, max 200", "hint": "Try a shorter one."}` from MCP. A 200-char
+title still succeeds on both surfaces.

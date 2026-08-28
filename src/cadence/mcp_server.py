@@ -18,7 +18,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from cadence.store import CadenceError, Store
+from cadence.store import CadenceError, InvalidTask, MAX_TITLE_LEN, Store
 
 mcp = FastMCP(
     "cadence",
@@ -57,16 +57,25 @@ def add_task(
     """Create a new task.
 
     Args:
-        title: Non-empty task title.
+        title: Non-empty task title, max 200 characters.
         due: Optional ISO date string, e.g. "2026-09-01".
         priority: Optional, one of "low", "med", "high". Omit for no priority.
 
     Returns:
         {"ok": true, "task": {id, title, status, priority, due,
         created_at, completed_at}} on success, or {"ok": false, "error",
-        "message", "hint"} if title is empty or priority is invalid.
+        "message", "hint"} if title is empty, over 200 characters, or
+        priority is invalid.
     """
     try:
+        if len(title or "") > MAX_TITLE_LEN:
+            # Fast-path pre-check, matching cli.py's cmd_add: reject before
+            # hitting the store, same wording store.add() would raise
+            # anyway (Red Team pass-3 finding #5).
+            raise InvalidTask(
+                f"title is {len(title)} characters, max {MAX_TITLE_LEN}",
+                hint="Try a shorter one.",
+            )
         task = Store().add(title, due=due, priority=priority)
         return {"ok": True, "task": task.to_dict()}
     except CadenceError as exc:

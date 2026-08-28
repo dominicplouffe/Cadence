@@ -271,6 +271,68 @@ def test_cli_add_empty_priority_exits_1_not_2(tmp_path):
     assert "priority" in result.stdout
 
 
+# --- Regression tests: Red Team pass-3 finding #5 (title has no max
+# length; a 5000-char repro broke `cadence list`'s table layout). 200
+# chars matches the longest title docs/human-surface.md actually tested
+# wrap behavior against.
+
+
+def test_add_rejects_over_length_title_store_side(store):
+    with pytest.raises(InvalidTask):
+        store.add("x" * 201)
+
+
+def test_add_accepts_title_at_max_length_store_side(store):
+    task = store.add("y" * 200)
+    assert len(task.title) == 200
+
+
+def test_mcp_add_task_rejects_over_length_title(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_title_len.db"))
+    from cadence.mcp_server import add_task
+
+    result = add_task("x" * 201)
+    assert result["ok"] is False
+    assert result["error"] == "invalid_task"
+    assert "201" in result["message"]
+    assert "200" in result["message"]
+    assert result["hint"]
+
+
+def test_mcp_add_task_accepts_title_at_max_length(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_title_ok.db"))
+    from cadence.mcp_server import add_task
+
+    result = add_task("y" * 200)
+    assert result["ok"] is True
+    assert len(result["task"]["title"]) == 200
+
+
+def test_cli_add_over_length_title_exits_1(tmp_path):
+    env = {**os.environ, "CADENCE_DB_PATH": str(tmp_path / "cli_title_len.db")}
+    result = subprocess.run(
+        [sys.executable, "-m", "cadence.cli", "add", "x" * 201],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 1, result.stderr
+    assert result.stdout.startswith("Error: title is 201 characters, max 200.")
+    assert "Try a shorter one." in result.stdout
+
+
+def test_cli_add_title_at_max_length_succeeds(tmp_path):
+    env = {**os.environ, "CADENCE_DB_PATH": str(tmp_path / "cli_title_ok.db")}
+    result = subprocess.run(
+        [sys.executable, "-m", "cadence.cli", "add", "y" * 200],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("Added #1:")
+
+
 def test_cli_add_bad_db_path_directory_still_exits_2(tmp_path):
     # A genuine store failure reaching cmd_add's except CadenceError handler
     # (StoreUnavailable) must still be the internal/store exit code, 2 --

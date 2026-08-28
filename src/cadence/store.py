@@ -19,6 +19,14 @@ from typing import Optional
 VALID_PRIORITIES = ("low", "med", "high")
 VALID_STATUSES = ("pending", "done")
 
+### Red Team pass-3 finding #5: an unbounded title (5000+ chars reproduced)
+### makes `cadence list` dump hundreds of wrapped lines for one row, breaking
+### the table layout docs/human-surface.md §5 promises. 200 matches the
+### longest title docs/human-surface.md §6/§7 actually tested the wrap
+### behavior against, so it's a documented, exercised ceiling, not an
+### arbitrary one.
+MAX_TITLE_LEN = 200
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,6 +170,13 @@ class Store:
             raise InvalidTask(
                 "title must be a non-empty string",
                 hint="Call add with a `title` argument, e.g. add(title='Ship the CLI').",
+            )
+        if len(title) > MAX_TITLE_LEN:
+            # Store-side, so every writer (CLI, MCP, or any future surface)
+            # hits the same rule -- same reasoning as _validate_due below.
+            raise InvalidTask(
+                f"title is {len(title)} characters, max {MAX_TITLE_LEN}",
+                hint="Try a shorter one.",
             )
         if priority is not None and priority not in VALID_PRIORITIES:
             raise InvalidTask(
