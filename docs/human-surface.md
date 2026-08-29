@@ -165,6 +165,127 @@ each with the one-line form and one worked example — this is the CLI's
 implemented, and no implemented verb is missing from here (checked by the
 prototype's own test in step 6 below).
 
+### 4.7 Decompose (R-08)
+
+```
+$ cadence decompose 4 --into "Buy flour" "Buy eggs" "Preheat oven"
+Decomposed #4 into 3 subtasks: #12, #13, #14
+```
+Subtasks render under their parent in `list` output using the existing
+two-space-per-level indent rule (§3), never as a separate view:
+```
+  ○  4   Bake a cake                            ·  3 open subtasks
+    ○  12  Buy flour
+    ○  13  Buy eggs
+    ✓  14  Preheat oven                         ·  done 2026-08-29
+```
+The parent row's metadata column shows an open-subtask count instead of its
+own due/priority once it has children — a parent with subtasks is tracked
+through them, not in parallel with them. Cadence does not do the "turn a
+vague request into subtasks" reasoning itself — that's the calling agent's
+job (per the bake-off's own finding that no existing tool does this) —
+`decompose` is purely the structural primitive: it links titles the caller
+already wrote to a parent, atomically, as one call instead of N.
+
+Bounded by construction, same rationale as the runner-up concept's spike
+(bakeoff.md, Concept 5): **max depth 3, max 20 subtasks per parent**, so a
+looping agent can't decompose forever. Both are errors per §4.4's shape,
+not silent clamping:
+```
+$ cadence decompose 4
+Error: 'decompose' needs at least one subtask. Try: cadence decompose 4 --into "Buy flour" "Buy eggs"
+
+$ cadence decompose 15 --into "x"
+Error: task #15 is already at max decomposition depth (3). Try decomposing a top-level task instead.
+
+$ cadence decompose 4 --into t1 t2 ... t21
+Error: 'decompose' takes at most 20 subtasks per call, got 21. Split into two decompose calls.
+```
+
+### 4.8 Reprioritise
+
+```
+$ cadence reprioritise 4 high
+Reprioritised #4 (med → high): Buy milk
+```
+Distinct verb from setting priority at creation time (`cadence add --priority`)
+because re-prioritising an *existing, possibly mid-flight* task is the
+ten-step script's own step and deserves its own audit-log entry (§4.9)
+rather than being folded into `add`. Same two-sentence error shape as every
+other field error:
+```
+$ cadence reprioritise 4 urgent
+Error: 'urgent' isn't a priority. Try: cadence reprioritise 4 high (low, med, or high)
+```
+**`list` ordering, corrected:** open tasks sort by priority (high → med →
+low) then id ascending within a tier; done tasks always sort after open
+ones, by done-date descending. This makes `list_tasks`'s docstring true
+instead of aspirational — Red Team pass-1 finding #3 was that the docstring
+claimed priority ordering while the store actually used insertion order;
+this section is the spec Build implements against, not new copy invented
+to patch around the bug.
+
+### 4.9 Undo
+
+```
+$ cadence undo
+Undid: Done #4 → reopened "Buy milk"
+```
+Undo reverts the single most recent mutation in the store's commit log
+(git-backed per the bake-off's chosen storage model), regardless of which
+surface — CLI or agent/MCP — made it; there is no per-task undo argument,
+because "what happened most recently" is the one unambiguous target and
+matches how a person actually thinks about undo. Reverting is itself a new
+commit, which makes undo naturally symmetric with no separate redo verb:
+running `cadence undo` twice in a row returns to the pre-undo state (the
+second undo reverts the first). This is the git-log-as-audit-trail "wow"
+capability from bakeoff.md made concrete as a command, not just a
+`git log` party trick for people comfortable with git.
+```
+Error: no mutation to undo yet. Run a command first (add/done/schedule/...).
+```
+
+### 4.10 Sync (two clients)
+
+```
+$ cadence sync
+Synced with origin: pulled 2, pushed 1. Up to date.
+
+$ cadence sync
+Already in sync with origin. Nothing to pull or push.
+```
+Never silent data loss on conflict (this was the bake-off's own hardest-risk
+spike criterion: "serialized cleanly, or fails loudly with a recoverable
+error"). Cadence takes the second branch — a conflicting task is reported,
+not overwritten, everything else in the same sync still lands:
+```
+$ cadence sync
+Synced with origin: pulled 3, pushed 2. 1 conflict needs you.
+Error: #4 was edited on both sides since last sync (this client: priority; origin: due date). Nothing was overwritten. Run 'cadence sync --keep-mine 4' or 'cadence sync --keep-theirs 4', then sync again.
+```
+Exit code `1` while any conflict is unresolved (a script can tell "sync is
+done" from "sync needs a human" apart, same contract as §4.4), `0` once
+clean.
+
+### 4.11 Export
+
+```
+$ cadence export
+Exported 14 tasks to cadence-export-2026-08-29.json
+
+$ cadence export --format table
+```
+prints every task (open and done, unfiltered) in the exact `list` row
+format (§4.1), to stdout, for a human to read or pipe onward — no separate
+export layout to learn. `json` (default) is for backup/interop/agents and
+writes a timestamped file unless `--out PATH` is given, in which case it
+writes there and to stdout is suppressed. Same two-sentence error shape for
+an unknown format:
+```
+$ cadence export --format xml
+Error: 'xml' isn't a supported export format. Try: cadence export --format json (or table).
+```
+
 ## 5. Is a TUI (curses/full-screen) view warranted now?
 
 **No, not yet — decided and recorded here, not left open.** A full-screen
