@@ -288,7 +288,7 @@ not overwritten, everything else in the same sync still lands:
 ```
 $ cadence sync
 Synced with origin: pulled 3, pushed 2. 1 conflict needs you.
-Error: #4 was edited on both sides since last sync (this client: priority; origin: due date). Nothing was overwritten. Run 'cadence sync --keep-mine 4' or 'cadence sync --keep-theirs 4', then sync again.
+Error: #4 differs between this client and the remote since the last sync (edited on both sides, or independently created with the same id). Nothing was overwritten. Run 'cadence sync --keep-mine 4' or 'cadence sync --keep-theirs 4', then sync again.
 ```
 Exit code `1` while any conflict is unresolved (a script can tell "sync is
 done" from "sync needs a human" apart, same contract as §4.4), `0` once

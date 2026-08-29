@@ -196,6 +196,29 @@ class Store:
         # history too, never the real user's.
         return GitHistory(self.db_path.parent / (self.db_path.stem + ".history"))
 
+    @staticmethod
+    def _resolve_remote(remote: str) -> str:
+        """Resolve a caller-supplied `--remote`/`remote` value to the git
+        history location `sync` actually needs (docs/human-surface.md
+        §4.10). A caller only ever legitimately holds one of:
+
+        - a git URL or bare-repo path meant to be used as-is (a real
+          remote server, or a shared bare repo already set up for this) --
+          recognized by "://" / "git@", or by already being a git repo on
+          disk (a `.history` working dir, or a bare repo);
+        - the OTHER client's own `CADENCE_DB_PATH` value (that client's
+          plain `.db` file path) -- this client derives that client's
+          `.history` dir itself, the exact same way `Store._history()`
+          derives its own, so the caller never has to know that Cadence
+          keeps history in a sibling `.history` directory at all.
+        """
+        if "://" in remote or remote.startswith("git@"):
+            return remote
+        p = Path(remote)
+        if p.is_dir() and ((p / ".git").is_dir() or (p / "HEAD").is_file()):
+            return remote  # already points at a history repo (or bare repo)
+        return str(p.parent / (p.stem + ".history"))
+
     def _snapshot_and_commit(self, tasks: list["Task"], message: str) -> None:
         hist = self._history()
         hist.ensure()
@@ -540,8 +563,9 @@ class Store:
         """
         hist = self._history()
         hist.ensure()
+        given_remote = remote
         if remote:
-            hist.set_remote(remote)
+            hist.set_remote(self._resolve_remote(remote))
         remote_url = hist.get_remote()
         if not remote_url:
             raise InvalidTask(
@@ -550,8 +574,11 @@ class Store:
             )
         if not hist.fetch():
             raise InvalidTask(
-                f"can't reach remote '{remote_url}'",
-                hint="Check the path/URL and try again.",
+                f"no Cadence store found at '{given_remote or remote_url}'",
+                hint=(
+                    "Check the path is the other client's CADENCE_DB_PATH "
+                    "and that client has run 'cadence sync' at least once."
+                ),
             )
         theirs_ref = hist.remote_main_sha()
         if theirs_ref is None:

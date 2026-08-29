@@ -463,6 +463,58 @@ def test_sync_without_remote_configured_is_a_named_error(store):
         store.sync()
 
 
+def test_sync_remote_accepts_plain_db_path_and_converges(tmp_path):
+    """R-08 finding 1 fix: the *only* address an agent restricted to tool
+    descriptions can produce is the other client's own CADENCE_DB_PATH
+    value (a plain .db path) -- never Cadence's internal `.history` git
+    dir, which is never surfaced anywhere. `sync(remote=...)` must accept
+    that value directly and derive the history location itself, and the
+    task must actually land in the other store's data (not just avoid
+    raising)."""
+    store_a = Store(db_path=tmp_path / "peer_a.db")
+    store_b = Store(db_path=tmp_path / "peer_b.db")
+
+    task_a = store_a.add("From A")
+
+    # B points straight at A's plain CADENCE_DB_PATH -- not A's .history
+    # dir, which B never sees and has no way to construct.
+    r_b1 = store_b.sync(remote=str(store_a.db_path))
+    assert r_b1["conflicts"] == []
+    assert r_b1["pulled"] == 1
+    assert store_b.get(task_a.id).title == "From A"
+
+    task_b = store_b.add("From B")
+    r_b2 = store_b.sync()  # remote already saved from the first call
+    assert r_b2["conflicts"] == []
+    assert r_b2["pushed"] == 1
+
+    # A points straight at B's plain CADENCE_DB_PATH to pick up what B
+    # pushed -- proves the direct client-to-client push (not just a
+    # shared bare-repo intermediary) actually lands, both the address
+    # resolution and the underlying git push into a live, checked-out
+    # peer repo (receive.denyCurrentBranch=updateInstead).
+    r_a = store_a.sync(remote=str(store_b.db_path))
+    assert r_a["conflicts"] == []
+    assert r_a["pulled"] == 1
+    assert store_a.get(task_b.id).title == "From B"
+
+    # Both stores now hold both tasks -- real convergence, not "no error".
+    assert {t.id for t in store_a.list(status="all")} == {task_a.id, task_b.id}
+    assert {t.id for t in store_b.list(status="all")} == {task_a.id, task_b.id}
+
+
+def test_cli_sync_remote_help_and_error_name_the_db_path_contract(tmp_path):
+    env = _cli_env(tmp_path, "cli_remote_help.db")
+    help_out = _run_cli("sync", "--help", env=env)
+    assert "CADENCE_DB_PATH" in help_out.stdout
+
+    bad = _run_cli("sync", "--remote", str(tmp_path / "nope.db"), env=env)
+    assert bad.returncode == 1
+    assert bad.stdout.startswith(f"Error: no Cadence store found at '{tmp_path / 'nope.db'}'.")
+    assert "CADENCE_DB_PATH" in bad.stdout
+    assert "cadence sync' at least once" in bad.stdout
+
+
 def test_mcp_sync_tasks_and_resolve(tmp_path, monkeypatch, bare_remote):
     monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_sync_a.db"))
     from cadence.mcp_server import add_task, sync_tasks

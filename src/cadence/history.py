@@ -69,6 +69,16 @@ class GitHistory:
             text=True,
             check=True,
         )
+        # Every client's history repo is a normal (non-bare) working repo
+        # with `main` checked out -- but §4.10 lets a second client point
+        # `sync --remote` directly at THIS client's own CADENCE_DB_PATH,
+        # which resolves to pushing straight into this repo, not via a
+        # bare intermediary. Git refuses that by default ("refusing to
+        # update checked out branch"); `updateInstead` makes it safe by
+        # keeping the working tree in sync with whatever lands on `main`,
+        # so this client's own next commit never has a stale index to
+        # diff against.
+        self._git("config", "receive.denyCurrentBranch", "updateInstead")
         (self.tasks_dir / ".gitkeep").write_text("")
         self._git("add", "-A")
         self._git("commit", "-q", "-m", "init: empty task store", "--allow-empty")

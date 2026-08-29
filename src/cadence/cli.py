@@ -295,9 +295,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
         )
         for c in result["conflicts"]:
             print(
-                f"Error: #{c['id']} was edited on both sides since last sync. "
-                f"Nothing was overwritten. Run 'cadence sync --keep-mine {c['id']}' "
-                f"or 'cadence sync --keep-theirs {c['id']}', then sync again."
+                f"Error: #{c['id']} differs between this client and the remote "
+                f"since the last sync (edited on both sides, or independently "
+                f"created with the same id). Nothing was overwritten. Run "
+                f"'cadence sync --keep-mine {c['id']}' or 'cadence sync "
+                f"--keep-theirs {c['id']}', then sync again."
             )
         return 1
     print(f"Synced with origin: pulled {pulled}, pushed {pushed}. Up to date.")
@@ -388,7 +390,12 @@ def build_parser() -> argparse.ArgumentParser:
         "sync", help="Sync tasks with another Cadence client. Example: cadence sync"
     )
     p_sync.add_argument(
-        "--remote", help="Remote history path/URL to sync with (only needed once)"
+        "--remote",
+        help=(
+            "The other client's own CADENCE_DB_PATH value (its plain .db "
+            "file path), or a git URL -- only needed once. Cadence derives "
+            "that client's history location itself."
+        ),
     )
     p_sync.add_argument(
         "--keep-mine", metavar="ID", help="Resolve a conflict by keeping this client's version"

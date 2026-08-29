@@ -239,15 +239,19 @@ def undo() -> dict:
 def sync_tasks(remote: Optional[str] = None) -> dict:
     """Sync this store with a shared remote (another client's history).
 
-    Never silently drops data: a task edited on both sides since the last
-    clean sync is left untouched on both this store and the remote and is
-    reported in `conflicts` instead of being overwritten; everything else
-    in the same sync still lands.
+    Never silently drops data: a task that differs between this store and
+    the remote since the last clean sync (edited on both sides, or
+    independently created with the same id) is left untouched on both
+    this store and the remote and is reported in `conflicts` instead of
+    being overwritten; everything else in the same sync still lands.
 
     Args:
-        remote: Path/URL of the shared history to sync with. Only needed
-            the first time (or to change it) -- omit on later calls to
-            reuse the remote already configured.
+        remote: The OTHER client's own CADENCE_DB_PATH value (its plain
+            .db file path) -- this client derives that client's history
+            location itself, so you never need to know Cadence's internal
+            storage layout. A git URL also works, for a shared server
+            remote. Only needed the first time (or to change it) -- omit
+            on later calls to reuse the remote already configured.
 
     Returns:
         {"ok": true, "pulled": N, "pushed": N, "already_synced": bool,
