@@ -17,6 +17,8 @@ from __future__ import annotations
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError as _FastMCPToolError
+from pydantic import ValidationError as _PydanticValidationError
 
 from cadence.store import CadenceError, InvalidTask, MAX_TITLE_LEN, Store
 
@@ -336,6 +338,70 @@ def export_tasks(format: str = "json") -> dict:
         rows = [_render_row(_Task(**t), 80) for t in tasks]
         return {"ok": True, "rows": rows, "count": len(tasks)}
     return {"ok": True, "tasks": tasks, "count": len(tasks)}
+
+
+def _humanize_arg_validation_error(tool_name: str, exc: _PydanticValidationError) -> dict:
+    """Render a pydantic ValidationError raised while FastMCP coerces raw
+    JSON args against a tool's schema into the same {ok, error, message,
+    hint} shape every other invalid-input path already uses.
+
+    Red Team MCP-stress-pass finding 1: FastMCP validates each tool call's
+    arguments against a pydantic model it derives from the function
+    signature *before* the tool function (and its own try/except net)
+    ever runs -- e.g. add_task(title=12345) never reaches add_task's body
+    at all. That validation error used to escape as isError=true with a
+    raw pydantic dump (including a https://errors.pydantic.dev/... URL),
+    a shape no agent's `ok`-branching code is written to expect.
+    """
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ())) or "argument"
+        if err.get("type") == "missing":
+            parts.append(f"'{loc}' is required")
+        else:
+            parts.append(f"'{loc}': {err.get('msg', 'is invalid')} (got {err.get('input')!r})")
+    detail = "; ".join(parts) if parts else str(exc)
+    return {
+        "ok": False,
+        "error": "invalid_argument",
+        "message": f"{tool_name} got a bad argument: {detail}.",
+        "hint": (
+            "Check each argument's type against the tool's docstring "
+            "(e.g. numeric ids as numbers, lists as JSON arrays, not "
+            "strings) and retry with corrected input."
+        ),
+    }
+
+
+# FastMCP-level net, one layer earlier than _err_unexpected: the tool
+# manager's call_tool is what actually invokes arg-schema validation
+# (via Tool.run -> fn_metadata.call_fn_with_arg_validation) before any
+# tool function body runs, so this is the first point that can see a
+# validation failure and re-shape it. Wraps the tool_manager's own
+# call_tool rather than monkeypatching the FastMCP/Tool classes
+# themselves, so it only changes this server's instance, not the
+# installed library.
+_orig_manager_call_tool = mcp._tool_manager.call_tool
+
+
+async def _call_tool_with_validation_net(name, arguments, context=None, convert_result=False):
+    try:
+        return await _orig_manager_call_tool(
+            name, arguments, context=context, convert_result=convert_result
+        )
+    except _FastMCPToolError as exc:
+        cause = exc.__cause__
+        if not isinstance(cause, _PydanticValidationError):
+            raise  # not the arg-coercion case this net is for -- let it surface as before
+        err_dict = _humanize_arg_validation_error(name, cause)
+        if convert_result:
+            tool = mcp._tool_manager.get_tool(name)
+            if tool is not None:
+                return tool.fn_metadata.convert_result(err_dict)
+        return err_dict
+
+
+mcp._tool_manager.call_tool = _call_tool_with_validation_net
 
 
 def run() -> None:

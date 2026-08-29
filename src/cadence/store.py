@@ -265,8 +265,26 @@ class Store:
         if "://" in remote or remote.startswith("git@"):
             return remote
         p = Path(remote)
-        if p.is_dir() and ((p / ".git").is_dir() or (p / "HEAD").is_file()):
-            return remote  # already points at a history repo (or bare repo)
+        if p.is_dir():
+            if (p / ".git").is_dir() or (p / "HEAD").is_file():
+                return remote  # already points at a history repo (or bare repo)
+            # Red Team MCP-stress-pass finding 2: a plain directory that is
+            # NOT itself a git/bare repo is neither of the two things a
+            # caller may legitimately pass (a git URL/bare-repo path, or a
+            # peer's own CADENCE_DB_PATH *file*) -- it used to fall through
+            # to the derivation below, which silently treated the directory
+            # as if it were a peer's .db file and created a brand-new
+            # sibling `<dirname>.history` git repo next to it, pushing
+            # local tasks into a location nobody would ever sync from
+            # again. Reject it with the same two-sentence shape other bad
+            # remotes already get, before any side effect happens.
+            raise InvalidTask(
+                f"'{remote}' is a plain directory, not a git repo or a peer's .db file",
+                hint=(
+                    "Pass the other client's CADENCE_DB_PATH (its .db file "
+                    "path) or a git URL / bare-repo path instead."
+                ),
+            )
         # Full filename, not stem -- see the matching comment on
         # Store._history() (R-08 re-verify Finding B). Must derive the
         # exact same way that method does, or the two would themselves
@@ -699,13 +717,18 @@ class Store:
         hist.ensure()
         given_remote = remote
         if remote:
+            # Resolve (and validate) first: Finding 2 depends on this
+            # raising for a bare non-repo directory *before*
+            # _maybe_init_peer_history gets a chance to create a sibling
+            # history repo for it as a side effect.
+            resolved_remote = self._resolve_remote(remote)
             # R-08 re-verify Finding D: transparently bootstrap a peer that
             # exists on disk but has never written or synced -- see
-            # _maybe_init_peer_history -- before resolving/fetching it, so
-            # pushing into a brand-new second device just works instead of
+            # _maybe_init_peer_history -- before fetching it, so pushing
+            # into a brand-new second device just works instead of
             # misreporting "no Cadence store found".
             self._maybe_init_peer_history(remote)
-            hist.set_remote(self._resolve_remote(remote))
+            hist.set_remote(resolved_remote)
         remote_url = hist.get_remote()
         if not remote_url:
             raise InvalidTask(

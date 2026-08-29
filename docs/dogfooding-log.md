@@ -513,3 +513,68 @@ loses no data, but still silently does the wrong thing and pollutes the
 filesystem). Neither is fixed in this pass — findings only, filed to
 Build under this requirement per the task's instructions; Red Team does
 not edit the code under test.
+
+## Week 1 — 2026-08-29 (Rafael Okonkwo, Build): both MCP-stress-pass findings fixed
+
+Dov's two findings above (`d00f9ca`, `/workspace/redteam_mcp_stress/results.jsonl`),
+both fixed against the real published 0.2.5.
+
+**Finding 1** (`mcp_server.py`): confirmed root cause — FastMCP's
+`Tool.run` validates raw JSON args against a pydantic model it derives
+from each tool's signature (via `fn_metadata.call_fn_with_arg_validation`)
+*before* the tool function, and its own `_err_unexpected` net, ever run.
+`add_task(title=12345)` never reached `add_task`'s body at all; the
+`ValidationError` (with a `https://errors.pydantic.dev/...` URL baked
+into its text) escaped as `mcp.server.fastmcp.exceptions.ToolError`,
+which the SDK renders as `isError=true` with that raw dump as the only
+content — one layer earlier than the net built for exactly this shape.
+Fix: wrap the `FastMCP` instance's own `_tool_manager.call_tool` (an
+instance-level override in `mcp_server.py`, not a change to the
+installed `mcp` package) so a `ToolError` whose `__cause__` is a
+`pydantic.ValidationError` is re-rendered through
+`_humanize_arg_validation_error` into the same
+`{ok:false, error:"invalid_argument", message, hint}` shape every other
+bad-input path already uses, plain language, no pydantic URL. Any other
+`ToolError` (e.g. a genuinely unknown tool name) still raises exactly as
+before — the net is scoped to the arg-coercion case only.
+
+**Finding 2** (`store.py`, `Store._resolve_remote`): confirmed —
+`_resolve_remote` recognized a git URL, `git@` remote, and an existing
+git/bare repo directory, but for anything else (including a plain,
+already-existing, non-repo directory) it fell through to the
+"assume this is a peer's `.db` file path" derivation, silently pushing
+into a freshly created sibling `<dirname>.history` repo nobody would
+ever sync from again — and `Store.sync`'s `_maybe_init_peer_history`
+call ran *before* `_resolve_remote`, so that sibling repo actually got
+created as a side effect even before resolution. Fix: `_resolve_remote`
+now raises `InvalidTask` for an existing directory that is not itself a
+git/bare repo, naming the two legitimate shapes (a peer's own
+`CADENCE_DB_PATH` file, or a git URL/bare-repo path) in the hint; and
+`sync()` now calls `_resolve_remote` (validate) before
+`_maybe_init_peer_history` (the side-effecting bootstrap), so the reject
+happens before anything is created on disk. A genuinely nonexistent
+path is untouched (still resolves to a future peer `.history` location,
+matching Finding D's fix from the entry above).
+
+Regression tests added (`tests/test_smoke.py`), both confirmed failing
+against the pre-fix code first (`git stash` on just `mcp_server.py` +
+`store.py`, reran the new tests: all 7 failed — the 6 type-mismatch
+cases raised the raw `ToolError`/pydantic dump exactly as Dov's repro
+shows, and the bare-directory sync case asserted `ok:false` but got
+`ok:true`; `git stash pop` restored the fix before trusting them):
+`test_mcp_type_mismatched_args_return_structured_error_not_pydantic_dump`
+(parametrized over all 6 of Dov's exact repro cases — `add_task(title=
+12345)`, `add_task(title=True)`, `add_task({})`, `schedule_task(id=
+"abc"/1.5, ...)`, `decompose_task(id=2, into="not-a-list")` — driven
+through the real `mcp._tool_manager.call_tool` path, not the bare Python
+function, since calling `add_task(...)` directly never exercises
+FastMCP's own schema validation) and
+`test_mcp_sync_remote_bare_non_git_directory_is_rejected` (asserts
+`ok:false, error:"invalid_task"` and that no sibling `<dir>.history`
+repo gets created). Full suite: 86 passed (79 + 7 new). Shipped as
+`cadence-todo` 0.2.6; CI green on main; re-verified against the real
+published 0.2.6 package in a fresh no-repo venv, both via the in-process
+tool_manager path and a real `mcp` stdio `ClientSession` subprocess
+(matching Dov's own harness shape) — `add_task(title=12345)` came back
+`isError=False` with the clean `{ok:false, error:"invalid_argument",
+...}` JSON as the tool's text content, no pydantic dump, no URL.

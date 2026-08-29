@@ -348,3 +348,88 @@ def test_cli_add_bad_db_path_directory_still_exits_2(tmp_path):
     )
     assert result.returncode == 2, result.stderr
     assert result.stdout.startswith("Error: ")
+
+
+# --- Regression tests: Red Team MCP-stress-pass (docs/dogfooding-log.md,
+# commit d00f9ca; raw evidence /workspace/redteam_mcp_stress/results.jsonl),
+# findings 1 and 2. Both go through the real FastMCP call_tool path (the
+# tool_manager, not the bare Python function -- calling e.g. add_task(...)
+# directly never exercises FastMCP's own arg-schema validation, which is
+# exactly where finding 1 lived), matching what an agent actually sees.
+
+
+def _call_mcp_tool(name: str, arguments: dict) -> dict:
+    """Drive a tool the same way FastMCP's protocol layer does (schema
+    validation included), and unwrap the JSON text content back to a dict
+    -- what an agent parses out of the tool result."""
+    import asyncio
+    import json
+
+    from cadence.mcp_server import mcp
+
+    async def _run():
+        return await mcp._tool_manager.call_tool(name, arguments, convert_result=True)
+
+    result = asyncio.run(_run())
+    # convert_result=True with no output_schema returns unstructured content:
+    # a list of content blocks, text ones carrying the tool's JSON string.
+    for block in result:
+        text = getattr(block, "text", None)
+        if text is not None:
+            return json.loads(text)
+    raise AssertionError(f"no text content block in {result!r}")
+
+
+@pytest.mark.parametrize(
+    "tool,bad_args",
+    [
+        ("add_task", {"title": 12345}),
+        ("add_task", {"title": True}),
+        ("add_task", {}),
+        ("schedule_task", {"id": "abc", "due": "2026-09-01"}),
+        ("schedule_task", {"id": 1.5, "due": "2026-09-01"}),
+        ("decompose_task", {"id": 2, "into": "not-a-list"}),
+    ],
+)
+def test_mcp_type_mismatched_args_return_structured_error_not_pydantic_dump(
+    tmp_path, monkeypatch, tool, bad_args
+):
+    # Red Team finding 1: a wrong JSON *type* (or a missing required field)
+    # used to bypass {ok, error, message, hint} entirely -- FastMCP
+    # validates args against the tool's schema *before* the tool function
+    # (and its own try/except net) ever runs, so it raised a raw pydantic
+    # ValidationError (with a https://errors.pydantic.dev/... URL in it)
+    # instead. This must come back as ordinary structured error content,
+    # not isError with a stack-trace-shaped string.
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_typeerr.db"))
+    result = _call_mcp_tool(tool, bad_args)
+    assert result["ok"] is False
+    assert result["error"] == "invalid_argument"
+    assert "pydantic" not in result["message"].lower()
+    assert "errors.pydantic.dev" not in result["message"]
+    assert result["hint"]
+
+
+def test_mcp_sync_remote_bare_non_git_directory_is_rejected(tmp_path, monkeypatch):
+    # Red Team finding 2: sync_tasks(remote=<plain dir, not a git repo>)
+    # used to be silently accepted (ok:true, pushed:N) -- it fell through
+    # _resolve_remote's peer-db-path derivation, silently creating a new
+    # sibling `<dirname>.history` git repo and pushing local tasks into a
+    # location nobody will ever sync from again. Must be rejected instead,
+    # with no sibling history repo created as a side effect.
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_syncdir.db"))
+    add_result = _call_mcp_tool("add_task", {"title": "will not be pushed"})
+    assert add_result["ok"] is True
+
+    plain_dir = tmp_path / "not_a_repo"
+    plain_dir.mkdir()
+
+    sync_result = _call_mcp_tool("sync_tasks", {"remote": str(plain_dir)})
+    assert sync_result["ok"] is False
+    assert sync_result["error"] == "invalid_task"
+    assert sync_result["hint"]
+    sibling_history = tmp_path / "not_a_repo.history"
+    assert not sibling_history.exists(), (
+        "sync_tasks must not create a sibling .history repo for a "
+        "rejected non-git remote"
+    )
