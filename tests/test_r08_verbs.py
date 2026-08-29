@@ -754,3 +754,170 @@ def test_mcp_sync_tasks_direct_peer_id_collision_does_not_duplicate(
 
     a_tasks = Store(db_path=a_path).list(status="all")
     assert len(a_tasks) == 2, f"expected 2 tasks, got {len(a_tasks)}: {[t.title for t in a_tasks]}"
+
+
+# --- structural origin-UUID identity fix (task ---------------------------
+# --- task_01a04b9b39057fc952517775): 0.2.3's echo-fix only recognized ----
+# --- "my own echo" while a row was still unbased (its first-ever sync), --
+# --- so a 3RD ordinary re-sync of an already-converged pair reintroduced -
+# --- the phantom duplicate and a 4th crashed with a raw KeyError. --------
+
+
+def test_sync_direct_peer_repeated_resync_never_duplicates(tmp_path):
+    """Same id-1/id-1 collision as
+    test_sync_direct_peer_id_collision_does_not_duplicate_either_side, but
+    driven through *four* ordinary sync rounds per side (8 sync calls
+    total) with zero new local changes after the first round -- exactly
+    what a periodic sync job or a defensively-syncing agent does. The old
+    content-fingerprint-of-unbased-rows proxy for identity only survived
+    each row's first sync; by the 3rd round every row was already
+    "based", so the fingerprint match stopped firing and the echo was
+    pulled in again as if new. Every round must land on exactly 2 tasks
+    per side and never raise.
+    """
+    store_a = Store(db_path=tmp_path / "resync_a.db")
+    store_b = Store(db_path=tmp_path / "resync_b.db")
+
+    store_a.add("A-ORIGINAL")
+    store_b.add("B-ORIGINAL")
+
+    for round_num in range(1, 5):
+        r_a = store_a.sync(remote=str(store_b.db_path))
+        assert r_a["conflicts"] == [], f"round {round_num} A->B: {r_a}"
+        a_tasks = store_a.list(status="all")
+        assert len(a_tasks) == 2, (
+            f"round {round_num} A->B: expected 2 tasks on A, got "
+            f"{len(a_tasks)}: {[t.title for t in a_tasks]}"
+        )
+
+        r_b = store_b.sync(remote=str(store_a.db_path))
+        assert r_b["conflicts"] == [], f"round {round_num} B->A: {r_b}"
+        b_tasks = store_b.list(status="all")
+        assert len(b_tasks) == 2, (
+            f"round {round_num} B->A: expected 2 tasks on B, got "
+            f"{len(b_tasks)}: {[t.title for t in b_tasks]}"
+        )
+
+    # Both sides converged on exactly the two original tasks, each
+    # appearing once -- no phantom third row on either side after 8
+    # total sync calls.
+    assert sorted(t.title for t in store_a.list(status="all")) == [
+        "A-ORIGINAL", "B-ORIGINAL",
+    ]
+    assert sorted(t.title for t in store_b.list(status="all")) == [
+        "A-ORIGINAL", "B-ORIGINAL",
+    ]
+
+
+def test_sync_direct_peer_edit_after_convergence_propagates_without_duplicating(
+    tmp_path,
+):
+    """After the id-collision pair above has fully converged (both
+    directions synced once), an edit on one side followed by more sync
+    rounds in both directions must propagate the edit and must not
+    resurrect a duplicate of either side's original row. This is the
+    "re-sync after further edits" case from the fix spec."""
+    store_a = Store(db_path=tmp_path / "editresync_a.db")
+    store_b = Store(db_path=tmp_path / "editresync_b.db")
+
+    task_a = store_a.add("A-ORIGINAL")
+    store_b.add("B-ORIGINAL")
+
+    store_a.sync(remote=str(store_b.db_path))
+    store_b.sync(remote=str(store_a.db_path))
+    assert len(store_a.list(status="all")) == 2
+    assert len(store_b.list(status="all")) == 2
+
+    store_a.reprioritise(task_a.id, "high")
+
+    r_push = store_a.sync(remote=str(store_b.db_path))
+    assert r_push["conflicts"] == []
+    assert len(store_a.list(status="all")) == 2
+
+    r_pull = store_b.sync(remote=str(store_a.db_path))
+    assert r_pull["conflicts"] == []
+    b_tasks = store_b.list(status="all")
+    assert len(b_tasks) == 2, f"expected 2 tasks, got {len(b_tasks)}: {[t.title for t in b_tasks]}"
+    edited = [t for t in b_tasks if t.title == "A-ORIGINAL"]
+    assert len(edited) == 1
+    assert edited[0].priority == "high"
+
+    # Two more idempotent rounds each way: still exactly 2/2, edit holds.
+    for _ in range(2):
+        store_a.sync(remote=str(store_b.db_path))
+        store_b.sync(remote=str(store_a.db_path))
+    assert len(store_a.list(status="all")) == 2
+    assert len(store_b.list(status="all")) == 2
+
+
+def test_mcp_sync_tasks_repeated_resync_never_duplicates(tmp_path, monkeypatch):
+    """MCP-surface counterpart of
+    test_sync_direct_peer_repeated_resync_never_duplicates -- four
+    ordinary sync rounds per side over the actual tool surface an agent
+    calls, asserting exact counts throughout."""
+    from cadence.mcp_server import add_task, sync_tasks
+
+    a_path = tmp_path / "mcp_resync_a.db"
+    b_path = tmp_path / "mcp_resync_b.db"
+
+    monkeypatch.setenv("CADENCE_DB_PATH", str(a_path))
+    add_task("A-ORIGINAL")
+
+    monkeypatch.setenv("CADENCE_DB_PATH", str(b_path))
+    add_task("B-ORIGINAL")
+
+    for round_num in range(1, 5):
+        monkeypatch.setenv("CADENCE_DB_PATH", str(a_path))
+        r_a = sync_tasks(remote=str(b_path))
+        assert r_a["ok"] is True
+        assert r_a["conflicts"] == []
+        a_tasks = Store(db_path=a_path).list(status="all")
+        assert len(a_tasks) == 2, f"round {round_num}: {[t.title for t in a_tasks]}"
+
+        monkeypatch.setenv("CADENCE_DB_PATH", str(b_path))
+        r_b = sync_tasks(remote=str(a_path))
+        assert r_b["ok"] is True
+        assert r_b["conflicts"] == []
+        b_tasks = Store(db_path=b_path).list(status="all")
+        assert len(b_tasks) == 2, f"round {round_num}: {[t.title for t in b_tasks]}"
+
+
+def test_undo_preserves_origin_identity_across_sync(tmp_path):
+    """Undo must never blank out or fork a task's immutable `origin` --
+    doing so would make a reverted row look brand-new to the sync merge
+    engine and reintroduce a duplicate on the next sync. Exercises add ->
+    edit -> undo -> sync and checks the peer ends up with exactly one
+    copy of the row, not two."""
+    store_a = Store(db_path=tmp_path / "undo_origin_a.db")
+    store_b = Store(db_path=tmp_path / "undo_origin_b.db")
+
+    task = store_a.add("Reprioritise me")
+    origin_before = store_a.get(task.id).origin
+    assert origin_before
+    # `sync` requires the peer's own history to exist already (as with
+    # every other direct-peer test in this file) -- give B an unrelated
+    # task of its own so both sides have run their own first `add`.
+    store_b.add("B's unrelated task")
+
+    store_a.reprioritise(task.id, "high")
+    store_a.undo()
+    assert store_a.get(task.id).origin == origin_before
+
+    r = store_a.sync(remote=str(store_b.db_path))
+    assert r["conflicts"] == []
+    # A's push lands in B's own git history immediately, but B's sqlite
+    # only picks it up on B's own next sync (same as every other
+    # direct-peer test in this file).
+    store_b.sync(remote=str(store_a.db_path))
+    b_titles = [t.title for t in store_b.list(status="all")]
+    assert b_titles.count("Reprioritise me") == 1, b_titles
+
+    # A second, idempotent sync round must not duplicate the undone row.
+    store_a.sync(remote=str(store_b.db_path))
+    store_b.sync(remote=str(store_a.db_path))
+    a_titles = [t.title for t in store_a.list(status="all")]
+    b_titles = [t.title for t in store_b.list(status="all")]
+    assert a_titles.count("Reprioritise me") == 1, a_titles
+    assert b_titles.count("Reprioritise me") == 1, b_titles
+    assert len(store_a.list(status="all")) == 2
+    assert len(store_b.list(status="all")) == 2

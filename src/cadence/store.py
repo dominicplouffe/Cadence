@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import uuid
 from contextlib import closing
 from dataclasses import dataclass, asdict, field
 from datetime import date, datetime, timezone
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     due TEXT,
     created_at TEXT NOT NULL,
     completed_at TEXT,
-    parent_id INTEGER
+    parent_id INTEGER,
+    origin TEXT
 );
 """
 
@@ -151,8 +153,21 @@ class Task:
     created_at: str
     completed_at: Optional[str]
     parent_id: Optional[int] = None
+    # Immutable identity assigned once at creation, carried for the row's
+    # whole life (renumbering, sync, undo) -- the sync merge engine's real
+    # identity key (see _sync_diff_and_apply). A merge-engine detail, not
+    # a CLI/MCP-contract field: never returned by `to_dict()`, so no
+    # human-surface or agent-facing change rides on this.
+    origin: Optional[str] = None
 
     def to_dict(self) -> dict:
+        d = asdict(self)
+        d.pop("origin", None)
+        return d
+
+    def to_full_dict(self) -> dict:
+        """Everything, including `origin` -- for the sync merge engine and
+        git-history snapshots only. Never returned to a CLI/MCP caller."""
         return asdict(self)
 
 
@@ -172,6 +187,19 @@ class Store:
                 cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
                 if "parent_id" not in cols:
                     conn.execute("ALTER TABLE tasks ADD COLUMN parent_id INTEGER")
+                if "origin" not in cols:
+                    # Structural sync-identity fix (task
+                    # task_01a04b9b39057fc952517775 / Ines's spec
+                    # r08-sync-finding-c-duplicate-fix-spec.md): every row
+                    # needs a stable identity that survives renumbering.
+                    # Backfill a fresh UUID for rows that predate this
+                    # column -- one-time, immutable from here on.
+                    conn.execute("ALTER TABLE tasks ADD COLUMN origin TEXT")
+                    for row in conn.execute("SELECT id FROM tasks WHERE origin IS NULL").fetchall():
+                        conn.execute(
+                            "UPDATE tasks SET origin = ? WHERE id = ?",
+                            (uuid.uuid4().hex, row["id"]),
+                        )
                 conn.commit()
         except sqlite3.Error as exc:
             # e.g. CADENCE_DB_PATH points at a directory ("unable to open
@@ -200,6 +228,7 @@ class Store:
             created_at=row["created_at"],
             completed_at=row["completed_at"],
             parent_id=row["parent_id"] if "parent_id" in keys else None,
+            origin=row["origin"] if "origin" in keys else None,
         )
 
     def _history(self) -> GitHistory:
@@ -248,7 +277,10 @@ class Store:
         hist = self._history()
         hist.ensure()
         for t in tasks:
-            hist.write_task_file(t.to_dict())
+            # to_full_dict (not to_dict): the git-history blob is the sync
+            # merge engine's own storage, so it must carry `origin` even
+            # though CLI/MCP callers never see it.
+            hist.write_task_file(t.to_full_dict())
         hist.commit(message)
 
     def add(
@@ -279,9 +311,9 @@ class Store:
             due = _validate_due(due)
         with closing(self._connect()) as conn:
             cur = conn.execute(
-                "INSERT INTO tasks (title, status, priority, due, created_at) "
-                "VALUES (?, 'pending', ?, ?, ?)",
-                (title, priority, due, _now()),
+                "INSERT INTO tasks (title, status, priority, due, created_at, origin) "
+                "VALUES (?, 'pending', ?, ?, ?, ?)",
+                (title, priority, due, _now(), uuid.uuid4().hex),
             )
             conn.commit()
             task = self.get(cur.lastrowid, _conn=conn)
@@ -451,9 +483,9 @@ class Store:
             children = []
             for t in titles:
                 cur = conn.execute(
-                    "INSERT INTO tasks (title, status, priority, due, created_at, parent_id) "
-                    "VALUES (?, 'pending', NULL, NULL, ?, ?)",
-                    (t, _now(), parent_id),
+                    "INSERT INTO tasks (title, status, priority, due, created_at, parent_id, origin) "
+                    "VALUES (?, 'pending', NULL, NULL, ?, ?, ?)",
+                    (t, _now(), parent_id, uuid.uuid4().hex),
                 )
                 children.append(self.get(cur.lastrowid, _conn=conn))
             conn.commit()
@@ -523,24 +555,36 @@ class Store:
                 before_row = conn.execute(
                     "SELECT * FROM tasks WHERE id = ?", (task_id,)
                 ).fetchone()
-                before = self._row_to_task(before_row).to_dict() if before_row else None
+                before_task = self._row_to_task(before_row) if before_row else None
+                before = before_task.to_dict() if before_task else None
                 prev_content = hist.show_file(prev, relpath)
                 after = None
                 if prev_content is not None:
                     after = json.loads(prev_content)
+                    # `origin` is immutable identity, not a field any
+                    # mutation (including undo) may change -- a revert
+                    # must never blank it out or fork a new one, or this
+                    # row would look like a brand-new task to the sync
+                    # merge engine. Older history blobs written before
+                    # this column existed won't have it; fall back to
+                    # whatever this row already carries (backfilled at
+                    # migration), never a fresh UUID here.
+                    origin = after.get("origin") or (before_task.origin if before_task else None)
                     conn.execute(
                         "INSERT INTO tasks (id, title, status, priority, due, created_at, "
-                        "completed_at, parent_id) VALUES (?,?,?,?,?,?,?,?) "
+                        "completed_at, parent_id, origin) VALUES (?,?,?,?,?,?,?,?,?) "
                         "ON CONFLICT(id) DO UPDATE SET title=excluded.title, "
                         "status=excluded.status, priority=excluded.priority, "
                         "due=excluded.due, created_at=excluded.created_at, "
-                        "completed_at=excluded.completed_at, parent_id=excluded.parent_id",
+                        "completed_at=excluded.completed_at, parent_id=excluded.parent_id, "
+                        "origin=COALESCE(excluded.origin, tasks.origin)",
                         (
                             after["id"], after["title"], after["status"], after["priority"],
                             after["due"], after["created_at"], after["completed_at"],
-                            after.get("parent_id"),
+                            after.get("parent_id"), origin,
                         ),
                     )
+                    after["origin"] = origin
                     hist.write_task_file(after)
                 else:
                     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -575,17 +619,20 @@ class Store:
         )
 
     def _apply_remote_task(self, conn: sqlite3.Connection, data: dict) -> None:
+        # `origin` rides along with every applied row -- COALESCE so an
+        # older peer's blob that predates this column (no "origin" key)
+        # never blanks out an origin this row already has locally.
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority, due, created_at, "
-            "completed_at, parent_id) VALUES (?,?,?,?,?,?,?,?) "
+            "completed_at, parent_id, origin) VALUES (?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET title=excluded.title, "
             "status=excluded.status, priority=excluded.priority, due=excluded.due, "
             "created_at=excluded.created_at, completed_at=excluded.completed_at, "
-            "parent_id=excluded.parent_id",
+            "parent_id=excluded.parent_id, origin=COALESCE(excluded.origin, tasks.origin)",
             (
                 data["id"], data["title"], data["status"], data["priority"],
                 data["due"], data["created_at"], data["completed_at"],
-                data.get("parent_id"),
+                data.get("parent_id"), data.get("origin"),
             ),
         )
 
@@ -663,105 +710,189 @@ class Store:
                 ),
             ) from exc
 
+    @staticmethod
+    def _no_origin(data: dict) -> dict:
+        """Strip the merge-engine-only `origin` field before a task dict
+        crosses into a `conflicts` entry returned to a CLI/MCP caller --
+        origin is never part of that contract (see Task.to_dict)."""
+        return {k: v for k, v in data.items() if k != "origin"}
+
     def _sync_diff_and_apply(self, hist: GitHistory, theirs_ref: str) -> dict:
+        """Structural sync-identity fix (task
+        task_01a04b9b39057fc952517775, spec
+        concept_notes/r08-sync-finding-c-duplicate-fix-spec.md, finding
+        redteam_r08_v3_0222/rafael_0.2.3_resync_finding.md): identity for
+        merge purposes is each row's immutable `origin` UUID (assigned
+        once at creation, never touched by renumbering/sync/undo) -- never
+        the display `id` (which renumbering intentionally reassigns) and
+        never a content-fingerprint proxy for it (which stops working the
+        moment a row has been through one sync round and becomes
+        "based", which is exactly what let a 3rd ordinary re-sync of an
+        already-converged pair reintroduce the duplicate 0.2.3 shipped).
+
+        A client's own display-id numbering for a given origin, once
+        assigned, never changes again on that client -- clients are never
+        required to agree with each other on what number a given task is
+        under; only content-by-origin has to converge. The only thing
+        that can still collide is a *display id* against some other
+        origin already using that number on the same side; that is
+        display-only bookkeeping, resolved by `renumbered`, never a real
+        identity conflict (two independent rows can never share a UUID).
+        """
         base_ref = hist.sync_base_sha()
-        mine = {t.id: t.to_dict() for t in self.list(status="all")}
+        # to_full_dict, not to_dict: this merge engine needs `origin`;
+        # nothing here is returned to a CLI/MCP caller directly.
+        mine = {t.id: t.to_full_dict() for t in self.list(status="all")}
         theirs = hist.snapshot_at(theirs_ref)
         base = hist.snapshot_at(base_ref) if base_ref else {}
 
-        # Red Team finding C (0.2.2): fingerprint every LOCAL task that has
-        # no base of its own (base.get(id) is None) -- i.e. one of mine
-        # that has never been reconciled through a common sync yet. That
-        # is exactly, and only, the category of row an id-collision on the
-        # OTHER side's own earlier sync can echo back into shared history
-        # under a brand-new id (see the ID COLLISION branch below: it
-        # copies "theirs" verbatim, only changing `id`, so the echo's
-        # content-minus-id is byte-identical to the original). A task ID
-        # that's new to both `mine` and `base` but whose content matches
-        # one of these fingerprints isn't a new remote task at all -- it's
-        # a reflection of a task I already hold under a different id, and
-        # pulling it as "new" is exactly the direct-peer topology bug that
-        # fabricated a permanent duplicate on both clients (ok:true, no
-        # conflict reported). A genuinely new task from the remote never
-        # matches, since it was never derived from one of my own rows.
-        unbased_mine_fingerprints = {
-            self._content_fingerprint(v): tid
-            for tid, v in mine.items()
-            if base.get(tid) is None
-        }
+        def by_origin(d: dict) -> dict:
+            idx = {}
+            for tid, data in d.items():
+                # Rows written before this column existed carry no
+                # `origin` at all (pre-migration git blobs) -- fall back
+                # to a per-dict, id-scoped key so such legacy rows only
+                # ever match each other by the old id-based rule, instead
+                # of accidentally colliding with an unrelated row.
+                o = data.get("origin") or f"__legacy_id_{tid}__"
+                idx[o] = data
+            return idx
 
-        ids = sorted(set(mine) | set(theirs) | set(base))
-        next_new_id = (max(ids) + 1) if ids else 1
-        pulled_ids, pushed_ids, conflicts, renumbered = [], [], {}, []
-        for tid in ids:
-            b, m, t = base.get(tid), mine.get(tid), theirs.get(tid)
-            if m == t:
+        mine_by_o = by_origin(mine)
+        theirs_by_o = by_origin(theirs)
+        base_by_o = by_origin(base)
+
+        all_ids = set(mine) | set(theirs) | set(base)
+        seed_next = (max(all_ids) + 1) if all_ids else 1
+        local_used, remote_used = set(mine), set(theirs)
+        counters = {"local": seed_next, "remote": seed_next}
+
+        def alloc(used: set, preferred, space: str) -> int:
+            if preferred is not None and preferred not in used:
+                used.add(preferred)
+                return preferred
+            new_id = counters[space]
+            counters[space] += 1
+            used.add(new_id)
+            return new_id
+
+        pulled_ids, conflicts, renumbered = [], {}, []
+        push_plan: list[tuple[int, int, dict]] = []  # (local_id, remote_id, data)
+
+        for o in set(mine_by_o) | set(theirs_by_o) | set(base_by_o):
+            m, t, b = mine_by_o.get(o), theirs_by_o.get(o), base_by_o.get(o)
+            m_fp = self._content_fingerprint(m) if m is not None else None
+            t_fp = self._content_fingerprint(t) if t is not None else None
+            b_fp = self._content_fingerprint(b) if b is not None else None
+
+            if m is not None and t is not None and m_fp == t_fp:
+                continue  # same content already, whatever id each side shows it under
+            if m is None and t is None:
                 continue
-            mine_changed = m != b
-            theirs_changed = t != b
-            if mine_changed and theirs_changed:
-                if b is None:
-                    # ID COLLISION, not an edit conflict -- see the
-                    # docstring above. Keep mine at its existing id;
-                    # preserve theirs under a fresh one, both sides.
-                    new_id = next_new_id
-                    next_new_id += 1
-                    renumbered_task = dict(t)
-                    renumbered_task["id"] = new_id
-                    mine[new_id] = renumbered_task
-                    pushed_ids.append(tid)       # re-assert mine on the remote
-                    pushed_ids.append(new_id)    # add theirs under its new id
-                    renumbered.append(
-                        {"old_id": tid, "new_id": new_id, "kept_at_old_id": "mine"}
-                    )
-                else:
-                    conflicts[tid] = {"mine": m, "theirs": t}
-            elif theirs_changed:
-                if b is None and m is None and t is not None:
-                    echo_of = unbased_mine_fingerprints.get(self._content_fingerprint(t))
-                    if echo_of is not None:
-                        # It's mine already, under `echo_of` -- do not
-                        # fabricate a second row for it.
-                        continue
-                pulled_ids.append(tid)
-            elif mine_changed:
-                pushed_ids.append(tid)
 
-        if not pulled_ids and not pushed_ids and not conflicts:
+            mine_changed = m_fp != b_fp
+            theirs_changed = t_fp != b_fp
+
+            if t is None:
+                # Only I know this task. (Theirs having dropped a
+                # previously-based origin -- this store has no delete
+                # verb -- is a no-op: nothing to push, and resurrecting
+                # it as a "pull" isn't right either, so leave it alone.)
+                if mine_changed:
+                    remote_id = alloc(remote_used, m["id"], "remote")
+                    row = dict(m, id=remote_id)
+                    push_plan.append((m["id"], remote_id, row))
+                    # Not reported in `renumbered`: this only changes what
+                    # id the REMOTE stores this task under, which is
+                    # invisible in this client's own `list()` -- nothing
+                    # about my own numbering moved.
+                continue
+
+            if m is None:
+                # New to me. Under origin identity this is never a real
+                # collision (two independently-created rows can't share a
+                # UUID) -- the only clash possible is theirs' display id
+                # against some *other* origin I already hold under that
+                # number, which just needs a fresh local number.
+                local_id = alloc(local_used, t.get("id"), "local")
+                row = dict(t, id=local_id)
+                mine[local_id] = row
+                pulled_ids.append(local_id)
+                if local_id != t.get("id"):
+                    renumbered.append(
+                        {"old_id": t.get("id"), "new_id": local_id, "kept_at_old_id": "mine"}
+                    )
+                continue
+
+            # Both sides already know this task (by origin).
+            if mine_changed and theirs_changed:
+                conflicts[m["id"]] = {
+                    "mine": self._no_origin(m), "theirs": self._no_origin(t),
+                }
+            elif theirs_changed:
+                # My own display id for this origin never moves.
+                row = dict(t, id=m["id"])
+                mine[m["id"]] = row
+                pulled_ids.append(m["id"])
+            elif mine_changed:
+                push_plan.append((m["id"], t["id"], dict(m, id=t["id"])))
+
+        if not pulled_ids and not push_plan and not conflicts:
             return {
                 "pulled": 0, "pushed": 0, "conflicts": [], "renumbered": [],
                 "already_synced": True,
             }
 
         local_head = hist.head()
-        renumbered_ids = [r["new_id"] for r in renumbered]
         with closing(self._connect()) as conn:
-            for tid in pulled_ids:
-                self._apply_remote_task(conn, theirs[tid])
-            for new_id in renumbered_ids:
-                self._apply_remote_task(conn, mine[new_id])
+            for local_id in pulled_ids:
+                self._apply_remote_task(conn, mine[local_id])
             conn.commit()
-        for tid in pulled_ids:
-            hist.write_task_file(theirs[tid])
-        for new_id in renumbered_ids:
-            hist.write_task_file(mine[new_id])
 
-        # What we're willing to push: local's own non-conflicting changes
-        # plus any renumbered rows, laid on top of origin's own tree -- so
-        # pushing can never overwrite a path this sync chose not to
-        # resolve (a genuinely conflicted id is simply absent from
-        # `overlay`).
-        overlay = {tid: mine[tid] for tid in pushed_ids}
+        # Self-heal: rewrite EVERY task file from sqlite truth (not just
+        # the rows this round touched) before committing locally. A
+        # peer's earlier direct push writes straight into this store's
+        # own checked-out history dir
+        # (receive.denyCurrentBranch=updateInstead) without this store's
+        # sqlite or sync bookkeeping ever finding out -- reading that
+        # drifted tree back on a later sync is exactly what reintroduced
+        # the duplicate on a 3rd/4th round. A blind `git add -A` would
+        # launder that drift straight into this store's own next commit;
+        # rewriting every file from `mine` first heals it as soon as this
+        # store next syncs at all.
+        final = {t.id: t.to_full_dict() for t in self.list(status="all")}
+        on_disk_ids = set()
+        if hist.tasks_dir.exists():
+            for p in hist.tasks_dir.glob("*.json"):
+                try:
+                    on_disk_ids.add(int(p.stem))
+                except ValueError:
+                    continue
+        for stale_id in on_disk_ids - set(final):
+            hist.remove_task_file(stale_id)
+        for tid, data in final.items():
+            hist.write_task_file(data)
+
+        # What we're willing to push: only content whose origin is
+        # genuinely mine to assert (new-to-remote or edited-by-me),
+        # each landing at a remote id chosen against the REMOTE's own
+        # id-space -- never a copy of what I just pulled (that would be
+        # re-asserting the other side's own task back at it, exactly the
+        # mechanism that clobbered a peer's own file in the pre-fix
+        # code), and never my own display-id blindly reused if the
+        # remote already uses that number for a different origin.
+        overlay = {remote_id: data for _, remote_id, data in push_plan}
         pushed_ok = True
         if overlay:
             pushed_ok = hist.push_safe_merge(
                 theirs_ref, overlay, "sync: push local changes", [theirs_ref, local_head]
             )
         # Fold origin's history into local's own timeline too (pulled
-        # writes are already applied to the local working tree above).
+        # writes, and the self-heal rewrite above, are already applied to
+        # the local working tree).
         hist.advance_local(
             [local_head, theirs_ref],
-            f"sync: pulled {len(pulled_ids)}, pushed {len(pushed_ids)}, "
+            f"sync: pulled {len(pulled_ids)}, pushed {len(push_plan)}, "
             f"renumbered {len(renumbered)}",
         )
 
@@ -774,7 +905,7 @@ class Store:
 
         return {
             "pulled": len(pulled_ids),
-            "pushed": len(pushed_ids) if pushed_ok else 0,
+            "pushed": len(push_plan) if pushed_ok else 0,
             "conflicts": [{"id": tid, **v} for tid, v in conflicts.items()],
             "renumbered": renumbered,
             "already_synced": False,
@@ -801,7 +932,16 @@ class Store:
                 f"no pending sync conflict for #{task_id}",
                 hint="Run 'cadence sync' to see pending conflicts.",
             )
-        chosen = conflicts[task_id][keep]
+        # `conflicts[task_id][keep]` was stripped of `origin` before being
+        # reported (never part of the CLI/MCP contract) and, if `keep`
+        # is "theirs", may still carry the REMOTE's own display id for
+        # this origin rather than this client's -- always apply/store it
+        # under `task_id` (this client's own numbering never moves) and
+        # re-attach this row's real origin from what's already on disk.
+        existing_origin = self.get(task_id).origin
+        chosen = dict(conflicts[task_id][keep])
+        chosen["id"] = task_id
+        chosen["origin"] = existing_origin
         with closing(self._connect()) as conn:
             self._apply_remote_task(conn, chosen)
             conn.commit()
@@ -814,9 +954,21 @@ class Store:
             theirs_ref = hist.remote_main_sha()
             local_head = hist.head()
             if theirs_ref:
+                # Push under whatever id the REMOTE already uses for this
+                # same origin (if it knows this task at all), never
+                # blindly `task_id` -- clients aren't required to agree
+                # on numbering, so reusing task_id verbatim could land on
+                # a different, unrelated task on the remote's side.
+                remote_id = task_id
+                if existing_origin:
+                    for rid, rdata in hist.snapshot_at(theirs_ref).items():
+                        if rdata.get("origin") == existing_origin:
+                            remote_id = rid
+                            break
+                push_data = dict(chosen, id=remote_id)
                 message = f"sync: resolved #{task_id} (kept {keep})"
                 pushed = hist.push_safe_merge(
-                    theirs_ref, {task_id: chosen}, message, [theirs_ref, local_head]
+                    theirs_ref, {remote_id: push_data}, message, [theirs_ref, local_head]
                 )
                 if pushed:
                     hist.advance_local([local_head, theirs_ref], message)

@@ -199,3 +199,67 @@ caught a count regression on any topology. Shipped as `cadence-todo`
 0.2.3. Does not reopen R-08 (verified MET on 0.2.1's transcript, which
 never exercised this path); this sits on step 8 of the finish-line
 transcript script for whatever a stranger installs today.
+
+## Week 1 — 2026-08-29 (Rafael Okonkwo, Build): 0.2.3's echo-fix only covered a row's first-ever sync
+
+Found by Rafael re-verifying 0.2.3 against the real published PyPI
+package before calling it settled — same discipline as the Red Team
+passes above. The 2-call repro that motivated 0.2.3 (two never-before-
+synced clients, id-1/id-1 collision, sync A→B then B→A) is genuinely
+clean. But continuing with a **3rd** ordinary sync of the now-converged
+pair (no new local changes since full convergence — the single most
+common thing a periodic sync job or a defensively-syncing agent does)
+reintroduced the exact same phantom duplicate, and a 4th sync then
+crashed with a raw, unhandled `SyncInconsistent: ... KeyError: 2` reading
+history data. Deterministic, reproduced twice against the real 0.2.3
+package (`pip install cadence-todo==0.2.3` into a throwaway venv, driven
+through `cadence.store.Store` directly — the same code path the CLI/MCP
+tools call).
+
+Root cause (per the fix spec Ines wrote for 0.2.2's Finding C,
+`concept_notes/r08-sync-finding-c-duplicate-fix-spec.md`): 0.2.3's echo
+detection matched *content fingerprints* among rows with no base yet —
+true only the first time a row is synced. Once a row has been through one
+sync round it becomes "based" and drops out of that check, so the next
+time it comes back renumbered from a peer's own earlier sync, there's no
+longer a fingerprint to catch it against, and it's pulled in as if new —
+same bug, one round later. This is exactly the narrow-patch-vs-general-fix
+gap Ines flagged when the 0.2.2 fix first shipped.
+
+Fix: every task now carries an immutable `origin` UUID assigned once at
+creation (`Task.origin`, a new `origin` column, backfilled on migration
+for existing rows), never touched by renumbering, editing, or undo, and
+never exposed on the CLI/MCP contract (`to_dict()` strips it; only the
+merge engine and git-history blobs see it via `to_full_dict()`). The sync
+diff/merge (`_sync_diff_and_apply`) now identifies a task for merge
+purposes purely by `origin`, never by display id and never by a
+content-fingerprint proxy — so a row that has been synced any number of
+times, edited, renumbered, or undone is still recognized as "the same
+task" by every peer, for its whole life, not just its first round. A
+peer's earlier direct push writing straight into another peer's checked-
+out history repo (the direct-peer topology's actual mechanism) is also
+now self-healed on every sync by rewriting every task file from this
+store's own sqlite truth before committing, instead of trusting
+whatever's already on disk.
+
+Regression tests added asserting exact task **counts** (not set
+membership) across 4 full sync rounds per side (8 sync calls total) on
+the direct-peer topology, both on the `Store` API and the MCP tool
+surface, plus a case exercising an edit after convergence and a case
+checking `undo` never disturbs a task's `origin`
+(`test_sync_direct_peer_repeated_resync_never_duplicates`,
+`test_mcp_sync_tasks_repeated_resync_never_duplicates`,
+`test_sync_direct_peer_edit_after_convergence_propagates_without_duplicating`,
+`test_undo_preserves_origin_identity_across_sync` in
+`tests/test_r08_verbs.py`). Confirmed these fail against the pre-fix code
+(reverted `store.py` to the 0.2.3 commit, re-ran just these tests: 3/4
+failed with the same duplicate-count / crash / missing-attribute symptoms
+described above) before confirming they pass against the fix, so the
+tests are known to catch this class rather than merely coexist with it.
+Shipped as `cadence-todo` 0.2.4. Does not reopen R-08 (still verified MET
+on 0.2.1's transcript); this is the second sync-surface fix in a row to
+surface only once someone actually re-synced more than twice, which is
+the ordinary case for both the finish-line transcript's step 8 and this
+company's own two-client dogfooding — worth treating a real 2-client,
+many-round sync loop as a standing check rather than a one-off repro
+going forward.
