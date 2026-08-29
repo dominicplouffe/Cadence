@@ -254,6 +254,33 @@ Synced with origin: pulled 2, pushed 1. Up to date.
 $ cadence sync
 Already in sync with origin. Nothing to pull or push.
 ```
+**The `--remote` value, made discoverable (Red Team R-08 finding, 2026-08-29):**
+the *only* thing another client can hand you is the plain path or URL it
+already knows about itself — its own `CADENCE_DB_PATH` (a `.db` file, or a
+host it exposes) — never an internal storage-layout detail. So `--remote`
+takes exactly that, and `sync` derives whatever internal history location
+it needs from it:
+```
+$ cadence sync --remote /path/to/their/cadence.db
+Synced with origin: pulled 2, pushed 1. Up to date. Remote saved — future
+'cadence sync' calls will reuse it.
+```
+This is a *contract*, not an implementation detail: nothing that isn't a
+value the caller already legitimately holds (their own configured db path,
+or a URL) is ever a valid `--remote` argument, and nothing about a
+`.history` directory, or any other on-disk naming Cadence invents for
+itself, is ever documented or required as input — an agent or person
+reaching for the value one client already has for itself must always be
+enough. If a first connection can't be made from that value, the error
+follows the exact §4.4 two-sentence shape, quoting what was tried and
+naming the one thing to check — never the raw "can't reach remote '<value>'"
+with no next step:
+```
+$ cadence sync --remote /wrong/path.db
+Error: no Cadence store found at '/wrong/path.db'. Check the path is the
+other client's CADENCE_DB_PATH and that client has run 'cadence sync' at
+least once.
+```
 Never silent data loss on conflict (this was the bake-off's own hardest-risk
 spike criterion: "serialized cleanly, or fails loudly with a recoverable
 error"). Cadence takes the second branch — a conflicting task is reported,
