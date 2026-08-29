@@ -88,6 +88,18 @@ class StoreUnavailable(CadenceError):
     code = "store_unavailable"
 
 
+class SyncInconsistent(CadenceError):
+    """`sync` hit an internal inconsistency in the history data it read
+    (R-08 re-verify Finding B) -- a clean, actionable error instead of a
+    raw KeyError/internal_error leaking out of the diff/apply logic. The
+    known trigger (two CADENCE_DB_PATH values sharing a history dir) is
+    fixed at the source in `_history`/`_resolve_remote`; this is the
+    defense-in-depth net for any other way two stores' history could end
+    up cross-contaminated."""
+
+    code = "sync_inconsistent"
+
+
 def default_db_path() -> Path:
     """Resolve the store location, honoring CADENCE_DB_PATH for tests/agents
     that want an isolated scratch store instead of the user's real data."""
@@ -194,7 +206,16 @@ class Store:
         # One history repo per store file, living next to it -- so a
         # scratch CADENCE_DB_PATH used by tests gets its own scratch
         # history too, never the real user's.
-        return GitHistory(self.db_path.parent / (self.db_path.stem + ".history"))
+        #
+        # Uses the FULL filename (`.name`), not `.stem` (R-08 re-verify
+        # Finding B): `Path.stem` only strips the *last* dot-suffix, so
+        # two different CADENCE_DB_PATH values that merely share the text
+        # before their first dot -- e.g. `store` and `store.db`, or
+        # `a.db` and `a.db_backup` -- used to derive to the exact same
+        # on-disk history directory and silently cross-contaminate each
+        # other's task history. `.name` keeps the whole filename, so
+        # distinct paths always derive to distinct history dirs.
+        return GitHistory(self.db_path.parent / (self.db_path.name + ".history"))
 
     @staticmethod
     def _resolve_remote(remote: str) -> str:
@@ -217,7 +238,11 @@ class Store:
         p = Path(remote)
         if p.is_dir() and ((p / ".git").is_dir() or (p / "HEAD").is_file()):
             return remote  # already points at a history repo (or bare repo)
-        return str(p.parent / (p.stem + ".history"))
+        # Full filename, not stem -- see the matching comment on
+        # Store._history() (R-08 re-verify Finding B). Must derive the
+        # exact same way that method does, or the two would themselves
+        # disagree about where a given CADENCE_DB_PATH's history lives.
+        return str(p.parent / (p.name + ".history"))
 
     def _snapshot_and_commit(self, tasks: list["Task"], message: str) -> None:
         hist = self._history()
@@ -554,12 +579,26 @@ class Store:
 
     def sync(self, remote: Optional[str] = None) -> dict:
         """docs/human-surface.md §4.10: never silently drops data on
-        conflict. A task changed on both sides since the last clean sync is
-        left untouched on BOTH the local store and the remote, reported by
-        id, and everything else in the same sync still lands.
+        conflict. A task EDITED on both sides since the last clean sync
+        (both have a common prior version that then diverged) is left
+        untouched on BOTH the local store and the remote, reported by id
+        in `conflicts` -- resolve_sync_conflict settles those.
+
+        An id that never had a common prior version -- both sides
+        independently created a task under the same auto-assigned id, with
+        no shared history to compare against (R-08 re-verify Finding A) --
+        is never a real edit conflict (edits never change a task's id or
+        created_at, and ids are never reused once assigned). Treating it
+        like one used to let `resolve_sync_conflict` permanently destroy
+        one side's whole, unrelated task. Instead this is auto-resolved
+        within the same sync call: the id keeps this client's task, and
+        the other side's task is preserved under a freshly assigned id, on
+        both this store and the remote. Reported in `renumbered`, never in
+        `conflicts` -- nothing here needs or accepts resolve_sync_conflict.
 
         Returns {"pulled": N, "pushed": N, "conflicts": [{"id", "mine",
-        "theirs"}], "already_synced": bool}.
+        "theirs"}], "renumbered": [{"old_id", "new_id", "kept_at_old_id"}],
+        "already_synced": bool}.
         """
         hist = self._history()
         hist.ensure()
@@ -587,15 +626,40 @@ class Store:
             hist.push_new_history()
             hist.set_sync_base(local_head)
             n = len(self.list(status="all"))
-            return {"pulled": 0, "pushed": n, "conflicts": [], "already_synced": n == 0}
+            return {
+                "pulled": 0, "pushed": n, "conflicts": [], "renumbered": [],
+                "already_synced": n == 0,
+            }
 
+        try:
+            return self._sync_diff_and_apply(hist, theirs_ref)
+        except CadenceError:
+            raise
+        except Exception as exc:
+            # R-08 re-verify Finding B: a raw KeyError/internal_error out of
+            # the diff/apply logic below is exactly the "undesigned crash"
+            # this project's own bar refuses. The one known trigger (two
+            # CADENCE_DB_PATH values sharing an on-disk history dir) is
+            # fixed at the source in _history/_resolve_remote; this is the
+            # net for anything else that leaves this store's history
+            # inconsistent with what it expects to read back.
+            raise SyncInconsistent(
+                f"sync hit an internal inconsistency reading history data ({type(exc).__name__}: {exc})",
+                hint=(
+                    "Nothing was changed. Check that CADENCE_DB_PATH for every "
+                    "client is a distinct path ending in '.db', then try again."
+                ),
+            ) from exc
+
+    def _sync_diff_and_apply(self, hist: GitHistory, theirs_ref: str) -> dict:
         base_ref = hist.sync_base_sha()
         mine = {t.id: t.to_dict() for t in self.list(status="all")}
         theirs = hist.snapshot_at(theirs_ref)
         base = hist.snapshot_at(base_ref) if base_ref else {}
 
         ids = sorted(set(mine) | set(theirs) | set(base))
-        pulled_ids, pushed_ids, conflicts = [], [], {}
+        next_new_id = (max(ids) + 1) if ids else 1
+        pulled_ids, pushed_ids, conflicts, renumbered = [], [], {}, []
         for tid in ids:
             b, m, t = base.get(tid), mine.get(tid), theirs.get(tid)
             if m == t:
@@ -603,27 +667,51 @@ class Store:
             mine_changed = m != b
             theirs_changed = t != b
             if mine_changed and theirs_changed:
-                conflicts[tid] = {"mine": m, "theirs": t}
+                if b is None:
+                    # ID COLLISION, not an edit conflict -- see the
+                    # docstring above. Keep mine at its existing id;
+                    # preserve theirs under a fresh one, both sides.
+                    new_id = next_new_id
+                    next_new_id += 1
+                    renumbered_task = dict(t)
+                    renumbered_task["id"] = new_id
+                    mine[new_id] = renumbered_task
+                    pushed_ids.append(tid)       # re-assert mine on the remote
+                    pushed_ids.append(new_id)    # add theirs under its new id
+                    renumbered.append(
+                        {"old_id": tid, "new_id": new_id, "kept_at_old_id": "mine"}
+                    )
+                else:
+                    conflicts[tid] = {"mine": m, "theirs": t}
             elif theirs_changed:
                 pulled_ids.append(tid)
             elif mine_changed:
                 pushed_ids.append(tid)
 
         if not pulled_ids and not pushed_ids and not conflicts:
-            return {"pulled": 0, "pushed": 0, "conflicts": [], "already_synced": True}
+            return {
+                "pulled": 0, "pushed": 0, "conflicts": [], "renumbered": [],
+                "already_synced": True,
+            }
 
         local_head = hist.head()
+        renumbered_ids = [r["new_id"] for r in renumbered]
         with closing(self._connect()) as conn:
             for tid in pulled_ids:
                 self._apply_remote_task(conn, theirs[tid])
+            for new_id in renumbered_ids:
+                self._apply_remote_task(conn, mine[new_id])
             conn.commit()
         for tid in pulled_ids:
             hist.write_task_file(theirs[tid])
+        for new_id in renumbered_ids:
+            hist.write_task_file(mine[new_id])
 
-        # What we're willing to push: only local's own non-conflicting
-        # changes, laid on top of origin's own tree -- so pushing can never
-        # overwrite a path this sync chose not to resolve (the conflicted
-        # ids are simply absent from `overlay`).
+        # What we're willing to push: local's own non-conflicting changes
+        # plus any renumbered rows, laid on top of origin's own tree -- so
+        # pushing can never overwrite a path this sync chose not to
+        # resolve (a genuinely conflicted id is simply absent from
+        # `overlay`).
         overlay = {tid: mine[tid] for tid in pushed_ids}
         pushed_ok = True
         if overlay:
@@ -634,7 +722,8 @@ class Store:
         # writes are already applied to the local working tree above).
         hist.advance_local(
             [local_head, theirs_ref],
-            f"sync: pulled {len(pulled_ids)}, pushed {len(pushed_ids)}",
+            f"sync: pulled {len(pulled_ids)}, pushed {len(pushed_ids)}, "
+            f"renumbered {len(renumbered)}",
         )
 
         if conflicts:
@@ -648,6 +737,7 @@ class Store:
             "pulled": len(pulled_ids),
             "pushed": len(pushed_ids) if pushed_ok else 0,
             "conflicts": [{"id": tid, **v} for tid, v in conflicts.items()],
+            "renumbered": renumbered,
             "already_synced": False,
         }
 

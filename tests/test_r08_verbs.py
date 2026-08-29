@@ -558,3 +558,109 @@ def test_cli_sync_conflict_exit_code_and_recovery_command(tmp_path, bare_remote)
 
     r_clean = _run_cli("sync", env=env_b)
     assert r_clean.returncode == 0, r_clean.stderr
+
+
+# --- R-08 re-verify Finding A: id collision must never destroy a task ----
+
+
+def test_sync_id_collision_between_unrelated_tasks_preserves_both(tmp_path, bare_remote):
+    """Two never-synced-before clients each add a task before ever
+    syncing, so each store assigns id 1 independently -- an id
+    COLLISION between two unrelated tasks, not an edit of the same task.
+    Unlike a real edit conflict, this must never destroy either side's
+    content: it auto-resolves within sync() itself (reported in
+    `renumbered`, not `conflicts`), never requiring resolve_sync_conflict
+    (which would otherwise permanently delete the losing side's task --
+    see docs/ten-step-transcript.md "Step 8 in detail", Finding A)."""
+    store_a = Store(db_path=tmp_path / "coll_a.db")
+    store_b = Store(db_path=tmp_path / "coll_b.db")
+
+    task_a = store_a.add("Draft offsite agenda")
+    task_b = store_b.add("Buy milk")
+    assert task_a.id == task_b.id  # both independently assigned id 1
+
+    r_a = store_a.sync(remote=bare_remote)
+    assert r_a["conflicts"] == []
+    assert r_a["renumbered"] == []
+
+    r_b = store_b.sync(remote=bare_remote)
+    assert r_b["conflicts"] == []
+    assert len(r_b["renumbered"]) == 1
+    assert r_b["renumbered"][0]["old_id"] == task_b.id
+    assert r_b["renumbered"][0]["kept_at_old_id"] == "mine"
+
+    # B kept its own task at id 1 AND gained A's task under a fresh id --
+    # neither title was deleted.
+    b_titles = {t.title for t in store_b.list(status="all")}
+    assert "Buy milk" in b_titles
+    assert "Draft offsite agenda" in b_titles
+    assert store_b.get(task_b.id).title == "Buy milk"
+
+    # A syncing again must also end up with both titles present somewhere
+    # in its own store -- still no content lost, from either side.
+    r_a2 = store_a.sync(remote=bare_remote)
+    assert r_a2["conflicts"] == []
+    a_titles = {t.title for t in store_a.list(status="all")}
+    assert "Buy milk" in a_titles
+    assert "Draft offsite agenda" in a_titles
+
+    # No open conflict was left behind for either client to resolve.
+    with pytest.raises(CadenceError):
+        store_b.resolve_conflict(task_b.id, "mine")
+
+
+def test_mcp_sync_tasks_reports_id_collision_as_renumbered_not_conflict(
+    tmp_path, monkeypatch, bare_remote
+):
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp_coll_a.db"))
+    from cadence.mcp_server import add_task, sync_tasks
+
+    add_task("A's first task")
+    sync_tasks(remote=bare_remote)
+
+    store_b = Store(db_path=tmp_path / "mcp_coll_b.db")
+    store_b.add("B's first task")
+    result = store_b.sync(remote=bare_remote)
+    assert result["conflicts"] == []
+    assert len(result["renumbered"]) == 1
+
+
+# --- R-08 re-verify Finding B: distinct CADENCE_DB_PATH stems must not ---
+# --- collide on-disk and must never crash sync with a raw KeyError -------
+
+
+def test_history_dir_does_not_collide_on_shared_stem(tmp_path):
+    """`Path.stem` only strips the last dot-suffix, so `store` and
+    `store.db` used to derive to the identical on-disk history directory
+    even though they're different CADENCE_DB_PATH values."""
+    store_plain = Store(db_path=tmp_path / "store")
+    store_dotdb = Store(db_path=tmp_path / "store.db")
+
+    assert store_plain._history().repo_dir != store_dotdb._history().repo_dir
+
+
+def test_sync_no_crash_when_second_db_path_shares_stem_with_existing_store(tmp_path):
+    """Direct regression for the documented repro (docs/ten-step-transcript.md
+    "Step 8 in detail", Finding B): two brand-new stores whose paths are
+    built by suffixing an already-in-use store's path share that store's
+    `Path.stem` and, under the old derivation, all three collapsed onto
+    the SAME history directory -- crashing sync with a raw `KeyError: 2`
+    and cross-contaminating the pre-existing store's history. Must not
+    crash, and the pre-existing store's own data must be untouched."""
+    used = Store(db_path=tmp_path / "used.db")
+    used.add("Existing task")
+
+    collide_c = Store(db_path=tmp_path / "used.db_collide_c")
+    collide_d = Store(db_path=tmp_path / "used.db_collide_d")
+    collide_c.add("C's own task")
+    collide_d.add("D's own task")
+
+    r = collide_c.sync(remote=str(collide_d.db_path))
+    assert r["conflicts"] == []
+
+    c_titles = {t.title for t in collide_c.list(status="all")}
+    assert "C's own task" in c_titles
+    assert "D's own task" in c_titles
+
+    # The pre-existing, unrelated store's history was never touched.
+    assert [t.title for t in used.list(status="all")] == ["Existing task"]

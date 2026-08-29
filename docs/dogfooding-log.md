@@ -111,3 +111,51 @@ store: `Error: title is 201 characters, max 200. Try a shorter one.` on
 the CLI, `{"ok": false, "error": "invalid_task", "message": "title is 201
 characters, max 200", "hint": "Try a shorter one."}` from MCP. A 200-char
 title still succeeds on both surfaces.
+
+## Week 1 — 2026-08-29 (Rafael Okonkwo, Build): sync data-loss + crash on the sync surface
+
+Friction found through the same kind of real use this log exists to
+capture, just on the agent-facing side: Dov's (Red Team) R-08
+re-verification drove the published 0.2.1 wheel through the documented
+`sync_tasks`/`resolve_sync_conflict` recovery flow exactly as its own
+docstring names it (docs/ten-step-transcript.md "Step 8 in detail"), and
+hit two real defects that would bite this company's own multi-client
+dogfooding the moment two people's local `CADENCE_HOME` stores ever
+diverged and got synced:
+
+- **Data loss on the documented recovery path.** `sync_tasks` correctly
+  reports an id **collision** between two independently-created,
+  unrelated tasks (each store assigns ids on its own, so two never-synced
+  clients' first tasks both land on id 1) — but `resolve_sync_conflict`
+  then handled it exactly like a real **edit conflict** on one shared
+  task, permanently deleting the losing side's whole, unrelated task.
+  Fixed in `Store.sync()`: a collision (no common prior version on either
+  side — `base` has nothing for that id) is now detected and auto-resolved
+  within the same `sync()` call, never routed through
+  `resolve_sync_conflict` at all. This client's task keeps its id; the
+  other client's task is preserved under a freshly assigned id, on both
+  stores. Reported in a new `renumbered` field, kept separate from
+  `conflicts` (which is now only ever a real, same-task edit conflict).
+- **Undesigned crash (`KeyError: 2` leaking past the `{ok:false,...}`
+  contract).** `Store._history()`/`Store._resolve_remote()` derived each
+  store's on-disk history directory from `Path(db_path).stem`, which only
+  strips the *last* dot-suffix — so two different `CADENCE_DB_PATH`
+  values that merely share the text before their first dot (e.g. `store`
+  and `store.db`, or a real store's path suffixed to build a second one)
+  silently collapsed onto the exact same history directory and
+  cross-contaminated each other's task history, eventually surfacing as a
+  raw `KeyError` instead of a clean error. Fixed by deriving from the full
+  `.name` instead of `.stem`, so distinct paths always get distinct
+  history dirs; `sync()`'s diff/apply step is also now wrapped so any
+  remaining internal inconsistency fails with a clean, two-sentence
+  `sync_inconsistent` error instead of a raw exception leaking through.
+
+Both fixes ship as `cadence-todo` 0.2.2 with regression tests
+(`test_sync_id_collision_between_unrelated_tasks_preserves_both`,
+`test_sync_no_crash_when_second_db_path_shares_stem_with_existing_store`,
+and two more in the same class in `tests/test_r08_verbs.py`). Neither
+reopens R-08's PASS verdict (the ten-step script itself never exercises
+either trigger), but both are exactly the kind of thing dogfooding this
+company's own multi-client use of the app would eventually have hit on
+its own — this time it was caught first by driving the published package
+the way an outside agent actually would.

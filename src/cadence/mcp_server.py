@@ -239,11 +239,21 @@ def undo() -> dict:
 def sync_tasks(remote: Optional[str] = None) -> dict:
     """Sync this store with a shared remote (another client's history).
 
-    Never silently drops data: a task that differs between this store and
-    the remote since the last clean sync (edited on both sides, or
-    independently created with the same id) is left untouched on both
-    this store and the remote and is reported in `conflicts` instead of
-    being overwritten; everything else in the same sync still lands.
+    Never silently drops data. Two different things can make a task id
+    differ between this store and the remote since the last clean sync:
+
+    - Edited on both sides (same task, changed independently on each
+      client): left untouched on both this store and the remote, reported
+      by id in `conflicts`. Call resolve_sync_conflict(id, keep="mine"|
+      "theirs") for each one, then call sync_tasks again.
+    - Independently created with the same id (two unrelated tasks that
+      happened to get the same auto-assigned id, since each client
+      assigns ids on its own): never a real conflict, so it's resolved
+      automatically within this same call -- this client's task keeps its
+      id, the other client's task is preserved under a freshly assigned
+      id. Reported by id in `renumbered`; nothing to call for these.
+
+    Everything else in the same sync still lands either way.
 
     Args:
         remote: The OTHER client's own CADENCE_DB_PATH value (its plain
@@ -255,10 +265,10 @@ def sync_tasks(remote: Optional[str] = None) -> dict:
 
     Returns:
         {"ok": true, "pulled": N, "pushed": N, "already_synced": bool,
-        "conflicts": [{"id", "mine", "theirs"}, ...]}. If `conflicts` is
-        non-empty, call resolve_sync_conflict(id, keep="mine"|"theirs") for
-        each one, then call sync_tasks again. {"ok": false, ...} if no
-        remote is configured or it can't be reached.
+        "conflicts": [{"id", "mine", "theirs"}, ...],
+        "renumbered": [{"old_id", "new_id", "kept_at_old_id"}, ...]}.
+        {"ok": false, ...} if no remote is configured or it can't be
+        reached.
     """
     try:
         result = Store().sync(remote=remote)

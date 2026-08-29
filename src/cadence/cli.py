@@ -287,17 +287,22 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print("Already in sync with origin. Nothing to pull or push.")
         return 0
     pulled, pushed = result["pulled"], result["pushed"]
+    for r in result.get("renumbered", []):
+        print(
+            f"Note: #{r['old_id']} was independently created on both clients "
+            f"(not an edit of the same task) -- kept #{r['old_id']} as this "
+            f"client's version and gave the other client's task a new id, "
+            f"#{r['new_id']}. Nothing was lost or overwritten."
+        )
     if result["conflicts"]:
-        ids = ", ".join(str(c["id"]) for c in result["conflicts"])
         print(
             f"Synced with origin: pulled {pulled}, pushed {pushed}. "
             f"{len(result['conflicts'])} conflict needs you."
         )
         for c in result["conflicts"]:
             print(
-                f"Error: #{c['id']} differs between this client and the remote "
-                f"since the last sync (edited on both sides, or independently "
-                f"created with the same id). Nothing was overwritten. Run "
+                f"Error: #{c['id']} was edited on both this client and the "
+                f"remote since the last sync. Nothing was overwritten. Run "
                 f"'cadence sync --keep-mine {c['id']}' or 'cadence sync "
                 f"--keep-theirs {c['id']}', then sync again."
             )
