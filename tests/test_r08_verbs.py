@@ -503,6 +503,64 @@ def test_sync_remote_accepts_plain_db_path_and_converges(tmp_path):
     assert {t.id for t in store_b.list(status="all")} == {task_a.id, task_b.id}
 
 
+def test_sync_push_into_peer_that_only_ever_listed_bootstraps_and_succeeds(tmp_path):
+    """R-08 re-verify Finding D
+    (redteam_run7_0224/REDTEAM_PASS_0.2.4_sync_deep.md): a peer whose store
+    file exists (created by a read-only `list`) but has never written or
+    synced -- no `.history` yet -- used to make a push into it fail with
+    `no Cadence store found at '<path>'`, even though the path and the
+    store file are both correct. The peer's history must now be
+    transparently bootstrapped so the push just works, exactly as if that
+    peer had run any command on itself first."""
+    store_a = Store(db_path=tmp_path / "a.db")
+    store_b_path = tmp_path / "b.db"
+
+    task_a = store_a.add("A's task")
+
+    # Client B: brand new device. A read-only `list()` creates the sqlite
+    # file (matching `cadence list` in the real CLI) but must NOT itself
+    # create a `.history` dir -- otherwise this test would not reproduce
+    # Finding D's precondition at all.
+    store_b = Store(db_path=store_b_path)
+    assert store_b.list(status="all") == []
+    assert store_b_path.exists()
+    history_dir = store_b_path.parent / (store_b_path.name + ".history")
+    assert not (history_dir / ".git").is_dir()
+
+    # Client A pushes into B -- the normal "sync my tasks to my new device"
+    # order. Must not raise (the old bug), and must actually push (not
+    # silently no-op).
+    result = store_a.sync(remote=str(store_b_path))
+    assert result["conflicts"] == []
+    assert result["pushed"] == 1
+    assert (history_dir / ".git").is_dir()
+
+    # B's own sqlite only picks up an incoming push once B itself syncs --
+    # same as an already-initialized peer (see
+    # test_sync_remote_accepts_plain_db_path_and_converges); this fix is
+    # scoped to the transport bootstrap, not the pull/apply logic. That
+    # normal second half of the flow must now work too, proving the
+    # bootstrap produced a real, usable history rather than just avoiding
+    # the error.
+    landed = Store(db_path=store_b_path)
+    r_b = landed.sync(remote=str(store_a.db_path))
+    assert r_b["conflicts"] == []
+    assert r_b["pulled"] == 1
+    assert [t.title for t in landed.list(status="all")] == ["A's task"]
+
+
+def test_sync_into_genuinely_missing_peer_path_still_errors(tmp_path):
+    """The bootstrap above is scoped to a peer store file that actually
+    exists on disk -- a path with nothing at all must still fail exactly
+    as before (see also
+    test_cli_sync_remote_help_and_error_name_the_db_path_contract), so a
+    real typo/wrong-path mistake is never silently swallowed."""
+    store_a = Store(db_path=tmp_path / "a2.db")
+    store_a.add("A's task")
+    with pytest.raises(InvalidTask, match="no Cadence store found"):
+        store_a.sync(remote=str(tmp_path / "does_not_exist.db"))
+
+
 def test_cli_sync_remote_help_and_error_name_the_db_path_contract(tmp_path):
     env = _cli_env(tmp_path, "cli_remote_help.db")
     help_out = _run_cli("sync", "--help", env=env)
@@ -513,6 +571,35 @@ def test_cli_sync_remote_help_and_error_name_the_db_path_contract(tmp_path):
     assert bad.stdout.startswith(f"Error: no Cadence store found at '{tmp_path / 'nope.db'}'.")
     assert "CADENCE_DB_PATH" in bad.stdout
     assert "cadence sync' at least once" in bad.stdout
+
+
+def test_cli_sync_push_into_freshly_listed_peer_succeeds(tmp_path):
+    """Real-CLI reproduction of R-08 re-verify Finding D's exact repro:
+    client A has a task, client B is a brand new device that has only ever
+    run `list`, then A syncs --remote straight at B's path. Must exit 0
+    and actually land the task on B, not report a missing store."""
+    env_a = _cli_env(tmp_path, "finding_d_a.db")
+    env_b = _cli_env(tmp_path, "finding_d_b.db")
+
+    added = _run_cli("add", "A's task", env=env_a)
+    assert added.returncode == 0, added.stdout
+
+    listed = _run_cli("list", env=env_b)
+    assert listed.returncode == 0, listed.stdout
+    assert (tmp_path / "finding_d_b.db").exists()
+
+    synced = _run_cli("sync", "--remote", str(tmp_path / "finding_d_b.db"), env=env_a)
+    assert synced.returncode == 0, synced.stdout
+    assert "no Cadence store found" not in synced.stdout
+
+    # B still has to sync itself to materialize the incoming push into its
+    # own store (same as any already-initialized peer) -- this fix bootstraps
+    # the transport, not the pull/apply logic.
+    b_sync = _run_cli("sync", "--remote", str(tmp_path / "finding_d_a.db"), env=env_b)
+    assert b_sync.returncode == 0, b_sync.stdout
+
+    b_listed = _run_cli("list", env=env_b)
+    assert "A's task" in b_listed.stdout
 
 
 def test_mcp_sync_tasks_and_resolve(tmp_path, monkeypatch, bare_remote):

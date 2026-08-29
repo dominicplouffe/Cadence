@@ -273,6 +273,42 @@ class Store:
         # disagree about where a given CADENCE_DB_PATH's history lives.
         return str(p.parent / (p.name + ".history"))
 
+    @staticmethod
+    def _maybe_init_peer_history(remote: str) -> None:
+        """R-08 re-verify Finding D (redteam_run7_0224/REDTEAM_PASS_0.2.4_sync_deep.md):
+        a peer whose `.db` file exists but has never had a write or a sync
+        of its own (e.g. it only ever ran `cadence list`, which creates the
+        sqlite file but never touches `.history`) used to make `sync`
+        report `no Cadence store found at '<path>'` -- true of the git
+        history, false of the store, and actionable only from a command
+        run *on that other client*, which the initiating side has no way
+        to do. `Store()` already treats "first mutation on a fresh path"
+        as an ordinary, silent event (`_snapshot_and_commit` -> `hist.ensure()`);
+        this makes "first *push into* a fresh path" the same non-event
+        instead of an error, by doing exactly what that first mutation
+        would have done to the peer's history, before `fetch` ever runs.
+
+        Deliberately narrow: only fires when `remote` is a plain local
+        `.db`-style path (never a git URL/`git@`, matched the same way
+        `_resolve_remote` already does) whose file exists on disk (so a
+        genuinely wrong/nonexistent path -- see
+        test_cli_sync_remote_help_and_error_name_the_db_path_contract --
+        still fails exactly as before) but whose derived `.history` dir
+        has no `.git` yet. Touches only that derivation and `GitHistory.ensure()`,
+        never the diff/apply/merge logic Findings A/B/C already fixed.
+        """
+        if "://" in remote or remote.startswith("git@"):
+            return
+        p = Path(remote)
+        if p.is_dir() and ((p / ".git").is_dir() or (p / "HEAD").is_file()):
+            return  # already points straight at a history/bare repo
+        if not p.exists():
+            return  # nothing on disk at all -- a real bad-path error, not this case
+        hist_dir = p.parent / (p.name + ".history")
+        if (hist_dir / ".git").is_dir():
+            return  # already initialized -- nothing to do
+        GitHistory(hist_dir).ensure()
+
     def _snapshot_and_commit(self, tasks: list["Task"], message: str) -> None:
         hist = self._history()
         hist.ensure()
@@ -663,6 +699,12 @@ class Store:
         hist.ensure()
         given_remote = remote
         if remote:
+            # R-08 re-verify Finding D: transparently bootstrap a peer that
+            # exists on disk but has never written or synced -- see
+            # _maybe_init_peer_history -- before resolving/fetching it, so
+            # pushing into a brand-new second device just works instead of
+            # misreporting "no Cadence store found".
+            self._maybe_init_peer_history(remote)
             hist.set_remote(self._resolve_remote(remote))
         remote_url = hist.get_remote()
         if not remote_url:

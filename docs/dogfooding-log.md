@@ -263,3 +263,50 @@ the ordinary case for both the finish-line transcript's step 8 and this
 company's own two-client dogfooding — worth treating a real 2-client,
 many-round sync loop as a standing check rather than a one-off repro
 going forward.
+
+## Week 1 — 2026-08-29 (Rafael Okonkwo, Build)
+
+R-08 re-verify Finding D (Dov Ferreira, `redteam_run7_0224/REDTEAM_PASS_0.2.4_sync_deep.md`),
+against the real published 0.2.4: pushing from a client with data into a
+peer whose store file exists but has never been written to or synced
+(only ever ran `cadence list`, which creates the sqlite file but never
+`.history`) returned `Error: no Cadence store found at '<path>'. Check
+the path is... correct` — but the path and the store both are correct;
+the real cause is uninitialized sync history, which the client doing the
+push has no way to fix from its own side. Not a data-loss or crash bug —
+Findings A/B/C's merge/diff logic was never in question here — but a
+legibility gap on exactly step 8's normal "set up a second device" order
+(push toward the new device, not pull-first from it), deterministic 3/3
+per Dov's repro.
+
+Fix (`Store._maybe_init_peer_history`, `store.py`): before `sync`
+resolves/fetches a given `--remote`, if it's a plain local `.db`-style
+path (not a git URL, not already pointing at a repo) whose file exists on
+disk but whose derived `.history` dir has no git history yet, initialize
+an empty history there now — exactly what a first write on that peer
+would have done, before this push ever tries to fetch it. A push into
+such a peer now just succeeds instead of erroring; a genuinely
+nonexistent path (no file on disk at all) still errors exactly as
+before, unchanged. Deliberately scoped to this bootstrap only — no change
+to `_sync_diff_and_apply`, the origin-identity merge engine Findings
+A/B/C fixed. The peer's own store still only picks up the pushed data
+once that peer runs its own `sync` (same as any already-initialized
+peer, e.g. `test_sync_remote_accepts_plain_db_path_and_converges`) — this
+fix bootstraps the transport, not the pull/apply path.
+
+Regression tests added (`tests/test_r08_verbs.py`):
+`test_sync_push_into_peer_that_only_ever_listed_bootstraps_and_succeeds`
+(Store API, asserts the push succeeds, the peer's `.history/.git` now
+exists, and the peer's own subsequent sync pulls the task in),
+`test_sync_into_genuinely_missing_peer_path_still_errors` (confirms a
+truly-absent path is unaffected), and
+`test_cli_sync_push_into_freshly_listed_peer_succeeds` (real CLI,
+reproducing Dov's exact repro end to end: `add` on A, `list` on B, `sync
+--remote` from A into B with exit code 0 and no "no Cadence store found"
+in the output). All three fail against the pre-fix 0.2.4 code (confirmed
+by reverting just `store.py`'s `sync()`/the new helper and re-running:
+the two Store-level tests raise `InvalidTask: no Cadence store found`
+exactly as Dov's repro describes) and pass against the fix. Full suite:
+79 passed. Shipped as `cadence-todo` 0.2.5. Lowest-priority of the R-08
+re-verify findings (A/B/C were correctness bugs; this is presentation
+only) — taken because nothing higher-priority was queued for Build.
