@@ -351,3 +351,165 @@ section, and install instructions — left `docs/bakeoff.md`,
 
 No code change, no version bump — this is a docs-only fix and ships
 straight to `main`.
+
+## Week 1 — 2026-08-29 (Dov Ferreira, Red Team)
+
+Chairman said "hit the MCP hard" right after being pointed at connecting
+his own Claude to `cadence mcp` and talking to it naturally. This pass is
+scoped to exactly that: not the scripted ten-step transcript (already
+verified 10/10 against published releases), but ~90 adversarial,
+malformed, and out-of-order MCP tool calls an unscripted agent could
+plausibly make, driven against the real published `cadence-todo` 0.2.5
+from a fresh venv (`pip install cadence-todo mcp` into a clean
+virtualenv, `mcp.client.stdio` talking to `cadence mcp` as a real
+subprocess — no repo checkout on the path). Full raw log of every call
+and response: `/workspace/redteam_mcp_stress/results.jsonl` and
+`stress.py` (harness), `coerce_check.py` and `unknown_tool_check.py`
+(follow-up probes), all in the shared workspace.
+
+**Finding 1 (highest priority — files as a Build task under this
+requirement): a wrong-JSON-type argument to any MCP tool leaks a raw
+pydantic validation dump instead of the designed `{ok:false, error,
+message, hint}` shape.** FastMCP validates a call's arguments against the
+tool's JSON schema *before* the tool function body (and therefore
+`mcp_server.py`'s own `_err_unexpected` net) ever runs, so a
+type-category mismatch — string vs int vs bool vs list, or a missing
+required field — never reaches cadence's error handling at all. Confirmed
+6 ways:
+```
+add_task(title=12345)            -> isError=true: "Error executing tool add_task: 1 validation
+                                     error for add_taskArguments\ntitle\n  Input should be a valid
+                                     string [type=string_type, input_value=12345, input_type=int]
+                                     \n    For further information visit
+                                     https://errors.pydantic.dev/2.13/v/string_type"
+add_task(title=True)             -> same shape, bool
+add_task({})                     -> "...title\n  Field required [type=missing, input_value={}, ...]"
+schedule_task(id="abc", due=...) -> "...id\n  Input should be a valid integer, unable to parse
+                                     string as an integer [type=int_parsing, ...]"
+schedule_task(id=1.5, due=...)   -> "...id\n  Input should be a valid integer, got a number with
+                                     a fractional part [type=int_from_float, ...]"
+decompose_task(id=2, into="x")   -> "...into\n  Input should be a valid list [type=list_type, ...]"
+```
+This is exactly the shape `_err_unexpected`'s own docstring names as the
+thing that must never reach an agent ("a shape no agent's `ok` branch is
+written to expect") — it just arrives one layer earlier than that net
+catches. Numeric-string ids (`id="1"`) *do* coerce fine, so this only
+bites on genuine type-category slips — but that is precisely the kind of
+slip a free-form conversational agent makes without ever reading the
+JSON schema literally (e.g. passing a single string to `into` because it
+decided there was only one subtask, or a bare number for `priority`).
+Given the chairman may hit this live, this is the one finding on this
+pass worth fixing before anything else. Filed to Build (message to
+leadership, since only the CEO can create team tasks) tied to this same
+requirement.
+
+**Finding 2 (medium): `sync_tasks(remote=<a plain directory, not a `.db`
+file and not a git repo>)` is silently accepted instead of rejected.**
+`Store._resolve_remote`/`_maybe_init_peer_history` only special-case a
+directory that already has `.git`/`HEAD` in it (a real repo); any other
+directory falls through to the same "treat it as a stem, append
+`.history`" logic used for a plain `.db` path. Repro:
+```
+$ # CADENCE_DB_PATH=/workspace/redteam_mcp_stress/scratch/cadence.db, 28 tasks already in the store
+sync_tasks(remote="/workspace/redteam_mcp_stress/scratch")   # scratch/ is a real dir, no .git inside
+-> {"ok": true, "pulled": 0, "pushed": 28, "conflicts": [], "renumbered": [], "already_synced": false}
+```
+and a brand-new git-backed history repo appears on disk at
+`/workspace/redteam_mcp_stress/scratch.history/` — a sibling of the
+directory the caller pointed at, holding a full copy of all 28 tasks —
+with nothing in the response indicating anything unusual happened. The
+`sync_tasks` docstring's own contract says `remote` must be "the OTHER
+client's own CADENCE_DB_PATH value (its plain `.db` file path) ... A git
+URL also works" — a bare non-repo directory is neither, and
+docs/human-surface.md §4.10 promises the exact §4.4 two-sentence error
+shape ("naming the one thing to check") for exactly this case ("If a
+first connection can't be made from that value..."). Instead it silently
+"succeeds" against a location nobody will ever read from, and writes
+unexpected files next to wherever the caller pointed. Lower severity than
+Finding 1 (no data loss — nothing was there to lose — and it takes a
+directory-shaped typo specifically, not any malformed input), but still
+a real gap in the "never silently drops data" / "never a raw path
+detail leaks" promises this exact code section makes. Filed to Build
+alongside Finding 1.
+
+**What held (tried, no defect found):**
+- Out-of-order calls against a completely fresh store — `complete_task`,
+  `undo`, `resolve_sync_conflict`, `schedule_task`, `reprioritise_task`,
+  `decompose_task`, `sync_tasks` all called before any task exists — every
+  one returned the clean `{ok:false, error, message, hint}` shape with no
+  leak (`task_not_found`, `nothing_to_undo`, `no_such_conflict`,
+  `invalid_task` as appropriate).
+- `add_task` boundaries: empty title, whitespace-only title, title at
+  exactly 200 chars (succeeds) vs 201 (clean reject), a 100k-char title
+  (clean reject, same message shape, not a hang or truncated dump), a
+  title with emoji/RTL/an embedded quote (`buy milk "for the café" —
+  emergency 🥛❤️ مرحبا`, stored and round-tripped byte-correct), and a
+  SQL-injection-shaped title (`SQLi'); DROP TABLE tasks;--`, stored
+  inertly as a literal string — sqlite3 parameter binding, not string
+  interpolation, confirmed by the table still being queryable afterward).
+- Malformed `due` values on both `add_task` and `schedule_task`:
+  unparsable string, empty string, an impossible calendar date
+  (`2026-13-40`), and a full ISO datetime (`2026-09-01T10:30:00`, which
+  the docstring's "ISO date/time string" phrasing might suggest works but
+  does not — `_validate_due` only accepts a bare date). All four reject
+  cleanly with the same `{ok:false, error:"invalid_task", ...}` shape and
+  a correct hint; nothing crashes. Worth a docstring tweak (say "date
+  string, e.g. 2026-09-01" rather than "date/time string") but the error
+  itself is clean and actionable, so not filed as a defect.
+- `id` edge cases on `complete_task`/`schedule_task`: nonexistent,
+  negative, zero, and an id overflowing sqlite's 64-bit bound
+  (`99999999999999999999`) — all return the same clean `task_not_found`,
+  including the overflow case (confirms the existing `OverflowError`
+  guard in `Store.get` still holds on the real published package).
+- Calling `complete_task` twice on the same id: idempotent in practice —
+  second call returns `ok:true` with the task already `done`, and because
+  both calls landed in the same second the git snapshot is byte-identical
+  so no duplicate "Done #1" commit was created (verified via `git log` on
+  the store's own `.history` — only one `Done #1` entry exists after two
+  calls). Not chasing a same-second race further; a call spaced further
+  apart would legitimately re-stamp `completed_at`, which is a reasonable
+  "re-affirm completion" outcome, not a data-loss one.
+- `reprioritise_task`/`decompose_task` on an already-completed task: both
+  succeed rather than reject. Nothing in the docs restricts either against
+  a done task, so not filed as a defect, but worth an explicit product
+  decision later — a done parent gaining a new open subtask is a real
+  state `list_tasks(status="pending")` should render sensibly for an
+  agent (each returned task already carries `parent_id`, so an agent can
+  reconstruct the relationship itself either way).
+- `decompose_task`: empty `into` list, an `into` of only blank/whitespace
+  strings, exactly 20 subtasks (the cap — succeeds), 21 in one call (clean
+  reject naming the cap), a 21st added via a second call after already at
+  20 (clean reject), a nonexistent parent id, and a depth-4 chain
+  (parent → child → grandchild → great-grandchild) — the first three
+  levels succeed and the 4th is cleanly rejected as "already at max
+  decomposition depth (3)", exactly per docs/human-surface.md §4.7.
+- `undo`: the documented double-undo symmetry holds, and pushed further —
+  ran 15+ consecutive `undo` calls in a row (an "undo storm") walking all
+  the way back through the entire history to the initial empty store and
+  past it; every call returned a clean `{ok:true, summary}` with no crash
+  and no `nothing_to_undo` misfire until history was genuinely exhausted.
+- Two-client sync end to end, including a genuine edit conflict: peer
+  creates a task and seeds the main store; main pulls it; both sides then
+  edit the *same* synced task differently (main reprioritises it, peer
+  reschedules it) before re-syncing; the next `sync_tasks` on main
+  correctly reported the pair in `conflicts`, and `resolve_sync_conflict`
+  settled it as designed. Self-sync (`remote` pointed at the store's own
+  db path) is a safe no-op (`already_synced: true, pulled 0, pushed 0`).
+- Calling a tool name that doesn't exist (`delete_task`, which nothing
+  documents but a chairman-invented "just delete it" instruction could
+  plausibly produce) returns a short, clean `isError=true: "Unknown tool:
+  delete_task"` from the MCP SDK itself — no stack trace, no schema dump.
+- Extra/unrecognized keyword arguments on a valid call (`add_task(title=
+  "x", urgent=True)`) and an explicit `null` for an optional field
+  (`add_task(title="x", due=None)`) are both silently accepted and
+  ignored/treated-as-omitted respectively — reasonable, forgiving
+  behavior for a model that includes a field out of over-caution.
+
+Ranked by consequence: Finding 1 first (an agent — including the
+chairman's own live session — hits it on an ordinary type slip, and the
+result looks exactly like an unhandled crash rather than a designed
+error); Finding 2 second (needs a specific directory-shaped mistake, and
+loses no data, but still silently does the wrong thing and pollutes the
+filesystem). Neither is fixed in this pass — findings only, filed to
+Build under this requirement per the task's instructions; Red Team does
+not edit the code under test.
