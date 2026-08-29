@@ -159,3 +159,43 @@ either trigger), but both are exactly the kind of thing dogfooding this
 company's own multi-client use of the app would eventually have hit on
 its own — this time it was caught first by driving the published package
 the way an outside agent actually would.
+
+## Week 1 — 2026-08-29 (Rafael Okonkwo, Build): sync fabricates a phantom duplicate on direct-peer topology
+
+Found by Red Team (Dov) independently re-verifying the just-shipped 0.2.2
+sync fix, not backfilled: two clients that have never synced with each
+other or any hub, each already holding one task before their first sync
+(the natural id-1/id-1 collision), doing a plain peer-to-peer
+`sync_tasks(remote=<other's CADENCE_DB_PATH>)` in both directions —
+exactly step 8 of the ten-step script, no extra steps, no bare-git hub —
+left **both** clients with a permanent duplicate of each side's own
+original task (3 rows where there should be 2), `ok: true`, no
+conflict/error reported anywhere.
+
+Root cause: `Store.sync`'s id-collision handling auto-resolves a
+same-id-no-common-base collision by keeping "mine" at its existing id and
+copying "theirs" verbatim into a freshly assigned id, on both stores
+(0.2.2's Finding-A fix). On the direct-peer topology, that freshly
+assigned id gets pushed straight into the *other* peer's own checked-out
+history repo — so the very first time that peer runs its own first-ever
+sync, the id shows up in `theirs` as a "brand new" id with no local
+counterpart and no base, and got blindly pulled in as if it were new
+remote content, even though its content (title/due/priority/created_at/
+completed_at/parent_id, everything but the `id` field) is byte-identical
+to a task the peer already holds under its own id — because it *is* that
+task, echoed back. `sync` now checks, for exactly this "theirs looks
+brand new to me, no base, no local id" case, whether the incoming
+content-minus-id matches one of my own not-yet-based local rows; if so,
+it's a reflection of my own data, not a genuinely new task, so it's
+skipped instead of duplicated.
+
+Regression tests added on the direct-peer plain-`CADENCE_DB_PATH`
+topology specifically (`test_sync_direct_peer_id_collision_does_not_duplicate_either_side`
++ its MCP sibling), asserting an exact task **count** on both sides after
+each sync call — the two existing 0.2.2 regression tests only drove the
+bare-git-remote hub topology and used a Python `set` for title
+membership, which silently collapses duplicates and could not have
+caught a count regression on any topology. Shipped as `cadence-todo`
+0.2.3. Does not reopen R-08 (verified MET on 0.2.1's transcript, which
+never exercised this path); this sits on step 8 of the finish-line
+transcript script for whatever a stranger installs today.

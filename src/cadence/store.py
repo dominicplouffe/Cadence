@@ -562,6 +562,18 @@ class Store:
 
     # -- sync -----------------------------------------------------------
 
+    @staticmethod
+    def _content_fingerprint(data: dict) -> tuple:
+        """Every field of a task snapshot except `id` -- two snapshots with
+        the same fingerprint are the same task content, however it got
+        filed under two different ids (see the ID COLLISION renumbering
+        below, which copies a task's content verbatim under a new id)."""
+        return (
+            data.get("title"), data.get("status"), data.get("priority"),
+            data.get("due"), data.get("created_at"), data.get("completed_at"),
+            data.get("parent_id"),
+        )
+
     def _apply_remote_task(self, conn: sqlite3.Connection, data: dict) -> None:
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority, due, created_at, "
@@ -657,6 +669,27 @@ class Store:
         theirs = hist.snapshot_at(theirs_ref)
         base = hist.snapshot_at(base_ref) if base_ref else {}
 
+        # Red Team finding C (0.2.2): fingerprint every LOCAL task that has
+        # no base of its own (base.get(id) is None) -- i.e. one of mine
+        # that has never been reconciled through a common sync yet. That
+        # is exactly, and only, the category of row an id-collision on the
+        # OTHER side's own earlier sync can echo back into shared history
+        # under a brand-new id (see the ID COLLISION branch below: it
+        # copies "theirs" verbatim, only changing `id`, so the echo's
+        # content-minus-id is byte-identical to the original). A task ID
+        # that's new to both `mine` and `base` but whose content matches
+        # one of these fingerprints isn't a new remote task at all -- it's
+        # a reflection of a task I already hold under a different id, and
+        # pulling it as "new" is exactly the direct-peer topology bug that
+        # fabricated a permanent duplicate on both clients (ok:true, no
+        # conflict reported). A genuinely new task from the remote never
+        # matches, since it was never derived from one of my own rows.
+        unbased_mine_fingerprints = {
+            self._content_fingerprint(v): tid
+            for tid, v in mine.items()
+            if base.get(tid) is None
+        }
+
         ids = sorted(set(mine) | set(theirs) | set(base))
         next_new_id = (max(ids) + 1) if ids else 1
         pulled_ids, pushed_ids, conflicts, renumbered = [], [], {}, []
@@ -684,6 +717,12 @@ class Store:
                 else:
                     conflicts[tid] = {"mine": m, "theirs": t}
             elif theirs_changed:
+                if b is None and m is None and t is not None:
+                    echo_of = unbased_mine_fingerprints.get(self._content_fingerprint(t))
+                    if echo_of is not None:
+                        # It's mine already, under `echo_of` -- do not
+                        # fabricate a second row for it.
+                        continue
                 pulled_ids.append(tid)
             elif mine_changed:
                 pushed_ids.append(tid)

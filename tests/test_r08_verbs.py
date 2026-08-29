@@ -664,3 +664,93 @@ def test_sync_no_crash_when_second_db_path_shares_stem_with_existing_store(tmp_p
 
     # The pre-existing, unrelated store's history was never touched.
     assert [t.title for t in used.list(status="all")] == ["Existing task"]
+
+
+# --- Red Team finding C (0.2.2): direct-peer id collision must not --------
+# --- fabricate a duplicate row on either side ------------------------------
+
+
+def test_sync_direct_peer_id_collision_does_not_duplicate_either_side(tmp_path):
+    """Deterministic repro of Red Team's 0.2.2 finding: two clients that
+    have NEVER synced with each other or with any hub, each already
+    holding one task before their first sync (natural id-1/id-1
+    collision), doing a plain peer-to-peer `sync(remote=<other's plain
+    CADENCE_DB_PATH>)` in BOTH directions -- exactly step 8 of the
+    ten-step script, no extra steps, no bare-git hub.
+
+    Unlike test_sync_id_collision_between_unrelated_tasks_preserves_both
+    above (which only exercises the bare_remote HUB topology), this drives
+    the direct-peer topology the CLI/MCP docs actually advertise for
+    `--remote`. And unlike that test's `set`-based title assertions (which
+    silently collapse duplicates and could not have caught this), this
+    asserts an exact task COUNT on both sides after each sync call, so a
+    fabricated extra row fails loudly here even if titles alone would look
+    fine.
+    """
+    store_a = Store(db_path=tmp_path / "peer_coll_a.db")
+    store_b = Store(db_path=tmp_path / "peer_coll_b.db")
+
+    task_a = store_a.add("A-ORIGINAL")
+    task_b = store_b.add("B-ORIGINAL")
+    assert task_a.id == task_b.id  # both independently assigned id 1
+
+    r_a = store_a.sync(remote=str(store_b.db_path))
+    assert r_a["conflicts"] == []
+    # A's own store must still hold exactly its own task plus B's -- 2,
+    # never 3.
+    assert len(store_a.list(status="all")) == 2
+
+    r_b = store_b.sync(remote=str(store_a.db_path))
+    assert r_b["conflicts"] == []
+    # The fabricated-duplicate bug: B ended up with 3 rows here (its own
+    # original task twice, plus A's) even though ok:true and no conflict
+    # was ever reported. Must be exactly 2.
+    b_tasks = store_b.list(status="all")
+    assert len(b_tasks) == 2, f"expected 2 tasks, got {len(b_tasks)}: {[t.title for t in b_tasks]}"
+    b_titles = [t.title for t in b_tasks]
+    assert sorted(b_titles) == ["A-ORIGINAL", "B-ORIGINAL"]
+    # In particular, B's own original task must appear exactly once, not
+    # duplicated.
+    assert b_titles.count("B-ORIGINAL") == 1
+
+    # And A, still holding just its first-sync state, is unaffected by
+    # B's second call until it syncs again.
+    assert len(store_a.list(status="all")) == 2
+
+
+def test_mcp_sync_tasks_direct_peer_id_collision_does_not_duplicate(
+    tmp_path, monkeypatch
+):
+    """Same repro as
+    test_sync_direct_peer_id_collision_does_not_duplicate_either_side,
+    driven over the actual MCP tool surface (each `CADENCE_DB_PATH` swap
+    simulates a separate agent session against its own client), since the
+    project's own rule is that a capability isn't proven fixed on one
+    surface only."""
+    from cadence.mcp_server import add_task, sync_tasks
+
+    a_path = tmp_path / "mcp_peer_coll_a.db"
+    b_path = tmp_path / "mcp_peer_coll_b.db"
+
+    monkeypatch.setenv("CADENCE_DB_PATH", str(a_path))
+    add_task("A-ORIGINAL")
+
+    monkeypatch.setenv("CADENCE_DB_PATH", str(b_path))
+    add_task("B-ORIGINAL")
+
+    monkeypatch.setenv("CADENCE_DB_PATH", str(a_path))
+    r_a = sync_tasks(remote=str(b_path))
+    assert r_a["ok"] is True
+    assert r_a["conflicts"] == []
+
+    monkeypatch.setenv("CADENCE_DB_PATH", str(b_path))
+    r_b = sync_tasks(remote=str(a_path))
+    assert r_b["ok"] is True
+    assert r_b["conflicts"] == []
+
+    b_tasks = Store(db_path=b_path).list(status="all")
+    assert len(b_tasks) == 2, f"expected 2 tasks, got {len(b_tasks)}: {[t.title for t in b_tasks]}"
+    assert sorted(t.title for t in b_tasks) == ["A-ORIGINAL", "B-ORIGINAL"]
+
+    a_tasks = Store(db_path=a_path).list(status="all")
+    assert len(a_tasks) == 2, f"expected 2 tasks, got {len(a_tasks)}: {[t.title for t in a_tasks]}"

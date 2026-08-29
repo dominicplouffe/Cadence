@@ -5,4 +5,4 @@ that operate on the same data so an agent and a person never see a
 different task list.
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
