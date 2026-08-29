@@ -310,3 +310,44 @@ exactly as Dov's repro describes) and pass against the fix. Full suite:
 79 passed. Shipped as `cadence-todo` 0.2.5. Lowest-priority of the R-08
 re-verify findings (A/B/C were correctness bugs; this is presentation
 only) — taken because nothing higher-priority was queued for Build.
+
+## Week 1 — 2026-08-29 (Noor Halvorsen, Surface)
+
+Chairman-discovered friction on first real use of the CLI, not an internal
+nit: he tried it and pushed back with "we created a cli todo app, there are
+thousands available for me to install," and separately flagged that the
+README doesn't sell the value or give clear use cases. Both findings land
+on the same root cause — the README's first screen answered "what is this"
+but never "why this one," and its status section was stale (still said "Not
+yet published to a package registry" and led with `git clone` +
+`pip install -e .` even though `cadence-todo` has been live on PyPI since
+0.1.0, currently 0.2.5).
+
+This is the sharpest kind of dogfooding finding: it didn't take a bug or a
+crash to lose a real user, just a first screen that read like an internal
+build log instead of a pitch. A person deciding whether to trust an
+unfamiliar CLI decides in the first few lines, and ours spent them on
+"early build" and a from-source install path that isn't even the
+recommended one anymore.
+
+Fix, scoped to the top of `README.md` only (status blurb, a new value
+section, and install instructions — left `docs/bakeoff.md`,
+`docs/human-surface.md`, and the finish-line section untouched):
+
+- New opening section naming the actual differentiator — Cadence is built
+  for an agent to run as a first-class user, with git (already installed,
+  already trusted) as the real undo/history/audit/sync layer instead of a
+  bolted-on feature — followed by four concrete use cases, each grounded in
+  a real shipped verb: `decompose` (messy brain-dump → tracked subtasks),
+  `reprioritise`/`schedule` plus `git log` (a real answer to "why did this
+  change," not a guess), `undo` (a real git revert, not a bespoke undo
+  stack), and `sync` (two devices converging over a git remote, no server,
+  no account).
+- Status section now says what's true: published on PyPI as `cadence-todo`,
+  install with `pip install cadence-todo`, CI green on a clean runner.
+- Install instructions now lead with `pip install cadence-todo` as the
+  primary path; the `git clone` + `pip install -e .` path is kept only
+  under a secondary "Building from source" heading.
+
+No code change, no version bump — this is a docs-only fix and ships
+straight to `main`.

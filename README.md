@@ -1,47 +1,73 @@
 # Cadence
 
-Cadence is an agentic-first todo application: a task manager whose primary
-user is an AI agent, with a human surface good enough that a person prefers
-it to what they use now.
+There are thousands of todo CLIs. Cadence is the one built for an AI agent
+to run as a first-class user, not a bolted-on chat wrapper on top of a
+human tool — and it turns git, which you already have installed, into the
+undo/history/audit/sync layer instead of building a bespoke (and weaker)
+version of all four.
+
+What that buys you, concretely:
+
+- **Hand your agent a messy brain-dump and get tracked subtasks back.**
+  `cadence decompose 12 --into "book flights" "book hotel" "pack"` (or the
+  `decompose_task` MCP tool) turns one vague task into real, independently
+  completable children — no more one giant to-do that never gets checked off.
+- **Ask "why did this get bumped to top priority" and get a real answer.**
+  Every `reprioritise`, `schedule`, and edit is a git commit under the hood,
+  so the answer is `git log`/`git blame` on your own task store, not a guess
+  or a feature nobody built.
+- **Undo a bad agent action instantly, with the same guarantee git gives
+  your code.** `cadence undo` reverts the last change — yours or your
+  agent's — because it *is* a git revert, not a bespoke undo stack that
+  only covers some operations.
+- **Keep two devices' task lists in sync without running a server.**
+  `cadence sync` pulls and pushes against a git remote you already control
+  (a repo, a USB stick, anything git can reach) — no account, no hosted
+  backend, no uptime to worry about.
 
 The plan is to publish Cadence as a public, installable, open-source project
 by **6 November 2026**. That date is a delivery commitment, not an estimate.
 
 ## Status
 
-Early build. Not yet published to a package registry (see the finish-line
-checklist below) but it builds, runs, and is tested from a fresh clone.
-See [`docs/bakeoff.md`](docs/bakeoff.md) for the five candidate concepts we
+Published on PyPI as [`cadence-todo`](https://pypi.org/project/cadence-todo/)
+— install with `pip install cadence-todo`. It builds, runs, and is tested
+from a fresh clone, and CI is green on a clean GitHub-hosted runner (see the
+finish-line checklist below for what's still outstanding). See
+[`docs/bakeoff.md`](docs/bakeoff.md) for the five candidate concepts we
 researched, the evidence behind each, and which one we chose and why, and
 [`docs/human-surface.md`](docs/human-surface.md) for the CLI's binding
 design spec.
 
-## Try it from a fresh clone
+## Install
 
 ```
-git clone https://github.com/dominicplouffe/Cadence.git
-cd Cadence
-pip install -e .
+pip install cadence-todo
 cadence add "Buy milk" --due 2026-09-01 --priority high
 cadence list
 cadence done 1
 ```
 
-By default tasks live in `~/.cadence/cadence.db` (a local SQLite file).
-Set `CADENCE_DB_PATH` to point at a scratch file instead (used by the test
-suite and useful for an agent that wants an isolated store).
+By default tasks live in `~/.cadence/cadence.db` (a local SQLite file) with
+a git-backed history alongside it. Set `CADENCE_DB_PATH` to point at a
+scratch file instead (used by the test suite and useful for an agent that
+wants an isolated store).
 
-Start the MCP server (agent surface) over stdio, exposing `add_task`,
-`list_tasks`, `complete_task`, and `schedule_task` as tools with structured
-JSON returns:
+Start the MCP server (agent surface) over stdio, exposing tools such as
+`add_task`, `list_tasks`, `complete_task`, `schedule_task`,
+`decompose_task`, `reprioritise_task`, `undo`, and `sync_tasks` with
+structured JSON returns:
 
 ```
 cadence mcp
 ```
 
-Run the test suite:
+### Building from source
 
 ```
+git clone https://github.com/dominicplouffe/Cadence.git
+cd Cadence
+pip install -e .
 pip install pytest
 pytest -q
 ```
