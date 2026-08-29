@@ -342,5 +342,74 @@ def run() -> None:
     mcp.run(transport="stdio")
 
 
+def _make_http_app(token: str):
+    """Wrap the stock streamable-HTTP ASGI app with a bearer-token check.
+
+    EXPERIMENTAL: this is the spike prototype for a remote transport so a
+    non-local client (Claude web/mobile custom connector) can reach a
+    self-hosted Cadence. It does not touch the stdio path `cadence mcp`
+    uses by default. No accounts, no multi-tenant backend -- the user runs
+    this themselves and exposes the port however they choose (SSH tunnel,
+    Tailscale, reverse proxy with TLS, etc.); this layer only checks the
+    token on every request.
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
+    inner: ASGIApp = mcp.streamable_http_app()
+
+    class BearerAuth:
+        def __init__(self, app: ASGIApp, expected_token: str) -> None:
+            self.app = app
+            self.expected_token = expected_token
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
+            headers = dict(scope.get("headers") or [])
+            auth = headers.get(b"authorization", b"").decode("latin-1")
+            presented = auth[7:] if auth.startswith("Bearer ") else None
+            if presented != self.expected_token:
+                response = JSONResponse(
+                    {
+                        "ok": False,
+                        "error": "unauthorized",
+                        "message": "Missing or wrong bearer token.",
+                        "hint": "Send 'Authorization: Bearer <token>' matching "
+                        "the token this server was started with.",
+                    },
+                    status_code=401,
+                )
+                await response(scope, receive, send)
+                return
+            await self.app(scope, receive, send)
+
+    return BearerAuth(inner, token)
+
+
+def run_http(host: str, port: int, token: str) -> None:
+    """Serve the same tool surface over the MCP Streamable HTTP transport.
+
+    EXPERIMENTAL / spike prototype -- see docs/experimental-http-transport.md.
+    Self-hosted only: binds to `host`:`port` on this machine, no accounts or
+    hosted backend. The caller is responsible for exposing this port safely
+    (tunnel, VPN, or a TLS-terminating reverse proxy); this function does
+    not add TLS itself.
+    """
+    import uvicorn
+
+    app = _make_http_app(token)
+    print(
+        f"[cadence mcp --http] EXPERIMENTAL remote transport listening on "
+        f"http://{host}:{port}/mcp -- bearer token required on every "
+        f"request. This is a spike prototype, not a hardened feature; see "
+        f"docs/experimental-http-transport.md.",
+        file=__import__("sys").stderr,
+    )
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
 if __name__ == "__main__":
     run()

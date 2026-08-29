@@ -17,6 +17,7 @@ Usage:
     cadence sync [--remote PATH] [--keep-mine ID | --keep-theirs ID]
     cadence export [--format json|table] [--out PATH]
     cadence mcp                     # start the MCP server over stdio (agent surface)
+    cadence mcp --http --token T    # EXPERIMENTAL: remote MCP over HTTP, see docs/experimental-http-transport.md
 """
 from __future__ import annotations
 
@@ -338,6 +339,23 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
+    if getattr(args, "http", False):
+        from cadence.mcp_server import run_http
+
+        token = args.token or os.environ.get("CADENCE_MCP_TOKEN")
+        if not token:
+            print(
+                "cadence mcp --http: EXPERIMENTAL, needs a token. Pass "
+                "--token <token> or set CADENCE_MCP_TOKEN. This binds a "
+                "port on this machine for remote MCP clients (e.g. "
+                "Claude web/mobile); you are responsible for exposing it "
+                "safely (tunnel/VPN/TLS proxy) -- see "
+                "docs/experimental-http-transport.md.",
+                file=sys.stderr,
+            )
+            return 2
+        run_http(args.host, args.port, token)
+        return 0
     from cadence.mcp_server import run
 
     run()
@@ -418,6 +436,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.set_defaults(func=cmd_export)
 
     p_mcp = sub.add_parser("mcp", help="Start the MCP server over stdio (agent surface)")
+    p_mcp.add_argument(
+        "--http",
+        action="store_true",
+        help="EXPERIMENTAL: serve over remote HTTP instead of stdio, so a "
+        "non-local client (e.g. Claude web/mobile) can reach this store. "
+        "Self-hosted, bearer-token-protected; see "
+        "docs/experimental-http-transport.md.",
+    )
+    p_mcp.add_argument("--host", default="127.0.0.1", help="Bind host for --http (default 127.0.0.1)")
+    p_mcp.add_argument("--port", type=int, default=8765, help="Bind port for --http (default 8765)")
+    p_mcp.add_argument(
+        "--token", help="Bearer token required of --http clients (or set CADENCE_MCP_TOKEN)"
+    )
     p_mcp.set_defaults(func=cmd_mcp)
 
     return parser
