@@ -138,17 +138,39 @@ class GitHistory:
         are None when this commit's message carries no `Reason:`/`Source:`
         trailer (every commit before wow-spec.md Part III, and every
         `add`/`done`/`undo`/sync commit today, which don't accept a reason
-        at all per Part III §1a's scope list)."""
+        at all per Part III §1a's scope list).
+
+        A `--reason` can itself contain newlines (store.py's _snapshot_
+        and_commit rides it verbatim as the commit-body paragraph after
+        `Reason: `), so this collects every line after a recognized
+        trailer key up to the next recognized key or end of message,
+        instead of only the one line immediately following the key --
+        Red Team 0.2.7 finding #1: the old one-line-only capture silently
+        dropped continuation lines on the read side even though `git log`
+        shows the full text was always written correctly."""
         message = self.full_message(commit)
-        lines = message.splitlines()
+        # rstrip trailing newlines first -- `git log --pretty=%B` always
+        # ends the body in at least one, and splitlines() would otherwise
+        # turn a lone trailing blank line into a spurious final "" entry
+        # that the loop below (correctly) treats as a continuation line of
+        # whichever trailer is still open, silently appending a stray
+        # newline onto `source` (or `reason`, if `Source:` is ever absent).
+        lines = message.rstrip("\n").splitlines()
         subject = lines[0] if lines else ""
-        reason = None
-        source = None
+        reason_lines: Optional[list[str]] = None
+        source_lines: Optional[list[str]] = None
+        current: Optional[list[str]] = None
         for line in lines[1:]:
             if line.startswith("Reason: "):
-                reason = line[len("Reason: "):]
+                reason_lines = [line[len("Reason: "):]]
+                current = reason_lines
             elif line.startswith("Source: "):
-                source = line[len("Source: "):]
+                source_lines = [line[len("Source: "):]]
+                current = source_lines
+            elif current is not None:
+                current.append(line)
+        reason = "\n".join(reason_lines) if reason_lines is not None else None
+        source = "\n".join(source_lines) if source_lines is not None else None
         return subject, reason, source
 
     def commit_time(self, commit: str) -> str:

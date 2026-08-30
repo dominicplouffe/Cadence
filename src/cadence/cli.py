@@ -299,6 +299,12 @@ def cmd_why(args: argparse.Namespace) -> int:
         _err(_format_err(exc))
     task = result["task"]
     events = result["events"]
+    # Same shutil.get_terminal_size() call cmd_list already uses (see its
+    # comment above) instead of a hardcoded width -- Red Team 0.2.7 finding
+    # #2: wow-spec.md §6's "no truncation, wraps at any terminal width"
+    # contract applies to this surface too, and `COLUMNS=N cadence why`
+    # must actually respond to N like `cadence list` already does.
+    reason_wrap_width = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
     print(f"#{task.id} {task.title} — history (newest first):")
     if not events:
         # Can't actually happen today (every task has at least a "Created"
@@ -323,7 +329,10 @@ def cmd_why(args: argparse.Namespace) -> int:
             label = _source_label(ev["source"])
             suffix = f" — {label}" if label else ""
             quote = f'"{ev["reason"]}"{suffix}'
-            wrapped = textwrap.wrap(quote, width=56) or [quote]
+            # break_long_words=False for the same reason cmd_list's title
+            # wrap sets it: a word wider than the column overflowing its
+            # own line is a smaller defect than one sliced mid-word.
+            wrapped = textwrap.wrap(quote, width=reason_wrap_width, break_long_words=False) or [quote]
             for line in wrapped:
                 print(f"                       {line}")
         elif ev["reason_capable"]:

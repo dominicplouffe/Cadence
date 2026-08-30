@@ -753,3 +753,43 @@ inherit it, and it directly undermines the specific promise this
 release shipped to keep ("why did this change" — an honest, complete
 answer). Finding 2 (fixed-width wrap) second — real and reproducible,
 but cosmetic/legibility, not data loss.
+
+## 2026-08-30 (Rafael Okonkwo, Build) — both 0.2.7 `why` findings fixed
+
+Both of Dov's findings above, confirmed fix-not-spec-gap by Noor (§6's
+"no truncation, wraps at any terminal width" already covers any
+text-rendering surface, §7).
+
+Finding 1 (`history.GitHistory.parse_trailers`, commit
+[to be filled]): the read-side trailer parser only ever captured the one
+line immediately following `Reason: `/`Source: `, so a `--reason` with
+embedded newlines lost every line after the first on the way back out —
+even though the write side (`Store._snapshot_and_commit`) always
+committed the full text and `git log --pretty=%B` on the raw commit
+showed it intact. Root cause was read-side only. Fixed by collecting
+every line after a recognized trailer key up to the next recognized key
+(`Reason: ` / `Source: `) or end-of-message, instead of stopping after
+one line — applies to all three reason-capable verbs
+(decompose/reprioritise/schedule) on both surfaces (CLI, MCP) at once,
+since both go through the same `Store.why` → `parse_trailers` path.
+Caught one more bug while fixing it: `git log`'s trailing newline turned
+into a spurious empty continuation line via `str.splitlines()`, silently
+appending `"\n"` onto whichever trailer was still open (usually
+`source`, since it's always last) — fixed by `rstrip("\n")`-ing the raw
+message before splitting.
+
+Finding 2 (`cli.cmd_why`'s reason-quote wrap): swapped the hardcoded
+`textwrap.wrap(quote, width=56)` for the same
+`shutil.get_terminal_size(fallback=(80, 24)).columns` call `cmd_list`
+already uses (with a 20-column floor so a pathologically narrow
+`COLUMNS` doesn't collapse to nothing), plus `break_long_words=False`
+to match `cmd_list`'s title wrap for the same reason (a word overflowing
+its own line beats one sliced mid-word). Confirmed `COLUMNS=40 cadence
+why <id>` and `COLUMNS=200 cadence why <id>` now produce visibly
+different wrapping on a reason longer than one line.
+
+6 new regression tests added to `tests/test_wow_part3.py` (multi-line
+reason preserved end-to-end on all three verbs × store/CLI/MCP, plus the
+COLUMNS-width-changes-the-wrap case) — confirmed failing against
+pre-fix code before trusting them. Full suite: 109 passed (103
+pre-existing + 6 new). Shipped as `cadence-todo` 0.2.8.

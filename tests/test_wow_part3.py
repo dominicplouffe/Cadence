@@ -262,3 +262,80 @@ def test_mcp_schedule_task_reason_is_optional(tmp_path, monkeypatch):
     result = why_task(task_id)
     assert result["history"][0]["reason"] is None
     assert result["history"][0]["source"] is None
+
+
+# --- Red Team 0.2.7 finding #1: multi-line `reason` continuation lines -----
+# were silently dropped on read (history.parse_trailers only captured the
+# one line immediately after `Reason: `/`Source: `) even though the write
+# side (git commit body) always held the full text. These pin the fix on
+# all three reason-capable verbs and on both surfaces.
+
+_MULTILINE_REASON = (
+    "First consideration: budget is tight.\n"
+    "Second consideration: timeline is short.\n"
+    "Third: stakeholder prefers Tuesday."
+)
+
+
+def test_why_reprioritise_multiline_reason_keeps_every_line(store):
+    task = store.add("Ship it")
+    store.reprioritise(task.id, "med", reason=_MULTILINE_REASON, source="cli")
+    events = store.why(task.id)["events"]
+    assert events[0]["reason"] == _MULTILINE_REASON
+
+
+def test_why_schedule_multiline_reason_keeps_every_line(store):
+    task = store.add("Renew TLS cert")
+    store.schedule(task.id, "2026-09-10", reason=_MULTILINE_REASON, source="cli")
+    events = store.why(task.id)["events"]
+    assert events[0]["reason"] == _MULTILINE_REASON
+
+
+def test_why_decompose_multiline_reason_keeps_every_line(store):
+    parent = store.add("Plan the party")
+    _, children = store.decompose(
+        parent.id, ["Book a venue"], reason=_MULTILINE_REASON, source="mcp"
+    )
+    events = store.why(children[0].id)["events"]
+    assert events[-1]["reason"] == _MULTILINE_REASON
+
+
+def test_cli_why_shows_every_line_of_a_multiline_reason(tmp_path):
+    env = _cli_env(tmp_path)
+    _run_cli("add", "Ship it", env=env)
+    result = _run_cli(
+        "reprioritise", "1", "med", "--reason", _MULTILINE_REASON, env=env
+    )
+    assert result.returncode == 0
+    out = _run_cli("why", "1", env=env).stdout
+    assert "First consideration" in out
+    assert "Second consideration" in out
+    assert "Third: stakeholder prefers Tuesday" in out
+
+
+def test_mcp_why_task_multiline_reason_keeps_every_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp4.db"))
+    from cadence.mcp_server import add_task, reprioritise_task, why_task
+
+    added = add_task("Ship it")
+    task_id = added["task"]["id"]
+    reprioritise_task(task_id, "med", reason=_MULTILINE_REASON)
+    result = why_task(task_id)
+    assert result["history"][0]["reason"] == _MULTILINE_REASON
+
+
+# --- Red Team 0.2.7 finding #2: `why`'s reason wrap must respect COLUMNS ---
+# like `list`'s title wrap already does, instead of a hardcoded width=56.
+
+
+def test_cli_why_reason_wrap_respects_columns_like_list_does(tmp_path):
+    env = _cli_env(tmp_path)
+    _run_cli("add", "Ship it", env=env)
+    long_reason = "word " * 40
+    _run_cli("reprioritise", "1", "high", "--reason", long_reason.strip(), env=env)
+    narrow = _run_cli("why", "1", env={**env, "COLUMNS": "40"})
+    wide = _run_cli("why", "1", env={**env, "COLUMNS": "200"})
+    assert narrow.returncode == 0 and wide.returncode == 0
+    assert narrow.stdout != wide.stdout
+    # Narrower terminal must wrap onto strictly more lines than the wide one.
+    assert narrow.stdout.count("\n") > wide.stdout.count("\n")
