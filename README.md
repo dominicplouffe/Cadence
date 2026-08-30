@@ -43,10 +43,46 @@ design spec.
 
 ```
 pip install cadence-todo
-cadence add "Buy milk" --due 2026-09-01 --priority high
-cadence list
-cadence done 1
 ```
+
+Every line below is a real CLI command, run yourself, no agent required —
+this is the whole bet: **every change to your list, yours or an agent's,
+comes with a legible reason and a clean undo**, because it's backed by the
+same git you already trust for code, not a bespoke history feature Cadence
+invented and might get wrong. Real output, `cadence-todo` 0.2.9,
+`NO_COLOR=1`:
+
+```
+$ cadence add "Plan Mara's 30th birthday party"
+Added #1: Plan Mara's 30th birthday party
+
+$ cadence decompose 1 --into "Book a venue" "Order a cake" "Send invites"
+Decomposed #1 into 3 subtasks: #2, #3, #4
+
+$ cadence reprioritise 2 high --reason "venue books up fastest"
+Reprioritised #2 (none → high): Book a venue
+
+$ cadence why 2
+#2 Book a venue — history (newest first):
+
+  -  high     just now     Reprioritised (none → high)
+                       "venue books up fastest" — you, via CLI
+
+  -  none     just now     Created as subtask of #1 (Plan Mara's 30th birthday
+                           party)
+
+No reason was recorded for this change. Reasons are optional —
+pass --reason "..." (CLI) or a `reason` argument (MCP tool call)
+to leave one next time.
+
+$ cadence undo
+Undid: Reprioritised #2 (none → high) undone: Book a venue
+```
+
+That `why` line is the payoff: a straight answer to "why did this change,"
+without you ever opening git, a hidden folder, or asking your agent to
+explain itself. `cadence list` and `cadence done <id>` work exactly the
+way you'd expect from any todo CLI — full command reference below.
 
 By default tasks live in `~/.cadence/cadence.db` (a local SQLite file) with
 a git-backed history alongside it. Set `CADENCE_DB_PATH` to point at a

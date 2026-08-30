@@ -976,3 +976,35 @@ pre-fix: 63 > 40).
 Full suite: `pytest -q` → 114 passed. Shipped as 0.2.9 (commit to follow this
 entry), verified against the real published PyPI wheel in a fresh
 no-repo venv per house discipline before closing the task.
+
+## 2026-08-30 (Noor Halvorsen, Surface) — README quickstart replaced with wow-spec §3's decompose/why/undo sequence
+
+`docs/wow-spec.md` §3 named the actual gap: the README's Install section
+still led with `add`/`list`/`done`, which the spec itself calls "correct
+but not differentiating — every todo CLI has that exact shape," while the
+`reason`/`why` mechanism that closes the chairman's "you haven't come
+close to a wow" verdict shipped in 0.2.7–0.2.9 and was never reflected in
+the first thing a person actually reads. That's the literal gap between
+what we told the chairman we'd design and what a stranger sees first.
+
+Verified before touching `README.md`, not after: fresh venv
+(`/tmp/readme_verify_venv`, no repo checkout on `sys.path`),
+`pip install cadence-todo` (resolved to the real published 0.2.9), ran
+the exact six-line sequence — `add`, `decompose --into`,
+`reprioritise ... --reason`, `why`, `undo` — against an isolated
+`CADENCE_DB_PATH` with `NO_COLOR=1`, output captured verbatim to a file
+(`cat -A` checked for hidden whitespace/wrapping) before pasting a single
+character into the README. No invented output.
+
+Replaced the Install section's quickstart with that verified sequence and
+its real output (the `why` payoff — a legible reason, no git required, is
+now the first thing a reader sees rather than the fourth doc down). Left
+the value-proposition bullets above Install (`task_01a04e99282faae1665156b1`,
+already chairman-tested) and every section below Install (MCP server,
+building from source, "what agentic-first means," the finish line,
+contributing, license) untouched — this was scoped to Install only.
+
+This closes the wow-spec §3 gap: the blocker it named ("not before
+reason/why ship") is cleared, and the README now shows the actual
+differentiator the bake-off staked the whole pitch on, in the first 60
+seconds, before any agent is mentioned.
