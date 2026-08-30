@@ -622,3 +622,134 @@ published 0.2.7 package (fresh venv, no repo on path) via both the CLI
 console script and a real MCP stdio `ClientSession` — `cadence why <id>`
 and `why_task` both matched local behavior exactly, including the
 reason/no-reason and missing-id paths.
+
+## 2026-08-30 (Dov Ferreira, Red Team) — adversarial pass on 0.2.7 wow-spec Part III (`reason` + `cadence why`)
+
+Fresh venv (`/workspace/redteam_027`, no local checkout on path), real
+`cadence-todo` 0.2.7 wheel from PyPI, both the CLI console script and a
+real MCP stdio `ClientSession` subprocess. Two real findings, one of them
+severe; everything else tried held.
+
+**Finding 1 (high — data integrity, both surfaces, all three verbs).** A
+`reason` value containing an embedded newline is silently truncated to
+its first line by `Store.why` (so both `cadence why` and MCP `why_task`
+show the truncated value — confirmed via `why_task`'s raw JSON, this is
+a store-level bug, not a CLI-formatting one). Minimal repro, no
+adversarial framing needed:
+```
+$ cadence add "Test plain multiline reason"
+$ cadence reprioritise 9 med --reason "First consideration: budget is tight.
+Second consideration: timeline is short.
+Third: stakeholder prefers Tuesday."
+$ cadence why 9
+  ...  "First consideration: budget is tight." — you, via CLI
+```
+"Second consideration..." and "Third: ..." are gone from the display —
+no ellipsis, no `[truncated]` marker, nothing. `git log --pretty=%B` on
+the same commit shows the *full* three-line reason was written
+correctly (`Reason: First consideration: budget is tight.\nSecond
+consideration: timeline is short.\nThird: stakeholder prefers
+Tuesday.\nSource: cli`), so this is a read-side parsing bug: the
+commit-body parser appears to treat only lines matching `^Reason: ` /
+`^Source: ` as data (last match wins if the key repeats) and silently
+drops every other line, including legitimate continuation lines of the
+one reason paragraph the commit body was designed to hold. Confirmed
+identically via MCP (`reprioritise_task(id=1, priority="high",
+reason="First point via MCP.\nSecond point via MCP.\nThird point via
+MCP.")` → `why_task` returns `"reason": "First point via MCP."` in the
+raw JSON, second and third points gone) and on `schedule` in addition to
+`reprioritise` (same code path). A sharper variant of the same bug: a
+reason whose second line happens to start with literal `Reason: ` or
+`Source: ` text (very plausible from an LLM writing free-form reasoning)
+gets *silently reattributed* — `--reason "$(printf 'line one\nline
+two\nReason: fake injected trailer\nSource: cli-spoofed')"` displays as
+just `"fake injected trailer"`, discarding the real first line entirely;
+the actual `Source:` attribution stayed correct in every case I tried
+(the code always appends the real `Source:` trailer *after* the
+caller-supplied reason text, so it wins the last-match), so this is not
+an exploitable attribution spoof today, but it is the same underlying
+fragility and I'd want a second look once someone touches this code.
+**Consequence:** the entire pitch of `why` is "an honest answer to why
+this changed"; a silently-incomplete answer that looks complete is worse
+than `why` not existing, because nothing about the output signals that
+anything is missing. Single-line reasons of any length (tried 6 KB, one
+line, no embedded newline) round-trip correctly — this is specifically
+about embedded newlines. Fix belongs in the history-read path (`why`'s
+commit-body parser), not in write-side escaping, since the write side
+already stores the full text losslessly.
+
+**Finding 2 (medium — legibility, `why` reason wrapping).** `list`'s
+title wrapping is terminal-width aware (confirmed with a real pty:
+`cadence list` wraps a long title differently at 20-col, 40-col and
+200-col widths — narrower wraps into more/shorter hanging-indent lines,
+200-col fits the title on one line). `why`'s `reason` paragraph wrap is
+not: run the exact same task's `why` output through the same pty helper
+at 20, 40 and 200 columns and the wrapped text is byte-identical at all
+three widths — a fixed ~55-60 char wrap regardless of actual terminal
+size. At a narrow terminal (20-40 cols, a real if uncommon width) each
+wrapped line is 55-60 chars, well past the terminal edge, so the
+terminal itself hard-wraps mid-word and the intended hanging indent is
+destroyed; at a wide terminal it leaves most of the line unused. This
+violates the "wrap, no truncation, at any terminal width" contract
+`human-surface.md` states for the surface generally (and tests
+explicitly for `list`'s titles at 40-col/120-col) — `why`'s prose didn't
+inherit that behavior. Repro: `python3` with `pty.fork()` +
+`fcntl.ioctl(fd, termios.TIOCSWINSZ, ...)` at cols=20/40/200, run
+`cadence why <id>` on a task with a reason longer than one line-width in
+each, diff the outputs (identical apart from ANSI codes echoing size).
+
+**Held (tried, did not break):**
+- `why` with a malformed id: `why 99` (out-of-range) → `Error: no task
+  with id 99. Run 'cadence list' to see valid ids.`; `why abc`, `why
+  -1`, `why 1.5` → `Error: 'X' is not a task id. Run 'cadence list' to
+  see valid ids.`; `why 0` → same "no task with id 0" shape. All exit 1,
+  all match §4.4 wording exactly, and match the same wording pattern
+  `done`/`schedule` already use for the identical bad-id shapes (`done
+  abc`, `done -5` — same text). MCP `why_task(id=-1)` and
+  `why_task(id=9999)` both return the structured `{ok:false,
+  error:"task_not_found", message:"no task with id N", hint:"Run
+  'cadence list' to see valid ids."}` shape, no raw exception.
+- `reason` omitted, `--reason ""` (empty string): both surfaces treat
+  empty-string the same as omitted — `why` prints "No reason was
+  recorded for this change..." either way, MCP returns `"reason": null`
+  either way. Consistent, not a silent-truncation case (an empty string
+  carries no information to lose).
+- `reason` with unicode/emoji (`"venues 🎉 ... naïve café ... déjà vu ...
+  中文测试"`): preserved verbatim on both surfaces, no crash, no mangled
+  bytes.
+- `source` tag: CLI-originated changes show "— you, via CLI", MCP shows
+  "— agent, via MCP", correctly, every time. Not spoofable through any
+  exposed surface — no `--source` CLI flag exists (checked `--help` on
+  `decompose`/`reprioritise`/`schedule`), and passing an extra
+  `"source": "cli"` argument to the MCP tool call (which has no
+  `source` field in its schema) is silently ignored rather than
+  honored — the real caller-surface tag wins regardless.
+- Glyph collision: `why`'s dim `•` (`\x1b[2m`, no-color fallback `-`,
+  confirmed in a non-tty pipe) never appears where `list` uses `○`, and
+  vice versa, checked in a real pty at 20/40/80/200 columns plus the
+  non-tty fallback path. No visual or semantic overlap.
+- `undo` interaction: reprioritise-with-reason then `undo` then `why` —
+  the original event keeps its own reason intact ("escalating because
+  deadline moved up" — you, via CLI) and the undo itself appears as a
+  new, separate, reason-less event ("Reprioritised (high → none) undone"
+  + the standard "No reason was recorded" nudge, correct since `undo`
+  takes no `--reason` arg at all). Nothing about the undo overwrites or
+  hides the original reason.
+
+**Adjacent, not new to 0.2.7 (noted, not filed as a Part-III defect):**
+omitting a required id entirely (`cadence why` with no argument at all)
+falls through to argparse's own usage banner and exit code 2, not the
+§4.4 two-sentence shape with exit code 1 — `human-surface.md` §4.4
+itself reserves exit 2 for internal/store errors. Confirmed this is
+pre-existing and cross-cutting, not introduced by this feature: `cadence
+schedule`/`done`/`reprioritise`/`decompose` with no arguments at all do
+the exact same thing. `why` just inherited the existing gap rather than
+closing it. Worth a small separate cleanup pass across all five verbs
+if/when Build has a slot; not blocking, not part of this pass's scope.
+
+**Ranking:** Finding 1 (multi-line reason truncation) first if only one
+gets fixed — it is silent, it is in the store layer so both surfaces
+inherit it, and it directly undermines the specific promise this
+release shipped to keep ("why did this change" — an honest, complete
+answer). Finding 2 (fixed-width wrap) second — real and reproducible,
+but cosmetic/legibility, not data loss.
