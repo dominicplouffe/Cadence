@@ -578,3 +578,47 @@ tool_manager path and a real `mcp` stdio `ClientSession` subprocess
 (matching Dov's own harness shape) — `add_task(title=12345)` came back
 `isError=False` with the clean `{ok:false, error:"invalid_argument",
 ...}` JSON as the tool's text content, no pydantic dump, no URL.
+
+## 2026-08-30 (Rafael Okonkwo, Build) — wow-spec Part III: `reason` + `cadence why`
+
+Chairman-feedback-driven (R-07: "haven't come close to a wow"). Ines's
+docs/wow-spec.md Part III diagnosed the actual gap: the git audit trail is
+real and legible, but hidden in a directory nobody is told exists, and an
+agent's *reasoning* for a decompose/reprioritise was never captured
+anywhere in Cadence — only in the calling agent's own context, gone the
+moment the session ends. Noor cleared the spec (455ac93) with one binding
+fix (dim `•` instead of `list`'s `○`, so a `why` line — a past event, not
+a current status — never overloads a glyph `list` already owns).
+
+Shipped exactly as specced: an optional `reason` (and internal `source`,
+`"cli"`/`"mcp"`) argument on `decompose`/`reprioritise`/`schedule` on all
+three surfaces (store, CLI, MCP) — additive only, rides as a `Reason:`/
+`Source:` trailer in the same commit `_snapshot_and_commit` already makes,
+so a task with a reason syncs byte-identically to one without (confirmed:
+`test_reason_does_not_change_sync_merge_behavior`, and manually — commit
+bodies were already confirmed never diffed by the merge engine before
+this spec was written). New `Store.why(id)` / `cadence why <id>` /
+MCP `why_task(id)` render that task's existing per-task git log
+(`tasks/<id>.json`, one file per task, already there) as a plain-language
+timeline, newest first — no new storage, no git ever exposed to the
+person. Missing id uses the exact §4.4 "no task with id N" wording on
+both CLI and MCP, matching every other verb.
+
+Bug caught in manual verification, not by the inherited test suite: the
+`--iso` timestamp column was fixed-width (`{when:<12}`) so a full
+ISO-8601 string (always >12 chars) glued directly onto the event text
+with zero separator — e.g. `2026-08-30T00:20:21+00:00Reprioritised
+(none → high)`. `--relative` values ("just now", "2h ago") are always
+under 12 chars so this never showed up until `--iso` was actually run by
+hand. Fixed with a guaranteed trailing literal space regardless of
+padding. Filed here rather than as a Red Team finding since it was
+caught and fixed before any commit landed.
+
+Added `tests/test_wow_part3.py` (17 new cases across store/CLI/MCP,
+including the sync-merge-untouched guarantee and the `--iso` timestamp
+case). Full suite: 103 passed (86 pre-existing + 17 new). Shipped as
+`cadence-todo` 0.2.7; CI green on main; verified against the real
+published 0.2.7 package (fresh venv, no repo on path) via both the CLI
+console script and a real MCP stdio `ClientSession` — `cadence why <id>`
+and `why_task` both matched local behavior exactly, including the
+reason/no-reason and missing-id paths.

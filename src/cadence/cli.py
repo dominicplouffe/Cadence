@@ -13,6 +13,7 @@ Usage:
     cadence schedule <id> <due-date>
     cadence decompose <id> --into "Subtask A" "Subtask B"
     cadence reprioritise <id> <low|med|high>
+    cadence why <id>                # show this task's history, plain language
     cadence undo
     cadence sync [--remote PATH] [--keep-mine ID | --keep-theirs ID]
     cadence export [--format json|table] [--out PATH]
@@ -83,6 +84,37 @@ def _days_overdue(due: str) -> int:
     d = datetime.date.fromisoformat(due)
     delta = (datetime.date.today() - d).days
     return delta if delta > 0 else 0
+
+
+def _relative_time(iso_str: str) -> str:
+    """"2m ago" / "just now" style rendering for `why` (wow-spec.md Part
+    III §1b) -- falls back to the raw string if it isn't parseable, rather
+    than crashing a command whose whole point is being legible."""
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str)
+    except (ValueError, TypeError):
+        return iso_str
+    now = datetime.datetime.now(dt.tzinfo) if dt.tzinfo else datetime.datetime.now()
+    secs = max(0, (now - dt).total_seconds())
+    if secs < 60:
+        return "just now"
+    mins = int(secs // 60)
+    if mins < 60:
+        return f"{mins}m ago"
+    hours = int(mins // 60)
+    if hours < 24:
+        return f"{hours}h ago"
+    days = int(hours // 24)
+    return f"{days}d ago"
+
+
+def _source_label(source):
+    """"you, via CLI" / "agent, via MCP" -- wow-spec.md Part III §1b."""
+    if source == "mcp":
+        return "agent, via MCP"
+    if source == "cli":
+        return "you, via CLI"
+    return None
 
 
 def _render_row(task, width: int, meta_override: str = None, level: int = 0) -> str:
@@ -227,7 +259,7 @@ def cmd_schedule(args: argparse.Namespace) -> int:
         _err(f"can't parse '{args.date}' as a date. Try: cadence schedule {args.id} 2026-09-01")
     store = Store()
     try:
-        task = store.schedule(task_id, due)
+        task = store.schedule(task_id, due, reason=args.reason, source="cli")
     except CadenceError as exc:
         _err(_format_err(exc))
     print(f"Scheduled #{task.id} for {due}: {task.title}")
@@ -238,7 +270,7 @@ def cmd_decompose(args: argparse.Namespace) -> int:
     task_id = _require_id(args.id)
     store = Store()
     try:
-        parent, children = store.decompose(task_id, args.into or [])
+        parent, children = store.decompose(task_id, args.into or [], reason=args.reason, source="cli")
     except CadenceError as exc:
         _err(_format_err(exc))
     ids = ", ".join(f"#{c.id}" for c in children)
@@ -251,10 +283,56 @@ def cmd_reprioritise(args: argparse.Namespace) -> int:
     store = Store()
     try:
         old = store.get(task_id)
-        task = store.reprioritise(task_id, args.priority)
+        task = store.reprioritise(task_id, args.priority, reason=args.reason, source="cli")
     except CadenceError as exc:
         _err(_format_err(exc))
     print(f"Reprioritised #{task.id} ({old.priority or 'none'} → {task.priority}): {task.title}")
+    return 0
+
+
+def cmd_why(args: argparse.Namespace) -> int:
+    task_id = _require_id(args.id)
+    store = Store()
+    try:
+        result = store.why(task_id)
+    except CadenceError as exc:
+        _err(_format_err(exc))
+    task = result["task"]
+    events = result["events"]
+    print(f"#{task.id} {task.title} — history (newest first):")
+    if not events:
+        # Can't actually happen today (every task has at least a "Created"
+        # commit) but a bare header with nothing under it would violate
+        # §4.2's "never a dead end" rule if some future path ever got here.
+        print()
+        print("No history recorded for this task yet.")
+        return 0
+    for i, ev in enumerate(events):
+        print()
+        bullet = _c(DIM, "•") if USE_COLOR else "-"
+        prio = ev["priority"]
+        prio_disp = _c(YELLOW, prio) if (USE_COLOR and prio == "high") else prio
+        when = ev["at"] if args.iso else _relative_time(ev["at"])
+        pad = 9 + (len(prio_disp) - len(prio))  # account for ANSI codes in the width
+        # `when:<12` only pads short ("just now"/"2h ago") values -- a full
+        # ISO-8601 timestamp (--iso) is already >12 chars, so the width spec
+        # adds no separator and glues it straight onto the event text. A
+        # trailing literal space guarantees at least one separator either way.
+        print(f"  {bullet}  {prio_disp:<{pad}}{when:<12} {ev['event']}")
+        if ev["reason"]:
+            label = _source_label(ev["source"])
+            suffix = f" — {label}" if label else ""
+            quote = f'"{ev["reason"]}"{suffix}'
+            wrapped = textwrap.wrap(quote, width=56) or [quote]
+            for line in wrapped:
+                print(f"                       {line}")
+        elif ev["reason_capable"]:
+            print()
+            print(
+                "No reason was recorded for this change. Reasons are optional —\n"
+                'pass --reason "..." (CLI) or a `reason` argument (MCP tool call)\n'
+                "to leave one next time."
+            )
     return 0
 
 
@@ -368,6 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sched.add_argument("id")
     p_sched.add_argument("date")
+    p_sched.add_argument("--reason", help="Optional: why, for 'cadence why' to show later")
     p_sched.set_defaults(func=cmd_schedule)
 
     p_decompose = sub.add_parser(
@@ -376,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_decompose.add_argument("id")
     p_decompose.add_argument("--into", nargs="+", metavar="TITLE")
+    p_decompose.add_argument("--reason", help="Optional: why, for 'cadence why' to show later")
     p_decompose.set_defaults(func=cmd_decompose)
 
     p_repri = sub.add_parser(
@@ -384,7 +464,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_repri.add_argument("id")
     p_repri.add_argument("priority")
+    p_repri.add_argument("--reason", help="Optional: why, for 'cadence why' to show later")
     p_repri.set_defaults(func=cmd_reprioritise)
+
+    p_why = sub.add_parser(
+        "why", help="Show why a task changed. Example: cadence why 2"
+    )
+    p_why.add_argument("id")
+    p_why.add_argument(
+        "--iso", action="store_true", help="Show absolute ISO timestamps instead of relative time"
+    )
+    p_why.set_defaults(func=cmd_why)
 
     p_undo = sub.add_parser(
         "undo", help="Revert the single most recent change. Example: cadence undo"

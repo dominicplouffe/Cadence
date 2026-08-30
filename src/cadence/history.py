@@ -125,6 +125,54 @@ class GitHistory:
         r = self._git("log", "-1", "--pretty=%s", commit, check=False)
         return r.stdout.strip() if r.returncode == 0 else ""
 
+    def full_message(self, commit: str) -> str:
+        """The commit's whole message (subject + body), e.g. the `Reason:`/
+        `Source:` trailers wow-spec.md Part III §1a adds -- `message_of`
+        above only returns the subject line (`%s`), which is what every
+        pre-existing caller (undo's summary) still wants."""
+        r = self._git("log", "-1", "--pretty=%B", commit, check=False)
+        return r.stdout if r.returncode == 0 else ""
+
+    def parse_trailers(self, commit: str) -> tuple[str, Optional[str], Optional[str]]:
+        """(subject, reason, source) for one commit -- `reason`/`source`
+        are None when this commit's message carries no `Reason:`/`Source:`
+        trailer (every commit before wow-spec.md Part III, and every
+        `add`/`done`/`undo`/sync commit today, which don't accept a reason
+        at all per Part III §1a's scope list)."""
+        message = self.full_message(commit)
+        lines = message.splitlines()
+        subject = lines[0] if lines else ""
+        reason = None
+        source = None
+        for line in lines[1:]:
+            if line.startswith("Reason: "):
+                reason = line[len("Reason: "):]
+            elif line.startswith("Source: "):
+                source = line[len("Source: "):]
+        return subject, reason, source
+
+    def commit_time(self, commit: str) -> str:
+        """Author-date ISO-8601 timestamp for `commit`, for `why`'s
+        relative-time display (and `--iso` passthrough)."""
+        r = self._git("log", "-1", "--pretty=%aI", commit, check=False)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def first_parent(self, commit: str) -> Optional[str]:
+        r = self._git("rev-parse", "--verify", f"{commit}^", check=False)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def log_for_file(self, relpath: str) -> list[str]:
+        """Every commit (newest first) that actually changed `relpath`'s
+        content -- git's own default history simplification already
+        excludes commits that touched the tree but left this blob
+        unchanged, which is exactly "this task's own history" wow-spec.md
+        Part III §1b needs (one file per task, per history.py's module
+        docstring)."""
+        r = self._git("log", "--pretty=%H", "--", relpath, check=False)
+        if r.returncode != 0:
+            return []
+        return [h for h in r.stdout.splitlines() if h]
+
     def changed_task_files(self, commit: str) -> list[str]:
         """Paths under tasks/ that `commit` added or changed relative to its
         first parent (or the empty tree, for a root commit)."""

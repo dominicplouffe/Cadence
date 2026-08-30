@@ -327,7 +327,21 @@ class Store:
             return  # already initialized -- nothing to do
         GitHistory(hist_dir).ensure()
 
-    def _snapshot_and_commit(self, tasks: list["Task"], message: str) -> None:
+    def _snapshot_and_commit(
+        self,
+        tasks: list["Task"],
+        message: str,
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> None:
+        """wow-spec.md Part III §1a: `reason` (optional, on decompose/
+        reprioritise/schedule only) rides as a second paragraph in the same
+        commit this method already makes -- no new storage, no schema
+        change. `source` ("cli" or "mcp", whichever surface called in)
+        rides alongside it so `why` can render "-- you, via CLI" / "--
+        agent, via MCP". Omitted entirely when `reason` is falsy, so every
+        existing commit shape (and every caller that doesn't pass either)
+        is byte-identical to before this change."""
         hist = self._history()
         hist.ensure()
         for t in tasks:
@@ -335,6 +349,8 @@ class Store:
             # merge engine's own storage, so it must carry `origin` even
             # though CLI/MCP callers never see it.
             hist.write_task_file(t.to_full_dict())
+        if reason:
+            message = f"{message}\n\nReason: {reason}\nSource: {source or 'cli'}"
         hist.commit(message)
 
     def add(
@@ -450,17 +466,32 @@ class Store:
         self._snapshot_and_commit([task], f"Done #{task.id}: {task.title}")
         return task
 
-    def schedule(self, task_id: int, due: str) -> Task:
+    def schedule(
+        self,
+        task_id: int,
+        due: str,
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> Task:
         due = _validate_due(due)
         with closing(self._connect()) as conn:
             self.get(task_id, _conn=conn)
             conn.execute("UPDATE tasks SET due = ? WHERE id = ?", (due, int(task_id)))
             conn.commit()
             task = self.get(task_id, _conn=conn)
-        self._snapshot_and_commit([task], f"Scheduled #{task.id} for {due}: {task.title}")
+        self._snapshot_and_commit(
+            [task], f"Scheduled #{task.id} for {due}: {task.title}",
+            reason=reason, source=source,
+        )
         return task
 
-    def reprioritise(self, task_id: int, priority: str) -> Task:
+    def reprioritise(
+        self,
+        task_id: int,
+        priority: str,
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> Task:
         """docs/human-surface.md §4.8: a dedicated verb, distinct from
         `add --priority`, because re-prioritising an existing task is its
         own auditable event."""
@@ -477,6 +508,7 @@ class Store:
         self._snapshot_and_commit(
             [task],
             f"Reprioritised #{task.id} ({old.priority or 'none'} → {priority}): {task.title}",
+            reason=reason, source=source,
         )
         return task
 
@@ -493,7 +525,13 @@ class Store:
             current = parent
             seen.add(current)
 
-    def decompose(self, parent_id: int, titles: list[str]) -> tuple[Task, list[Task]]:
+    def decompose(
+        self,
+        parent_id: int,
+        titles: list[str],
+        reason: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> tuple[Task, list[Task]]:
         """docs/human-surface.md §4.7: structural-only -- links titles the
         caller already wrote to a parent, atomically, as one call. Bounded
         by construction (max depth, max subtasks per parent) so a looping
@@ -548,6 +586,7 @@ class Store:
         self._snapshot_and_commit(
             [parent, *children],
             f"Decomposed #{parent.id} into {len(children)} subtasks: {ids}",
+            reason=reason, source=source,
         )
         return parent, children
 
@@ -557,6 +596,79 @@ class Store:
                 "SELECT * FROM tasks WHERE parent_id = ? ORDER BY id ASC", (parent_id,)
             ).fetchall()
             return [self._row_to_task(r) for r in rows]
+
+    # -- why (wow-spec.md Part III §1b) ----------------------------------
+
+    def _describe_why_event(self, before: Optional[dict], after: dict) -> tuple[str, bool]:
+        """(plain-language description, reason_capable) for one commit that
+        touched this task, given the task's content just before and just
+        after it. `reason_capable` says whether this *kind* of event is one
+        of the three verbs wow-spec.md Part III §1a lets a caller attach a
+        reason to (decompose/reprioritise/schedule) -- `why` only offers
+        the "no reason was recorded" nudge for those, never for add/done/
+        undo, which never had a reason to record in the first place."""
+        if before is None:
+            parent_id = after.get("parent_id")
+            if parent_id is not None:
+                try:
+                    parent_title = self.get(parent_id).title
+                    return f"Created as subtask of #{parent_id} ({parent_title})", True
+                except CadenceError:
+                    return f"Created as subtask of #{parent_id}", True
+            return "Created", False
+        if before.get("status") != after.get("status"):
+            return ("Completed" if after.get("status") == "done" else "Reopened"), False
+        if before.get("priority") != after.get("priority"):
+            old = before.get("priority") or "none"
+            new = after.get("priority") or "none"
+            return f"Reprioritised ({old} → {new})", True
+        if before.get("due") != after.get("due"):
+            old_due, new_due = before.get("due"), after.get("due")
+            if old_due is None:
+                return f"Scheduled for {new_due}", True
+            return f"Scheduled (due {old_due} → {new_due})", True
+        return "Updated", False
+
+    def why(self, task_id: int) -> dict:
+        """Render task `task_id`'s git-backed history (already written by
+        every mutation above) as a plain-language timeline, newest first --
+        wow-spec.md Part III §1b: "cadence why replaces 'go find a hidden
+        .git directory and run git log' outright." A thin read layer: each
+        task is already one file at tasks/<id>.json (history.py's module
+        docstring), so this is `git log -- that file`, not a new index.
+
+        Raises TaskNotFound (same "no task with id N" wording every other
+        verb uses, per §4.4) if the id doesn't exist.
+
+        Returns {"task": Task, "events": [{"event", "priority", "at"
+        (ISO), "reason", "source", "reason_capable"}, ...]}, newest first.
+        """
+        task = self.get(task_id)  # raises TaskNotFound/InvalidTask
+        hist = self._history()
+        hist.ensure()
+        relpath = f"tasks/{task_id}.json"
+        events = []
+        for commit in hist.log_for_file(relpath):
+            after_raw = hist.show_file(commit, relpath)
+            if after_raw is None:
+                continue  # file didn't exist at this commit -- nothing to describe
+            after = json.loads(after_raw)
+            parent_commit = hist.first_parent(commit)
+            before_raw = hist.show_file(parent_commit, relpath) if parent_commit else None
+            before = json.loads(before_raw) if before_raw is not None else None
+            subject, reason, source = hist.parse_trailers(commit)
+            desc, reason_capable = self._describe_why_event(before, after)
+            if subject.startswith("Undo:"):
+                desc = f"{desc} undone"
+            events.append({
+                "event": desc,
+                "priority": after.get("priority") or "none",
+                "at": hist.commit_time(commit),
+                "reason": reason,
+                "source": source,
+                "reason_capable": reason_capable,
+            })
+        return {"task": task, "events": events}
 
     # -- undo -----------------------------------------------------------
 

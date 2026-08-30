@@ -30,7 +30,12 @@ mcp = FastMCP(
         "complete_task to mark it done. decompose_task links subtask titles "
         "you already wrote to a parent task (it does not invent the "
         "breakdown itself). reprioritise_task changes an existing task's "
-        "priority. undo reverts the single most recent mutation from any "
+        "priority. decompose_task, reprioritise_task, and schedule_task all "
+        "take an optional `reason` string -- pass one whenever you have a "
+        "reason, so a person can later ask why_task and see it; it costs "
+        "nothing to omit. why_task renders a task's git-backed change "
+        "history as a plain-language timeline, including any reasons left "
+        "this way. undo reverts the single most recent mutation from any "
         "surface (running it twice returns to the pre-undo state). "
         "sync_tasks syncs this store with a shared remote history and "
         "reports any per-task conflicts, which resolve_sync_conflict "
@@ -135,12 +140,15 @@ def complete_task(id: int) -> dict:
 
 
 @mcp.tool()
-def schedule_task(id: int, due: str) -> dict:
+def schedule_task(id: int, due: str, reason: Optional[str] = None) -> dict:
     """Set or change a task's due date.
 
     Args:
         id: Numeric task id, as returned by add_task or list_tasks.
         due: Non-empty ISO date/time string, e.g. "2026-09-01".
+        reason: Optional. Why you're setting this due date -- recorded so
+            a person can later call why_task(id) and see it. Omit if you
+            don't have one; it costs nothing.
 
     Returns:
         {"ok": true, "task": {...}} with the new due date on success, or
@@ -148,7 +156,7 @@ def schedule_task(id: int, due: str) -> dict:
         is empty.
     """
     try:
-        task = Store().schedule(id, due)
+        task = Store().schedule(id, due, reason=reason, source="mcp")
         return {"ok": True, "task": task.to_dict()}
     except CadenceError as exc:
         return _err(exc)
@@ -157,7 +165,7 @@ def schedule_task(id: int, due: str) -> dict:
 
 
 @mcp.tool()
-def decompose_task(id: int, into: list[str]) -> dict:
+def decompose_task(id: int, into: list[str], reason: Optional[str] = None) -> dict:
     """Split a task into subtasks by linking titles you already wrote.
 
     This is a structural primitive, not a planner: Cadence does not invent
@@ -168,6 +176,9 @@ def decompose_task(id: int, into: list[str]) -> dict:
     Args:
         id: Numeric id of the parent task.
         into: Non-empty list of subtask titles (each max 200 characters).
+        reason: Optional. Why you're breaking this task down this way --
+            recorded so a person can later call why_task(id) (on the parent
+            or any subtask) and see it. Omit if you don't have one.
 
     Returns:
         {"ok": true, "parent": {...}, "subtasks": [task, ...]} on success,
@@ -176,7 +187,7 @@ def decompose_task(id: int, into: list[str]) -> dict:
         20-per-parent cap.
     """
     try:
-        parent, children = Store().decompose(id, into)
+        parent, children = Store().decompose(id, into, reason=reason, source="mcp")
         return {
             "ok": True,
             "parent": parent.to_dict(),
@@ -189,7 +200,7 @@ def decompose_task(id: int, into: list[str]) -> dict:
 
 
 @mcp.tool()
-def reprioritise_task(id: int, priority: str) -> dict:
+def reprioritise_task(id: int, priority: str, reason: Optional[str] = None) -> dict:
     """Change an existing task's priority.
 
     Distinct from setting priority at creation (add_task's `priority` arg):
@@ -199,6 +210,9 @@ def reprioritise_task(id: int, priority: str) -> dict:
     Args:
         id: Numeric task id, as returned by add_task or list_tasks.
         priority: One of "low", "med", "high".
+        reason: Optional. Why this task outranks the others now -- recorded
+            so a person can later call why_task(id) and see it instead of
+            just watching a number change. Omit if you don't have one.
 
     Returns:
         {"ok": true, "task": {...}} with the new priority on success, or
@@ -206,8 +220,50 @@ def reprioritise_task(id: int, priority: str) -> dict:
         unknown or priority isn't one of the three values.
     """
     try:
-        task = Store().reprioritise(id, priority)
+        task = Store().reprioritise(id, priority, reason=reason, source="mcp")
         return {"ok": True, "task": task.to_dict()}
+    except CadenceError as exc:
+        return _err(exc)
+    except Exception as exc:
+        return _err_unexpected(exc)
+
+
+@mcp.tool()
+def why_task(id: int) -> dict:
+    """Show a task's git-backed change history as a plain-language timeline.
+
+    Every mutation (add/decompose/reprioritise/schedule/complete/undo) is
+    already a commit; this reads that history back for one task, newest
+    first, including any `reason` left on decompose_task/reprioritise_task/
+    schedule_task calls and which surface (CLI or MCP) made each change.
+
+    Args:
+        id: Numeric task id, as returned by add_task or list_tasks.
+
+    Returns:
+        {"ok": true, "task": {...}, "history": [{"event": "<plain-language
+        description>", "priority": "<the task's priority right after this
+        change>", "at": "<ISO-8601 timestamp>", "reason": str or null,
+        "source": "cli"|"mcp"|null}, ...]} newest first, or {"ok": false,
+        "error": "task_not_found", "message", "hint"} if the id doesn't
+        exist.
+    """
+    try:
+        result = Store().why(id)
+        return {
+            "ok": True,
+            "task": result["task"].to_dict(),
+            "history": [
+                {
+                    "event": ev["event"],
+                    "priority": ev["priority"],
+                    "at": ev["at"],
+                    "reason": ev["reason"],
+                    "source": ev["source"],
+                }
+                for ev in result["events"]
+            ],
+        }
     except CadenceError as exc:
         return _err(exc)
     except Exception as exc:
