@@ -339,3 +339,79 @@ def test_cli_why_reason_wrap_respects_columns_like_list_does(tmp_path):
     assert narrow.stdout != wide.stdout
     # Narrower terminal must wrap onto strictly more lines than the wide one.
     assert narrow.stdout.count("\n") > wide.stdout.count("\n")
+
+
+# --- Red Team 0.2.8 finding #1: a `reason` whose own text starts a line ----
+# with "Reason: " or "Source: " must never be treated as opening a NEW
+# trailer -- `parse_trailers` (history.py) used to re-match on line prefix
+# alone, silently dropping everything captured before the collision (in the
+# self-collision case, permanently, from every surface but raw `git log`).
+
+_SELF_COLLIDING_REASON = (
+    "Kickoff notes below.\n"
+    "Reason: client asked for it verbally.\n"
+    "Follow up next week."
+)
+
+
+def test_why_reprioritise_reason_surviving_its_own_reason_prefix_collision(store):
+    """The reason's own middle line starts with 'Reason: ' -- plausible
+    task-management prose, not an adversarial string -- and must not
+    truncate everything recorded before it."""
+    task = store.add("Ship it")
+    store.reprioritise(task.id, "high", reason=_SELF_COLLIDING_REASON, source="cli")
+    events = store.why(task.id)["events"]
+    assert events[0]["reason"] == _SELF_COLLIDING_REASON
+
+
+def test_why_reprioritise_reason_surviving_a_source_prefix_collision(store):
+    """Same class, `Source: ` this time, and not on the message's last
+    line -- must still be treated as reason content, not as the real
+    `Source:` trailer (which only ever legally sits on the last line)."""
+    reason = "Line one.\nSource: not the real source line.\nLine three."
+    task = store.add("Ship it")
+    store.reprioritise(task.id, "high", reason=reason, source="cli")
+    events = store.why(task.id)["events"]
+    assert events[0]["reason"] == reason
+    assert events[0]["source"] == "cli"
+
+
+def test_cli_why_shows_every_line_despite_self_colliding_reason_prefix(tmp_path):
+    env = _cli_env(tmp_path)
+    _run_cli("add", "Ship it", env=env)
+    result = _run_cli(
+        "reprioritise", "1", "high", "--reason", _SELF_COLLIDING_REASON, env=env
+    )
+    assert result.returncode == 0
+    out = _run_cli("why", "1", env=env).stdout
+    assert "Kickoff notes below" in out
+    assert "client asked for it verbally" in out
+    assert "Follow up next week" in out
+
+
+def test_mcp_why_task_survives_self_colliding_reason_prefix(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "mcp5.db"))
+    from cadence.mcp_server import add_task, reprioritise_task, why_task
+
+    added = add_task("Ship it")
+    task_id = added["task"]["id"]
+    reprioritise_task(task_id, "high", reason=_SELF_COLLIDING_REASON)
+    result = why_task(task_id)
+    assert result["history"][0]["reason"] == _SELF_COLLIDING_REASON
+
+
+# --- Red Team 0.2.8 finding #2: `cmd_why`'s COLUMNS-aware wrap must ---------
+# subtract its own rendered indent (23 cols for the reason quote) the same
+# way `cmd_list` subtracts its layout overhead -- otherwise reason lines
+# render wider than the terminal at narrow COLUMNS instead of narrower.
+
+
+def test_cli_why_output_never_exceeds_narrow_columns(tmp_path):
+    env = _cli_env(tmp_path)
+    _run_cli("add", "Repro task collision", env=env)
+    _run_cli(
+        "reprioritise", "1", "high", "--reason", _SELF_COLLIDING_REASON, env=env
+    )
+    out = _run_cli("why", "1", env={**env, "COLUMNS": "40"}).stdout
+    longest = max((len(line) for line in out.splitlines()), default=0)
+    assert longest <= 40

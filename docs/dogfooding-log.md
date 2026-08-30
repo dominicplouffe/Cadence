@@ -938,3 +938,41 @@ prefixes. For finding 2, `cmd_why` needs the equivalent of `cmd_list`'s
 overhead subtraction: `reason_wrap_width = max(20, columns - len(indent))`
 using the same 23-char (or whatever it resolves to) indent string it
 already prints with.
+
+---
+
+## 2026-08-30 (Rafael Okonkwo, Build) — fixed Dov's 0.2.8 findings, shipping 0.2.9
+
+Both issues from the 0.2.8 adversarial pass (commit ef51538) fixed in this
+pass:
+
+**Finding 1 (severe, trailer self-collision):** `GitHistory.parse_trailers`
+in `src/cadence/history.py` now only opens a new `Reason:` trailer when none
+is currently open (`current is None`), and only opens `Source:` on the
+message's structurally-guaranteed last line — not on any line that merely
+starts with those words. `_snapshot_and_commit` (store.py) only ever emits
+one shape (`Reason:` opens once right after the subject's blank line;
+`Source:`, when present, is always the message's single final line), so that
+invariant is what lets the parser tell "trailers-block boundary" apart from
+"continuation line that happens to start the same way" without changing the
+storage format at all. Regression tests: `test_why_reprioritise_reason_surviving_its_own_reason_prefix_collision`,
+`test_why_reprioritise_reason_surviving_a_source_prefix_collision`,
+`test_cli_why_shows_every_line_despite_self_colliding_reason_prefix`,
+`test_mcp_why_task_survives_self_colliding_reason_prefix` — confirmed all
+four fail against pre-fix `history.py` (ran with `git stash push -- src/cadence/cli.py src/cadence/history.py`,
+keeping only the new tests) before restoring the fix.
+
+**Finding 2 (cosmetic, COLUMNS overflow):** `cmd_why` (`src/cadence/cli.py`)
+now subtracts its own rendered indent — 23 cols for the reason quote, plus
+the id-prefix width for the header line and the full row-prefix width for
+each event line — from `COLUMNS` before calling `textwrap.wrap`, the same
+pattern `cmd_list` already used. All three text surfaces in `why`'s output
+(header, event row, reason quote) are now wrapped this way; previously only
+the reason quote wrapped at all, and even that used the raw terminal width
+instead of `width - indent`. Regression test:
+`test_cli_why_output_never_exceeds_narrow_columns` (confirmed failing
+pre-fix: 63 > 40).
+
+Full suite: `pytest -q` → 114 passed. Shipped as 0.2.9 (commit to follow this
+entry), verified against the real published PyPI wheel in a fresh
+no-repo venv per house discipline before closing the task.

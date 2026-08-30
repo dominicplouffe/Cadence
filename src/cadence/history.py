@@ -147,7 +147,23 @@ class GitHistory:
         instead of only the one line immediately following the key --
         Red Team 0.2.7 finding #1: the old one-line-only capture silently
         dropped continuation lines on the read side even though `git log`
-        shows the full text was always written correctly."""
+        shows the full text was always written correctly.
+
+        Red Team 0.2.8 finding #1: that fix still re-parsed ANY line
+        starting with "Reason: "/"Source: " as a new trailer, even one
+        that is itself a continuation line inside an already-open reason
+        -- plausible task-management prose ("Reason: client asked for it
+        verbally.") colliding with the trailer syntax, not an adversarial
+        edge case; the self-collision variant was unrecoverable from any
+        surface but raw `git log --pretty=%B`. `_snapshot_and_commit`
+        (store.py) only ever emits one shape: `Reason: ...` opens once,
+        directly after the blank line under the subject, and -- only when
+        reason is truthy -- exactly one `Source: ...` line closes the
+        message, always as its very last line and always exactly one line
+        (source is a fixed "cli"/"mcp" literal, never user text, so it
+        never needs a continuation of its own). That invariant is what
+        lets the loop below tell the trailers-block boundary apart from a
+        continuation line that merely starts with the same words."""
         message = self.full_message(commit)
         # rstrip trailing newlines first -- `git log --pretty=%B` always
         # ends the body in at least one, and splitlines() would otherwise
@@ -160,11 +176,23 @@ class GitHistory:
         reason_lines: Optional[list[str]] = None
         source_lines: Optional[list[str]] = None
         current: Optional[list[str]] = None
-        for line in lines[1:]:
-            if line.startswith("Reason: "):
+        last_index = len(lines) - 1
+        for index, line in enumerate(lines[1:], start=1):
+            is_trailers_block_close = index == last_index
+            if current is None and line.startswith("Reason: "):
+                # `Reason:` only legally opens a trailer while none is open
+                # yet -- a line that merely starts the same way while we're
+                # already inside a continuation (current is not None) falls
+                # through to the plain "append" branch below instead of
+                # re-opening (and truncating) the reason.
                 reason_lines = [line[len("Reason: "):]]
                 current = reason_lines
-            elif line.startswith("Source: "):
+            elif is_trailers_block_close and line.startswith("Source: "):
+                # `Source:` only legally opens on the message's actual last
+                # line -- the structural position _snapshot_and_commit
+                # (store.py) guarantees for the real trailer, as opposed to
+                # those same words appearing mid-paragraph inside a
+                # continuation of `reason`'s own text.
                 source_lines = [line[len("Source: "):]]
                 current = source_lines
             elif current is not None:

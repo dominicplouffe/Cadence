@@ -304,8 +304,36 @@ def cmd_why(args: argparse.Namespace) -> int:
     # #2: wow-spec.md §6's "no truncation, wraps at any terminal width"
     # contract applies to this surface too, and `COLUMNS=N cadence why`
     # must actually respond to N like `cadence list` already does.
-    reason_wrap_width = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
-    print(f"#{task.id} {task.title} — history (newest first):")
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    # This line's own literal rendered indent (see the reason-quote `print`
+    # below) -- `list`'s wrap subtracts ITS layout overhead (id/glyph/
+    # divider columns, `_render_row`'s `title_col_width`) before calling
+    # `textwrap.wrap`; Red Team 0.2.8 finding #2 is that this one never
+    # did, so at narrow COLUMNS the reason text was wrapped to the full
+    # terminal width and then printed 23 columns further right, overflowing
+    # by exactly that much.
+    reason_indent = " " * 23
+    # Floor of 1 (not `list`'s 10, nor the pre-fix 20 this replaces): the
+    # overhead here (23 cols) can itself exceed a narrow COLUMNS, and §6's
+    # "no truncation... at any terminal width" contract means wrapping
+    # tighter than feels roomy beats spilling text past the terminal edge.
+    reason_wrap_width = max(1, width - len(reason_indent))
+    # Header: "#<id> <title> — history (newest first):" is one flowing
+    # line, not a fixed-column row like `list`'s -- it never wrapped at
+    # all before this fix, so at narrow COLUMNS (e.g. a long title at
+    # COLUMNS=40) it overflowed the same way the reason quote did. Wrapped
+    # here the same way as `list`'s title: hanging indent under where the
+    # title starts, `break_long_words=False` for the same reason as below.
+    id_prefix = f"#{task.id} "
+    header_tail = f"{task.title} — history (newest first):"
+    header_width = max(1, width - len(id_prefix))
+    header_lines = (
+        textwrap.wrap(header_tail, width=header_width, break_long_words=False)
+        or [header_tail]
+    )
+    print(f"{id_prefix}{header_lines[0]}")
+    for cont in header_lines[1:]:
+        print(f"{' ' * len(id_prefix)}{cont}")
     if not events:
         # Can't actually happen today (every task has at least a "Created"
         # commit) but a bare header with nothing under it would violate
@@ -324,17 +352,54 @@ def cmd_why(args: argparse.Namespace) -> int:
         # ISO-8601 timestamp (--iso) is already >12 chars, so the width spec
         # adds no separator and glues it straight onto the event text. A
         # trailing literal space guarantees at least one separator either way.
-        print(f"  {bullet}  {prio_disp:<{pad}}{when:<12} {ev['event']}")
+        when_col = max(12, len(when))
+        row_prefix = f"  {bullet}  {prio_disp:<{pad}}{when:<{when_col}} "
+        # Same overflow class as the header/reason above: the event text
+        # (e.g. "Reprioritised (none → high)") never wrapped either, so it
+        # could run past COLUMNS on its own. `row_prefix`'s only ANSI-
+        # bearing pieces are `bullet` and `prio_disp`, neither of which is
+        # itself width-padded (`pad` already visible-width-compensates the
+        # field it sits in), so its *visible* width is exactly the literal
+        # layout below -- no separate ANSI-stripping needed.
+        row_prefix_visible_len = 2 + 1 + 2 + 9 + when_col + 1
+        event_wrap_width = max(1, width - row_prefix_visible_len)
+        event_lines = (
+            textwrap.wrap(ev["event"], width=event_wrap_width, break_long_words=False)
+            or [ev["event"]]
+        )
+        print(f"{row_prefix}{event_lines[0]}")
+        for cont in event_lines[1:]:
+            print(f"{' ' * row_prefix_visible_len}{cont}")
         if ev["reason"]:
             label = _source_label(ev["source"])
             suffix = f" — {label}" if label else ""
-            quote = f'"{ev["reason"]}"{suffix}'
+            # A multi-line `reason` rides verbatim as the commit-body
+            # paragraph (wow-spec.md Part III §1a) -- each ORIGINAL line is
+            # its own wrap unit here instead of first flattening the whole
+            # reason into one reflowed paragraph (textwrap's default
+            # whitespace-collapsing behavior) and re-wrapping that. Content
+            # is identical either way; this just keeps a line the author
+            # deliberately broke off from its neighbor from being glued
+            # back onto it by an unrelated word-wrap decision.
+            reason_display_lines = ev["reason"].split("\n")
+            quote_lines = []
+            last = len(reason_display_lines) - 1
+            for j, rline in enumerate(reason_display_lines):
+                text = f'"{rline}' if j == 0 else rline
+                if j == last:
+                    text = f'{text}"{suffix}'
+                quote_lines.append(text)
             # break_long_words=False for the same reason cmd_list's title
             # wrap sets it: a word wider than the column overflowing its
             # own line is a smaller defect than one sliced mid-word.
-            wrapped = textwrap.wrap(quote, width=reason_wrap_width, break_long_words=False) or [quote]
+            wrapped = []
+            for line in quote_lines:
+                wrapped.extend(
+                    textwrap.wrap(line, width=reason_wrap_width, break_long_words=False)
+                    or [line]
+                )
             for line in wrapped:
-                print(f"                       {line}")
+                print(f"{reason_indent}{line}")
         elif ev["reason_capable"]:
             print()
             print(
