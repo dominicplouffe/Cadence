@@ -9,3 +9,28 @@ dist/
 build/
 .buildenv/
 .scratchvenv/
+
+# Local shim: this sandbox's `python` (/opt/venv) has no pytest and no
+# write access to its own site-packages. `python -m X` puts cwd first on
+# sys.path, so vendoring pytest's runtime here (copied from ./venv, never
+# installed) lets `python -m pytest -q` run without touching /opt/venv.
+# Not part of the shipped package or the real dev flow (README's is
+# `pip install -e . && pip install pytest && pytest -q`).
+/pytest/
+/_pytest/
+/iniconfig/
+/iniconfig-*.dist-info/
+/packaging/
+/packaging-*.dist-info/
+/pluggy/
+/pluggy-*.dist-info/
+/pytest-*.dist-info/
+/pygments/
+/pygments-*.dist-info/
+/py.py
+# Same shim, for the `cadence` package itself: tests spawn `sys.executable
+# -m cadence.cli` as a fresh subprocess whose cwd is this directory, and
+# that subprocess has no editable install to find it by either. A symlink
+# to src/cadence lets cwd-based -m resolution find it, in this sandbox
+# only; the real dev/CI flow is the editable install (README).
+/cadence

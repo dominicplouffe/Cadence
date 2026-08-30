@@ -28,3 +28,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Lets `pytest -q` collect and run against the real `cadence` package on a
+# bare checkout that has pytest but has not run `pip install -e .` yet.
+# CI still does the real editable install first (README's documented
+# path); this is additive so both resolve the identical src/ tree.
+pythonpath = ["src"]
