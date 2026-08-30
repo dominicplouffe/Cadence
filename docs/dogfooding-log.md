@@ -1052,3 +1052,139 @@ anything version-floor-sensitive before shipping, rather than trusting
 Recorded in team memory.
 
 Shipped as 0.2.10 (commit to follow this entry).
+
+---
+
+## 2026-08-30 (Rafael Okonkwo, Build) — 0.2.11: wow-spec Part II shipped — `cadence register` / `overdue --all-projects` / `sync --all-projects`, the direct fix for "I work on multiple projects"
+
+This is the chairman's own actual working setup (multiple project repos,
+one person), staked out in `docs/wow-spec.md` Part I/II as the honest,
+cheaply-buildable half of the cross-project pitch (§I.3: "each project's
+tasks already live in one plain SQLite file plus a plain git history,
+so scanning N known files and merging their rows is a read-only
+aggregation on data that already exists in the right shape"). Built
+narrowly, exactly as spec'd: no new storage engine, no schema change,
+read-only aggregation over stores that already work.
+
+- `cadence register` / `register_project` MCP tool — appends the
+  current CADENCE_DB_PATH to a plain-text registry at
+  `~/.config/cadence/projects.txt` (or `$CADENCE_CONFIG_HOME`), one path
+  per line, idempotent.
+- `cadence overdue [--all-projects]` / `overdue_tasks(all_projects=)` —
+  merges every registered store's overdue tasks into one project-
+  labeled view, leading each row with the `!`/`[!]` overdue glyph per
+  Surface's binding note on wow-spec.md Part II (2026-08-30). A
+  registered store that can't be opened is reported inline rather than
+  failing the whole call.
+- `cadence sync --all-projects [--remote <projects-file>]` /
+  `sync_tasks(all_projects=)` — a thin loop over the registry calling
+  the existing, already-tested per-project `Store.sync` for each entry;
+  never touches the merge/diff engine. Carries the same pulled/pushed
+  counts and the same `--keep-mine`/`--keep-theirs` conflict-recovery
+  line the single-project `sync` already gives, one line per project,
+  per Surface's binding note — never silently collapsed to "synced, no
+  conflicts."
+
+12 new regression tests (`tests/test_wow_part2.py`), confirmed 9/12 fail
+pre-fix (`git stash` on `cli.py`/`mcp_server.py`, the 3 pure-registry
+tests pass either way since `registry.py` is additive-only). Full suite:
+127 passed. Shipped as 0.2.11, commit 550f8ba — CI
+(https://github.com/dominicplouffe/Cadence/actions/runs/33309589608) and
+Publish (https://github.com/dominicplouffe/Cadence/actions/runs/33309589577)
+both green.
+
+**Verified against the real published PyPI wheel**, fresh venv, no repo
+on path (`pip install cadence-todo==0.2.11` from a clean
+`/workspace/verify_part2/venv`), with two real registered project
+directories (not mocked) — full transcript below, `NO_COLOR=1`,
+timestamps/dates as run:
+
+```
+$ export CADENCE_CONFIG_HOME=/workspace/verify_part2/config
+$ cd /workspace/verify_part2/proj-alpha
+$ export CADENCE_DB_PATH=/workspace/verify_part2/proj-alpha/cadence.db
+$ cadence register
+Registered /workspace/verify_part2/proj-alpha/cadence.db (as 'proj-alpha').
+$ cadence add "Write onboarding docs" --due 2026-08-21
+Added #1: Write onboarding docs
+$ cadence add "Ship the auth fix" --due 2028-08-30
+Added #2: Ship the auth fix
+$ export CADENCE_DB_PATH=/workspace/verify_part2/proj-beta/cadence.db
+$ cadence register
+Registered /workspace/verify_part2/proj-beta/cadence.db (as 'proj-beta').
+$ cadence add "Renew TLS cert" --due 2026-08-27
+Added #1: Renew TLS cert
+$ cadence register  (again in proj-alpha, idempotency check)
+Already registered: /workspace/verify_part2/proj-alpha/cadence.db (as 'proj-alpha').
+$ cat /workspace/verify_part2/config/projects.txt
+/workspace/verify_part2/proj-alpha/cadence.db
+/workspace/verify_part2/proj-beta/cadence.db
+$ cadence overdue --all-projects
+[!]  proj-alpha  #1   Write onboarding docs                |  overdue 9d
+[!]  proj-beta   #1   Renew TLS cert                       |  overdue 3d
+2 overdue across 2 registered projects. Run 'cadence register' in a project directory to add another.
+```
+
+Two-client `sync --all-projects`, set up so proj-alpha has real work to
+pull and proj-beta has a real, unresolved conflict (not invented):
+
+```
+$ cadence sync --remote /workspace/verify_part2/remote-alpha.git   (proj-alpha, first-time remote config)
+Synced with origin: pulled 0, pushed 2. Up to date.
+$ cadence sync --remote /workspace/verify_part2/remote-beta.git   (proj-beta, first-time remote config)
+Synced with origin: pulled 0, pushed 1. Up to date.
+--- device B: separate peer stores, same two remotes ---
+$ (peer-alpha) cadence sync --remote /workspace/verify_part2/remote-alpha.git
+Synced with origin: pulled 2, pushed 0. Up to date.
+$ (peer-alpha) cadence add "From device B"
+Added #3: From device B
+$ (peer-alpha) cadence sync
+Synced with origin: pulled 0, pushed 1. Up to date.
+$ (peer-beta) cadence sync --remote /workspace/verify_part2/remote-beta.git
+Synced with origin: pulled 1, pushed 0. Up to date.
+$ (peer-beta) cadence reprioritise 1 high --reason "needs review before renewal"
+Reprioritised #1 (none → high): Renew TLS cert
+$ (peer-beta) cadence sync
+Synced with origin: pulled 0, pushed 1. Up to date.
+$ (device A, proj-beta) cadence reprioritise 1 low   (unsynced local edit -> real conflict)
+Reprioritised #1 (none → low): Renew TLS cert
+$ cadence sync --all-projects   (device A, both registered projects)
+proj-alpha  synced: pulled 1, pushed 0. Up to date.
+proj-beta   synced: pulled 0, pushed 0. 1 conflict needs you.
+proj-beta   Error: #1 was edited on both this client and the remote since the last sync. Nothing was overwritten. Run 'cadence sync --keep-mine 1' or 'cadence sync --keep-theirs 1' with CADENCE_DB_PATH=/workspace/verify_part2/proj-beta/cadence.db, then sync again.
+$ echo $?
+1
+```
+
+Exit code 1 on an unresolved conflict, same convention as single-project
+`sync` — a fleet run doesn't report success while one project needs
+attention.
+
+MCP surface, same two registered stores, real installed 0.2.11 package
+(not a mock of the tool interface):
+
+```
+>>> from cadence.mcp_server import overdue_tasks, register_project
+>>> register_project()
+{'ok': True, 'path': '/workspace/verify_part2/proj-alpha/cadence.db', 'already_registered': True}
+>>> overdue_tasks(all_projects=True)
+{
+  "ok": true,
+  "tasks": [
+    {"id": 1, "title": "Write onboarding docs", "due": "2026-08-21", "project": "proj-alpha", "overdue_days": 9, ...},
+    {"id": 1, "title": "Renew TLS cert", "due": "2026-08-27", "project": "proj-beta", "overdue_days": 3, ...}
+  ],
+  "count": 2,
+  "projects": 2
+}
+```
+
+Everything above matches wow-spec.md Part II's format: the `!`/`[!]`
+overdue glyph leading every merged row, pulled/pushed counts and the
+`--keep-mine`/`--keep-theirs` recovery line surviving into the fleet
+view instead of collapsing to "synced, no conflicts," and idempotent
+`register`. `cadence why --project` (Part II's third moment, reusing
+Part III's already-shipped `why`) and the `overdue`/`sync --all-projects`
+pieces above were the two `SPEC` rows in Part II's II.1 gap table still
+open going into this task; `why --project` was not in this task's scope
+and remains open for a follow-on.
