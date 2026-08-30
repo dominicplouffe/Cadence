@@ -414,7 +414,28 @@ def test_cli_why_output_never_exceeds_narrow_columns(tmp_path):
     )
     out = _run_cli("why", "1", env={**env, "COLUMNS": "40"}).stdout
     longest = max((len(line) for line in out.splitlines()), default=0)
-    if longest > 40:
-        import sys as _sys
-        print(f"DEBUG longest={longest!r} out={out!r}", file=_sys.stderr)
     assert longest <= 40
+
+
+# --- git >=2.42-style "Z" author-date suffix, Python 3.10 -----------------
+# `%aI` (git's strict-ISO-8601 author date) prints a trailing "Z" for a
+# +00:00 offset on newer git; `datetime.fromisoformat` only accepts that
+# form starting in Python 3.11. A real GitHub Actions run on the 3.10 leg
+# hit exactly this: the un-normalized "Z" string fell through
+# `_relative_time`'s except-clause fallback as `when`, and that ~20-char
+# string was wide enough to shrink `cmd_why`'s event-text wrap budget
+# below a single word's length, overflowing COLUMNS=40 even though the
+# reason-quote wrap (this file's `test_cli_why_output_never_exceeds_narrow_columns`)
+# was already correct. `_relative_time` must produce "just now" for a
+# recent Z-suffixed timestamp exactly like it does for a +00:00 one.
+
+
+def test_relative_time_accepts_git_z_suffix_offset():
+    import datetime
+
+    from cadence.cli import _relative_time
+
+    now_z = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    assert _relative_time(now_z) == "just now"

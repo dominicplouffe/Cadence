@@ -1008,3 +1008,47 @@ This closes the wow-spec §3 gap: the blocker it named ("not before
 reason/why ship") is cleared, and the README now shows the actual
 differentiator the bake-off staked the whole pitch on, in the first 60
 seconds, before any agent is mentioned.
+
+---
+
+## 2026-08-30 (Rafael Okonkwo, Build) — 0.2.10: fixed a CI-only Python 3.10 regression the 0.2.9 fix introduced
+
+Shipping 0.2.9 (the fix for Dov's 0.2.8 findings) triggered a real Actions
+failure on the "Install + test (Python 3.10)" CI leg only — 3.11 and 3.12
+stayed green. `test_cli_why_output_never_exceeds_narrow_columns` failed
+with `assert 48 <= 40`, twice, reproducibly on GitHub's hosted runner but
+never locally across 7 attempts on a real `cpython-3.10.21` interpreter —
+so this was investigated with a temporary debug print (commit 60a26d7,
+harmless: `pyproject.toml`'s version was unchanged so `Publish` no-op'd on
+that push, confirmed via the Actions API) rather than guessed at.
+
+Root cause: `git log --pretty=%aI` (history.py's `commit_time`, feeding
+`why`'s relative-time display) prints a trailing `Z` for a UTC offset on
+the newer git installed on GitHub-hosted `ubuntu-latest` runners (git
+2.39.5 in this sandbox prints `+00:00` instead — that's why it never
+reproduced locally). `datetime.fromisoformat` only learned to parse a bare
+`Z` suffix in Python 3.11 (this project's own `requires-python` floor is
+3.10); on 3.10, the unparsed `Z` timestamp fell through `_relative_time`'s
+except-clause fallback and returned verbatim (~20 chars) instead of "just
+now". That long `when` value shrank `cmd_why`'s event-text wrap budget (the
+COLUMNS-overhead-subtraction fix shipped in 0.2.9) below the width of the
+word "Reprioritised" (13 chars); `break_long_words=False` (by design,
+matching `list`) let that whole word overflow onto its own line rather
+than slicing it, which is what actually produced the 48-char line.
+
+Fix: `_relative_time` now normalizes a trailing `Z` to `+00:00` before
+parsing, so it behaves identically regardless of which git version wrote
+the timestamp or which supported Python interpreter (3.10-3.12) reads it.
+Regression test `test_relative_time_accepts_git_z_suffix_offset` confirmed
+failing against pre-fix `cli.py` on a real Python 3.10.21 interpreter
+(`AssertionError: assert '...Z' == 'just now'`) before the fix, passing
+after. Full suite (`pytest -q`): 115 passed on both 3.10 and 3.11 locally.
+
+Lesson for the team: this project's floor is Python 3.10, but the sandbox
+only has 3.11 installed — `uv python install 3.10` (no root needed) pulls
+a real standalone interpreter in seconds and is now the way to validate
+anything version-floor-sensitive before shipping, rather than trusting
+"passes locally" when locally is a newer interpreter than the floor.
+Recorded in team memory.
+
+Shipped as 0.2.10 (commit to follow this entry).

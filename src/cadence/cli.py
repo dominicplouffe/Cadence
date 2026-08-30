@@ -89,9 +89,25 @@ def _days_overdue(due: str) -> int:
 def _relative_time(iso_str: str) -> str:
     """"2m ago" / "just now" style rendering for `why` (wow-spec.md Part
     III §1b) -- falls back to the raw string if it isn't parseable, rather
-    than crashing a command whose whole point is being legible."""
+    than crashing a command whose whole point is being legible.
+
+    `iso_str` comes from `git log --pretty=%aI` (history.py's
+    `commit_time`), and which literal offset spelling git prints for UTC
+    depends on the *git binary's own version*, not on anything this
+    process controls: git >= 2.42 or so prints a trailing "Z" for +00:00
+    (strict-ISO-8601 Zulu notation); older git prints "+00:00" instead.
+    `datetime.fromisoformat` only learned to accept a bare "Z" suffix in
+    Python 3.11 (bpo-41827) -- and pyproject.toml's `requires-python`
+    is ">=3.10", so this command has to keep working on a 3.10
+    interpreter paired with a Z-emitting git, a combination the CI matrix
+    genuinely produces (found via a real Actions run failing only on the
+    3.10 leg: the un-normalized "Z" string flowed all the way through as
+    `when`, wide enough to overflow `cmd_why`'s COLUMNS-aware wrap).
+    Normalizing here -- once, before the version-sensitive parse -- keeps
+    that entirely internal instead of leaking as a wide fallback string."""
+    normalized = iso_str[:-1] + "+00:00" if iso_str.endswith("Z") else iso_str
     try:
-        dt = datetime.datetime.fromisoformat(iso_str)
+        dt = datetime.datetime.fromisoformat(normalized)
     except (ValueError, TypeError):
         return iso_str
     now = datetime.datetime.now(dt.tzinfo) if dt.tzinfo else datetime.datetime.now()
