@@ -793,3 +793,148 @@ reason preserved end-to-end on all three verbs × store/CLI/MCP, plus the
 COLUMNS-width-changes-the-wrap case) — confirmed failing against
 pre-fix code before trusting them. Full suite: 109 passed (103
 pre-existing + 6 new). Shipped as `cadence-todo` 0.2.8.
+
+## 2026-08-30 (Dov Ferreira, Red Team) — adversarial pass on 0.2.8 (`why` trailer-parser + terminal-width wrap fix), 2 new findings
+
+Fresh venv, real published wheel only (`python3 -m venv redteam_028 && pip
+install cadence-todo==0.2.8`, confirmed `pip show cadence-todo` → 0.2.8,
+no repo on `sys.path`), CLI and MCP surfaces both driven directly.
+Re-verified this release's own claims first, then went adversarial per the
+task's four angles.
+
+**Held (both 0.2.7 findings genuinely fixed, no regression):**
+- 3-line `--reason` through `decompose`/`reprioritise`/`schedule` on CLI:
+  every line survives intact in `why`'s output (verified with distinct
+  wording per line so a drop or reorder would be visible), no spurious
+  blank continuation line from git's trailing newline.
+- Same on MCP (`why_task`'s JSON `history[].reason` returns the full
+  `"First point via MCP.\nSecond point via MCP.\nThird point via MCP."`
+  with embedded `\n` intact — checked the raw JSON, not just the
+  pretty-printed CLI rendering).
+- `Reason:` paragraph immediately followed by `Source:` with **no** blank
+  line (the normal, always-produced shape — confirmed in every raw `git
+  log --pretty=%B` body below) parses correctly whenever the reason text
+  itself contains no line that looks like a recognized trailer key.
+- Empty reason (`--reason ""`) and whitespace-only reason (`--reason
+  "   "`) both correctly collapse to "no reason was recorded" — no crash,
+  no stray quote-block.
+- `undo` interaction: reprioritise-with-3-line-reason → `undo` → `why`
+  still renders the original reason intact and unwrapped-differently; the
+  undo itself appears as its own reason-less event, nothing overwritten.
+
+**New finding 1 (real, severe — silent data loss): a `--reason` whose
+text contains a line starting with the literal `"Reason: "` or `"Source:
+"` (i.e. looks like a trailer key) truncates and can permanently drop
+earlier reason content, on both CLI and MCP, because both go through the
+same `Store.why` → `History.parse_trailers` path.**
+
+Root cause (`cadence/history.py::parse_trailers`, still present in
+0.2.8): the loop tests **every** line — including lines already inside an
+open trailer's continuation — against `line.startswith("Reason: ")` /
+`line.startswith("Source: ")`. Any such line inside the reason body is
+misread as the start of a *new* trailer, which reassigns `reason_lines`
+(or `source_lines`) to a fresh list, orphaning whatever had been
+collected so far with nothing left referencing it.
+
+Repro A — self-collision on `Reason:` (worse case, unrecoverable):
+```
+cadence add "Repro A"
+cadence reprioritise 1 high --reason "$(printf 'Kickoff notes below.\nReason: client asked for it verbally.\nFollow up next week.')"
+cadence why 1
+```
+Displayed reason: `"client asked for it verbally. Follow up next week."`
+— the first line, `"Kickoff notes below."`, is gone from every parsed
+view. Raw commit body (`git log --pretty=%B -1` in
+`cadence.db.history`) confirms the full text was written correctly:
+```
+Reason: Kickoff notes below.
+Reason: client asked for it verbally.
+Follow up next week.
+Source: cli
+```
+`Kickoff notes below.` exists nowhere except this raw git plumbing — no
+surface (`why` on CLI, `why_task` on MCP, `export`) can ever show it
+again. This is real, silent, permanent data loss of exactly the content
+this release's fix was written to protect.
+
+Repro B — collision on `Source:` (content misfiled, then usually masked):
+```
+cadence add "Repro B"
+cadence reprioritise 2 low --reason "$(printf 'Note before collision.\nSource: fake trailer text.\nTail line.')"
+cadence why 2
+```
+Displayed reason: `"Note before collision."` only — lines 2 and 3 are
+silently dropped from the reason. They get misfiled into `source_lines`
+instead (confirmed by re-running with `Source:` as the *last* line of the
+reason paragraph: the fake `source_lines` capture is then overwritten by
+the real trailing `Source: cli`/`Source: agent` trailer, so the displayed
+`source` still happens to read correctly by coincidence of ordering —
+but the misfiled reason text itself is gone either way). Reproduced
+identically via MCP (`why_task` on the same fixture returns
+`"reason": "Note before collision."`, JSON `history[0]`).
+
+This is a content-triggered instance of the same underlying weakness
+0.2.7's finding #1 was about (a naive prefix-matching trailer parser),
+just triggered by what the reason *says* instead of how many lines it
+has. A person writing a reason like `"Source: unclear, following up"` or
+`"Reason: was unclear at signup"` — plausible task-management language —
+loses part of their own note with no error, no warning, nothing in any
+UI to suggest anything was dropped.
+
+**New finding 2 (real, cosmetic/legibility, not data loss): `why`'s
+COLUMNS-aware reason wrap does not account for its own indent, unlike
+`list`, so at narrow terminals the printed line overflows the terminal
+width — the opposite of "matches list's wrapping behavior" this release
+claimed.**
+
+`cli.py::cmd_why`: `reason_wrap_width = max(20,
+shutil.get_terminal_size(fallback=(80, 24)).columns)` — uses the raw
+`COLUMNS` value directly as `textwrap.wrap`'s width, then prepends a
+23-character fixed indent (`" " * 23`) to every wrapped line before
+printing. `cmd_list`'s `_render_row`, by contrast, computes
+`title_col_width = max(10, width - 3 - 2 - 4 - 30 - len(level_indent))`
+— it subtracts its own layout overhead from the terminal width *before*
+wrapping, so its printed lines stay inside the terminal. `why` skips that
+subtraction entirely.
+
+Repro:
+```
+cadence add "Repro B width test task"
+cadence reprioritise 2 high --reason "This reason is long enough that it must wrap across several lines when the terminal is narrow, which is exactly what we are testing here for overflow."
+COLUMNS=40 cadence why 2 | awk '{print length($0)": "$0}'
+```
+Printed reason lines measure 57–63 characters wide at `COLUMNS=40` (up to
+57.5% over the 40-column terminal) — e.g. `"This reason is long enough
+that it must"` alone is 40 chars before the 23-char indent is added, for
+a 63-char physical line. `cmd_list`'s continuation lines at the same
+`COLUMNS=40`, by comparison, stay ≤21 characters. COLUMNS=40 vs
+COLUMNS=200 do genuinely produce different wrapping (confirmed, so the
+core "is it terminal-width-sensitive at all" claim holds) — the defect
+is that the computed width is wrong, not that it's static.
+
+**What I could not find a problem with:** the trailer-immediately-follows-
+no-blank-line case in isolation (item 2 of the task, non-colliding
+content); unicode/whitespace-only reasons; `undo` rendering; MCP JSON
+`\n`-preservation for well-formed multi-line reasons.
+
+**Ranking:** Finding 1 (trailer-key collision → silent, sometimes
+permanent, reason data loss) first if only one gets fixed — same-severity
+class as 0.2.7's original finding #1 (silent loss of the exact data this
+feature exists to preserve), and more insidious because the trigger is
+ordinary language ("Source: ...", "Reason: ...") rather than something a
+person would think to avoid. Finding 2 (width overflow) second — real,
+reproducible, and a direct contradiction of this release's own
+"matches `list`'s wrapping" claim, but cosmetic, not data loss.
+
+Suggested direction for Build (not prescribing the fix): the read side
+needs a parser that isn't fooled by trailer-key-shaped text inside a
+value it's already inside — e.g. only recognize `Reason:`/`Source:` as a
+new trailer when it appears as the *first* line after the commit
+subject's blank-line separator (trailers block), not anywhere a
+continuation is still open; or store/join reason text through a format
+that can't collide with the trailer grammar at all (e.g. a length-
+prefixed or fenced body) rather than continuing to pattern-match line
+prefixes. For finding 2, `cmd_why` needs the equivalent of `cmd_list`'s
+overhead subtraction: `reason_wrap_width = max(20, columns - len(indent))`
+using the same 23-char (or whatever it resolves to) indent string it
+already prints with.
