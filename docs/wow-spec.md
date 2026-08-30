@@ -208,6 +208,15 @@ change, no new database, no change to `sync`'s merge logic — this is
 additive read-only tooling over stores that already work exactly this
 way today.)*
 
+**Surface review note (2026-08-30, binding when this is built):** the
+row format above drops §4.1's `!` (red) overdue glyph — when this ships,
+lead each row with it, same word pairing as single-project `overdue`
+(`!  proj-alpha    #2  Write onboarding docs        overdue 9d`,
+no-color fallback `[!]`), so "overdue" is never carried by the word
+"overdue" alone in one view and by glyph+word in another. Not a blocker
+on this document's approval — Part II is sequenced after Part III per
+the Sign-off below and this can land with the implementation.
+
 **The moment: "why did the auth-fix task jump to top priority three days
 ago" — the answer Claude Code's Tasks structurally cannot give (§I.1:
 no version history, task state is overwritten):**
@@ -215,10 +224,10 @@ no version history, task state is overwritten):**
 $ cadence why 1 --project proj-alpha
 #1 Ship the auth fix — history (newest first):
 
-  ○ high     3d ago   Reprioritised (med → high)
+  • high     3d ago   Reprioritised (med → high)
                        "customer escalation came in, this blocks their
                        release" — agent, via MCP
-  ○ med      6d ago   Created
+  • med      6d ago   Created
                        — you, via CLI
 ```
 *(SPEC — `why` and the `reason` field are the same unshipped pieces
@@ -234,11 +243,13 @@ confirmed by reading `store.py`/`history.py` — the gap is entirely
 # on device B, after cloning ~/.config/cadence/projects.txt or running
 # 'cadence register' locally against the same five project directories:
 $ cadence sync --all-projects --remote alice@device-a:~/.config/cadence/projects.txt
-proj-alpha    synced, no conflicts
-proj-beta     synced, no conflicts
-proj-gamma    synced, no conflicts
-proj-delta    synced, no conflicts
-proj-epsilon  synced, no conflicts
+proj-alpha    synced: pulled 2, pushed 1. Up to date.
+proj-beta     synced: pulled 0, pushed 0. Up to date.
+proj-gamma    synced: pulled 1, pushed 0. Up to date.
+proj-delta    synced: pulled 1, pushed 3. Up to date.
+proj-epsilon  synced: pulled 0, pushed 1. 1 conflict needs you — run
+              'cadence sync --project proj-epsilon --keep-mine <id>' or
+              '--keep-theirs <id>', then sync again.
 $ cadence overdue --all-projects
 proj-alpha    #2  Write onboarding docs        overdue 9d
 proj-gamma    #4  Renew TLS cert                overdue 3d
@@ -253,6 +264,16 @@ once per `CADENCE_DB_PATH`, which is real but tedious — `--all-projects`
 is a thin loop over the registry from the first moment above, not new
 sync logic, so it inherits step 8's already-verified correctness rather
 than reopening it.)*
+
+**Surface review note (2026-08-30, binding when this is built):** the
+original draft collapsed each `--all-projects` row to "synced, no
+conflicts," dropping the pulled/pushed counts and the conflict-recovery
+line §4.10 requires for single-project `sync` — a fleet view is not an
+excuse to say less than the single-project command already says per
+project. Fixed above to carry the same counts and the same
+`--keep-mine`/`--keep-theirs` recovery instruction, one line per project,
+never silently summarized past a conflict. Same non-blocking status as
+the `overdue --all-projects` note above.
 
 ## II.1 Honest gap list for Part II
 
@@ -374,24 +395,37 @@ the ones a person asks "why" about.
 ### 1b. `cadence why <id>` / `why_task(id)` — the missing verb
 
 Renders that task's git-backed history as a plain-language timeline,
-newest first, in the same visual language as `list` (glyph, muted
-metadata, no raw git anywhere in the output — a user should never learn
-the word "commit" to use this). Implementation is a thin read layer on
-top of what already exists: each task is one file at `tasks/<id>.json`
-inside the `.history` repo (confirmed in `history.py`), so
-`git log --pretty=... -- tasks/<id>.json` already returns exactly the
-commits that touched *this* task, in order, with the `reason` paragraph
-(if any) in the commit body — no new index or table needed.
+newest first, in the same visual language as `list` (muted metadata, no
+raw git anywhere in the output — a user should never learn the word
+"commit" to use this). Implementation is a thin read layer on top of
+what already exists: each task is one file at `tasks/<id>.json` inside
+the `.history` repo (confirmed in `history.py`), so `git log --pretty=...
+-- tasks/<id>.json` already returns exactly the commits that touched
+*this* task, in order, with the `reason` paragraph (if any) in the
+commit body — no new index or table needed.
+
+**Glyph note (Surface review, 2026-08-30):** each history line leads
+with a dim `•` (border role, `\x1b[2m`, no-color fallback `-`), **not**
+`list`'s `○`. `○`/`✓`/`!` are reserved by §4.1 for a task's *current*
+status (open/done/overdue); a `why` line reports a *past event*, and
+several event types (e.g. "Reprioritised ... undone") aren't a status at
+all, so reusing `○` would silently teach the reader a glyph means two
+different things depending on which command printed it. `•` carries no
+status meaning by itself — the resulting priority word right after it
+(`high`/`med`/`low`/`none`) keeps its existing accent color per §2's
+palette table when it's `high`, same as everywhere else. This is the one
+binding edit from Surface review; everything else in §1b/§2's `why`
+output is approved as drafted.
 
 **Real example, this task's actual history** (content from §2 below):
 ```
 $ cadence why 2
 #2 Book a venue — history (newest first):
 
-  ○ high     2m ago   Reprioritised (med → high)
+  • high     2m ago   Reprioritised (med → high)
                        "venues this size book up fast, and the date's
                        only 3 weeks out" — agent, via MCP
-  ○ none     3m ago   Created as subtask of #1 (Plan Mara's 30th
+  • none     3m ago   Created as subtask of #1 (Plan Mara's 30th
                        birthday party)
                        "breaking the vague ask into things I can
                        actually check off" — agent, via MCP
@@ -409,7 +443,7 @@ design, just a parameter Build adds alongside `reason`).
 
 When no reason was recorded for a change:
 ```
-  ○ none     3m ago   Created as subtask of #1
+  • none     3m ago   Created as subtask of #1
 
 No reason was recorded for this change. Reasons are optional — pass
 --reason "..." (CLI) or a `reason` argument (MCP tool call) to leave one
@@ -423,7 +457,7 @@ errors.
 Error case, same shape as every other field error:
 ```
 $ cadence why 99
-Error: task #99 doesn't exist. Run 'cadence list' to see valid ids.
+Error: no task with id 99. Run 'cadence list' to see valid ids.
 ```
 
 This is the fix to the #1 gap named in the task brief: **`cadence why`
@@ -490,10 +524,10 @@ them without asking — this is the moment that has to be there and isn't:**
 $ cadence why 2
 #2 Book a venue — history (newest first):
 
-  ○ high     just now   Reprioritised (med → high)
+  • high     just now   Reprioritised (med → high)
                          "venues this size book up fast, and the date's
                          only 3 weeks out" — agent, via MCP
-  ○ none     just now   Created as subtask of #1 (Plan Mara's 30th
+  • none     just now   Created as subtask of #1 (Plan Mara's 30th
                          birthday party)
                          "breaking the vague ask into things I can
                          actually check off" — agent, via MCP
@@ -510,11 +544,11 @@ Undid: Reprioritised #2 (high → med) undone: Book a venue
 $ cadence why 2
 #2 Book a venue — history (newest first):
 
-  ○ med      just now   Reprioritised (high → med) undone
-  ○ high     1m ago     Reprioritised (med → high)
+  • med      just now   Reprioritised (high → med) undone
+  • high     1m ago     Reprioritised (med → high)
                          "venues this size book up fast, and the date's
                          only 3 weeks out" — agent, via MCP
-  ○ none     2m ago     Created as subtask of #1 ...
+  • none     2m ago     Created as subtask of #1 ...
 ```
 *(`cadence undo`'s output line is TODAY/real, verified this run against
 the actual reprioritise-then-undo case; the `why` re-render after undo is
@@ -626,15 +660,30 @@ I/II/III's SPEC pieces against this document until this section reads
   section's TODAY/SPEC annotations), and verifying every external claim
   about Claude Code's Tasks against a primary source or a live GitHub
   issue (linked inline in Part I).
-- **Surface (Noor Halvorsen):** **PENDING** on all three parts —
-  requested via leadership channel 2026-08-29. Veto or approval, and any
-  wording/glyph/column changes to the `why`, `overdue --all-projects`,
-  and `register` output above, land as a follow-up commit to this file
-  before Build starts on the corresponding SPEC pieces, per the same
-  review pattern already used for §4.7–4.10 of `docs/human-surface.md`.
-  Given §I.3's finding that gaps 2+3 (sync, audit/undo) are the proven
-  bet and gap 1 (cross-project view) is the speculative one, Build
-  should be told to sequence Part III's `reason`/`why` first (it's
-  smaller and underlies both parts), then Part II's registry/aggregation
-  pieces only after dogfooding confirms real demand for a unified
-  cross-repo view per §II.1's last row.
+- **Surface (Noor Halvorsen): REVIEWED, approved with edits, 2026-08-30.**
+  Reviewed against `docs/human-surface.md` (the governing system file —
+  §4.1 status glyphs, §4.4 error shape, §4.9 undo, §4.10 sync). One
+  binding fix made directly to this file: every `why`-timeline line used
+  `list`'s `○` (reserved by §4.1 for a task's current open/done/overdue
+  status) for what is actually a past *event*, several of which aren't a
+  status at all ("Reprioritised ... undone") — changed to a dim `•`
+  (border role) throughout §1b and §2, with the reasoning inline at §1b.
+  Also fixed: `why 99`'s error copy now matches §4.4's established "no
+  task with id N" wording instead of inventing new phrasing for the same
+  case. Both are mechanical, restore-the-system-file fixes, not new
+  design — Part III (`reason` + `why`) is **cleared for Build to
+  implement as written above (post-edit)**.
+
+  Part I/II (cross-project `register`/`overdue --all-projects`/
+  `sync --all-projects`) are **approved in principle, with two
+  non-blocking binding fixes already applied inline** (the `overdue
+  --all-projects` row needs §4.1's `!` overdue glyph, and
+  `sync --all-projects` needs to carry per-project pulled/pushed counts
+  and the §4.10 conflict-recovery line instead of collapsing to "synced,
+  no conflicts") — land them when Build actually implements Part II, not
+  before, since I agree with Ines's own sequencing call: gaps 2+3
+  (sync, audit/undo) are the proven bet, Part III's `reason`/`why` ships
+  first, and Part II's registry/aggregation pieces wait for dogfooding to
+  confirm real demand for a unified cross-repo view (§II.1's last row)
+  before Build spends time on them. No veto on any part; nothing here
+  blocks Build starting on Part III today.
