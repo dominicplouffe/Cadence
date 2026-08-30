@@ -20,6 +20,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError as _FastMCPToolError
 from pydantic import ValidationError as _PydanticValidationError
 
+from cadence.registry import project_name, read_projects_file, read_registry
+from cadence.registry import register_project as _register_project
 from cadence.store import CadenceError, InvalidTask, MAX_TITLE_LEN, Store
 
 mcp = FastMCP(
@@ -39,9 +41,14 @@ mcp = FastMCP(
         "surface (running it twice returns to the pre-undo state). "
         "sync_tasks syncs this store with a shared remote history and "
         "reports any per-task conflicts, which resolve_sync_conflict "
-        "settles. export_tasks returns every task, open and done. All "
-        "tools return {ok, ...}; on ok=false, read `error` and `hint` and "
-        "retry with corrected input rather than giving up."
+        "settles; pass all_projects=true to sync every registered project "
+        "in one call. export_tasks returns every task, open and done. "
+        "register_project adds this store (its current CADENCE_DB_PATH) to "
+        "a cross-project registry so overdue_tasks(all_projects=true) and "
+        "sync_tasks(all_projects=true) can find it -- call this once per "
+        "project before using either. All tools return {ok, ...}; on "
+        "ok=false, read `error` and `hint` and retry with corrected input "
+        "rather than giving up."
     ),
 )
 
@@ -112,6 +119,83 @@ def list_tasks(status: str = "pending") -> dict:
     try:
         tasks = Store().list(status=status)
         return {"ok": True, "tasks": [t.to_dict() for t in tasks], "count": len(tasks)}
+    except CadenceError as exc:
+        return _err(exc)
+    except Exception as exc:
+        return _err_unexpected(exc)
+
+
+@mcp.tool()
+def register_project() -> dict:
+    """Register this project's store (its current, resolved CADENCE_DB_PATH)
+    in the cross-project registry at ~/.config/cadence/projects.txt.
+
+    Call once per project (e.g. once per repo an agent works in) before
+    using overdue_tasks(all_projects=true) or sync_tasks(all_projects=true)
+    -- both only see stores that have been registered this way. Idempotent:
+    calling it again for the same store is a no-op, not a duplicate entry.
+
+    Returns:
+        {"ok": true, "path": "<resolved db path>", "already_registered":
+        bool}.
+    """
+    try:
+        path, already = _register_project()
+        return {"ok": True, "path": path, "already_registered": already}
+    except Exception as exc:
+        return _err_unexpected(exc)
+
+
+@mcp.tool()
+def overdue_tasks(all_projects: bool = False) -> dict:
+    """List overdue (pending, past-due) tasks.
+
+    Args:
+        all_projects: If false (default), only this store's own overdue
+            tasks. If true, opens every project registered via
+            register_project read-only and merges their overdue tasks into
+            one list, each tagged with its project name -- no project
+            needs to be the "current" one for this to see it.
+
+    Returns:
+        With all_projects=false: {"ok": true, "tasks": [task +
+        "overdue_days", ...], "count": N}.
+        With all_projects=true: {"ok": true, "tasks": [task + "project" +
+        "overdue_days", ...], "count": N (tasks only), "projects": M
+        (registered project count)}. A registered store that can't be
+        opened is reported as {"project", "error", "message", "hint"}
+        instead of a task, alongside the rest, rather than failing the
+        whole call.
+    """
+    from cadence.cli import _days_overdue
+
+    try:
+        if not all_projects:
+            tasks = [t for t in Store().list(status="pending") if t.due and _days_overdue(t.due) > 0]
+            out = []
+            for t in tasks:
+                d = t.to_dict()
+                d["overdue_days"] = _days_overdue(t.due)
+                out.append(d)
+            return {"ok": True, "tasks": out, "count": len(out)}
+
+        entries = read_registry()
+        rows = []
+        for path in entries:
+            name = project_name(path)
+            try:
+                store = Store(db_path=path)
+            except CadenceError as exc:
+                rows.append({"project": name, "error": exc.code, "message": exc.message, "hint": exc.hint})
+                continue
+            for t in store.list(status="pending"):
+                if t.due and _days_overdue(t.due) > 0:
+                    d = t.to_dict()
+                    d["project"] = name
+                    d["overdue_days"] = _days_overdue(t.due)
+                    rows.append(d)
+        count = sum(1 for r in rows if "error" not in r)
+        return {"ok": True, "tasks": rows, "count": count, "projects": len(entries)}
     except CadenceError as exc:
         return _err(exc)
     except Exception as exc:
@@ -294,7 +378,7 @@ def undo() -> dict:
 
 
 @mcp.tool()
-def sync_tasks(remote: Optional[str] = None) -> dict:
+def sync_tasks(remote: Optional[str] = None, all_projects: bool = False) -> dict:
     """Sync this store with a shared remote (another client's history).
 
     Never silently drops data. Two different things can make a task id
@@ -314,27 +398,72 @@ def sync_tasks(remote: Optional[str] = None) -> dict:
     Everything else in the same sync still lands either way.
 
     Args:
-        remote: The OTHER client's own CADENCE_DB_PATH value (its plain
-            .db file path) -- this client derives that client's history
-            location itself, so you never need to know Cadence's internal
-            storage layout. A git URL also works, for a shared server
-            remote. Only needed the first time (or to change it) -- omit
-            on later calls to reuse the remote already configured.
+        remote: With all_projects=false (default): the OTHER client's own
+            CADENCE_DB_PATH value (its plain .db file path) -- this client
+            derives that client's history location itself, so you never
+            need to know Cadence's internal storage layout. A git URL also
+            works, for a shared server remote. Only needed the first time
+            (or to change it) -- omit on later calls to reuse the remote
+            already configured.
+            With all_projects=true: the path to another client's own
+            registry file (its ~/.config/cadence/projects.txt) -- projects
+            are matched between the two registries by project name.  Omit
+            to reuse whatever remote each project already has configured.
+        all_projects: If true, loops over every project registered via
+            register_project and syncs each one (see the per-project
+            result shape below) instead of just this store.
 
-    Returns:
-        {"ok": true, "pulled": N, "pushed": N, "already_synced": bool,
-        "conflicts": [{"id", "mine", "theirs"}, ...],
+    Returns (all_projects=false): {"ok": true, "pulled": N, "pushed": N,
+        "already_synced": bool, "conflicts": [{"id", "mine", "theirs"}, ...],
         "renumbered": [{"old_id", "new_id", "kept_at_old_id"}, ...]}.
         {"ok": false, ...} if no remote is configured or it can't be
         reached.
+
+    Returns (all_projects=true): {"ok": true, "projects": M, "results":
+        [{"project": name, ...same shape as one non-all_projects sync
+        result, or "error"/"message"/"hint" if that project's store
+        couldn't be opened, or "skipped": true + "reason" if `remote` was
+        given but had no project of that name}, ...]}. Never fails the
+        whole call for one project's problem -- read each result's own
+        `ok`/`error`/`skipped`.
     """
-    try:
-        result = Store().sync(remote=remote)
-        return {"ok": True, **result}
-    except CadenceError as exc:
-        return _err(exc)
-    except Exception as exc:
-        return _err_unexpected(exc)
+    if not all_projects:
+        try:
+            result = Store().sync(remote=remote)
+            return {"ok": True, **result}
+        except CadenceError as exc:
+            return _err(exc)
+        except Exception as exc:
+            return _err_unexpected(exc)
+
+    entries = read_registry()
+    remote_map = {}
+    if remote:
+        for p in read_projects_file(remote):
+            remote_map[project_name(p)] = p
+    results = []
+    for path in entries:
+        name = project_name(path)
+        remote_arg = None
+        if remote:
+            remote_arg = remote_map.get(name)
+            if remote_arg is None:
+                results.append(
+                    {
+                        "project": name,
+                        "skipped": True,
+                        "reason": f"no project named '{name}' in remote registry '{remote}'",
+                    }
+                )
+                continue
+        try:
+            result = Store(db_path=path).sync(remote=remote_arg)
+            results.append({"project": name, "ok": True, **result})
+        except CadenceError as exc:
+            results.append({"project": name, "ok": False, "error": exc.code, "message": exc.message, "hint": exc.hint})
+        except Exception as exc:
+            results.append({"project": name, **_err_unexpected(exc)})
+    return {"ok": True, "projects": len(entries), "results": results}
 
 
 @mcp.tool()

@@ -9,6 +9,8 @@ any wording here; do not restate it from memory.
 Usage:
     cadence add "Buy milk" [--due 2026-09-01] [--priority high|med|low]
     cadence list
+    cadence register                # add this project's store to ~/.config/cadence/projects.txt
+    cadence overdue [--all-projects]
     cadence done <id>
     cadence schedule <id> <due-date>
     cadence decompose <id> --into "Subtask A" "Subtask B"
@@ -16,6 +18,7 @@ Usage:
     cadence why <id>                # show this task's history, plain language
     cadence undo
     cadence sync [--remote PATH] [--keep-mine ID | --keep-theirs ID]
+    cadence sync --all-projects [--remote PROJECTS_FILE]
     cadence export [--format json|table] [--out PATH]
     cadence mcp                     # start the MCP server over stdio (agent surface)
 """
@@ -28,7 +31,15 @@ import os
 import shutil
 import sys
 import textwrap
+from pathlib import Path
 
+from cadence.registry import (
+    project_name,
+    read_projects_file,
+    read_registry,
+    register_project,
+    registry_path,
+)
 from cadence.store import (
     CadenceError,
     MAX_TITLE_LEN,
@@ -257,6 +268,87 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_register(args: argparse.Namespace) -> int:
+    """wow-spec.md Part II §1: register this project's store so
+    `overdue --all-projects` / `sync --all-projects` can find it.
+    Idempotent -- running this twice in the same directory (same resolved
+    CADENCE_DB_PATH) never duplicates the registry entry."""
+    path, already = register_project()
+    name = project_name(path)
+    if already:
+        print(f"Already registered: {path} (as '{name}').")
+    else:
+        print(f"Registered {path} (as '{name}').")
+    return 0
+
+
+def _overdue_row(name: str, name_w: int, task) -> str:
+    """One `overdue --all-projects` row: §4.1's `!`/red overdue glyph
+    (no-color fallback `[!]`), always paired with the word 'overdue',
+    leading the row -- same pairing rule `cadence list` uses for a
+    single-project overdue row, extended with a project-name column."""
+    glyph = _c(RED, "!") if USE_COLOR else "[!]"
+    overdue_txt = f"overdue {_days_overdue(task.due)}d"
+    meta = _c(RED, overdue_txt) if USE_COLOR else overdue_txt
+    divider = _c(DIM, "·") if USE_COLOR else "|"
+    id_col = f"#{task.id}"
+    return f"{glyph}  {name:<{name_w}}  {id_col:<5}{task.title:<35}  {divider}  {meta}"
+
+
+def cmd_overdue(args: argparse.Namespace) -> int:
+    """wow-spec.md Part II §2: `cadence overdue [--all-projects]`.
+
+    Without --all-projects: overdue tasks in the current CADENCE_DB_PATH
+    store only, in `list`'s own row format. With --all-projects: opens
+    every registered store read-only with the unmodified Store class and
+    merges each store's overdue tasks into one project-labeled view --
+    no new storage engine, no schema change.
+    """
+    if not getattr(args, "all_projects", False):
+        store = Store()
+        tasks = [t for t in store.list(status="pending") if t.due and _days_overdue(t.due) > 0]
+        if not tasks:
+            print("No overdue tasks.")
+            return 0
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        for t in tasks:
+            print(_render_row(t, width))
+        return 0
+
+    entries = read_registry()
+    if not entries:
+        print(
+            "No projects registered yet. Run 'cadence register' in a "
+            "project directory first."
+        )
+        return 0
+    rows: list[tuple[str, object, str]] = []  # (name, task_or_None, error_or_None)
+    for path in entries:
+        name = project_name(path)
+        try:
+            store = Store(db_path=Path(path))
+        except CadenceError as exc:
+            rows.append((name, None, _format_err(exc)))
+            continue
+        for t in store.list(status="pending"):
+            if t.due and _days_overdue(t.due) > 0:
+                rows.append((name, t, None))
+    name_w = max([len(r[0]) for r in rows] + [10])
+    overdue_count = sum(1 for r in rows if r[1] is not None)
+    for name, task, err in rows:
+        if err is not None:
+            print(f"{name:<{name_w}}  Error: {err}")
+        else:
+            print(_overdue_row(name, name_w, task))
+    plural = "" if len(entries) == 1 else "s"
+    print(
+        f"{overdue_count} overdue across {len(entries)} registered "
+        f"project{plural}. Run 'cadence register' in a project directory "
+        "to add another."
+    )
+    return 0
+
+
 def cmd_done(args: argparse.Namespace) -> int:
     task_id = _require_id(args.id)
     store = Store()
@@ -436,7 +528,86 @@ def cmd_undo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sync_all_projects(args: argparse.Namespace) -> int:
+    """wow-spec.md Part II §3: `cadence sync --all-projects [--remote
+    <projects-file>]` -- a thin loop over the registry calling the
+    existing, already-tested per-project `Store.sync` for each entry.
+    Never touches the merge/diff engine itself.
+
+    `--remote`, in this mode, is the path to *another* client's own
+    projects registry file (same plain one-path-per-line format this
+    file already uses -- see docs/wow-spec.md Part II's device-B
+    walkthrough). Projects are matched across the two registries by
+    project name (the directory each store's .db file lives in), since
+    that's the only identifier both sides already share -- neither side
+    ever needs to know the other's internal history layout. Omit
+    --remote to reuse whatever remote each project already has configured
+    from a prior single-project `cadence sync --remote ...`.
+    """
+    entries = read_registry()
+    if not entries:
+        print(
+            "No projects registered yet. Run 'cadence register' in a "
+            "project directory first."
+        )
+        return 0
+    remote_map = {}
+    if args.remote:
+        for p in read_projects_file(Path(args.remote)):
+            remote_map[project_name(p)] = p
+    name_w = max([len(project_name(p)) for p in entries] + [10])
+    any_conflict = False
+    for path in entries:
+        name = project_name(path)
+        remote_arg = None
+        if args.remote:
+            remote_arg = remote_map.get(name)
+            if remote_arg is None:
+                print(
+                    f"{name:<{name_w}}  no project named '{name}' in remote "
+                    f"registry '{args.remote}' -- skipped."
+                )
+                continue
+        try:
+            store = Store(db_path=Path(path))
+            result = store.sync(remote=remote_arg)
+        except CadenceError as exc:
+            print(f"{name:<{name_w}}  Error: {_format_err(exc)}")
+            continue
+        if result["already_synced"]:
+            print(f"{name:<{name_w}}  Already in sync with origin. Nothing to pull or push.")
+            continue
+        pulled, pushed = result["pulled"], result["pushed"]
+        for r in result.get("renumbered", []):
+            print(
+                f"{name:<{name_w}}  Note: #{r['old_id']} was independently "
+                f"created on both clients (not an edit of the same task) -- "
+                f"kept #{r['old_id']} as this client's version and gave the "
+                f"other client's task a new id, #{r['new_id']}. Nothing was "
+                f"lost or overwritten."
+            )
+        if result["conflicts"]:
+            any_conflict = True
+            print(
+                f"{name:<{name_w}}  synced: pulled {pulled}, pushed {pushed}. "
+                f"{len(result['conflicts'])} conflict needs you."
+            )
+            for c in result["conflicts"]:
+                print(
+                    f"{name:<{name_w}}  Error: #{c['id']} was edited on both "
+                    f"this client and the remote since the last sync. "
+                    f"Nothing was overwritten. Run 'cadence sync --keep-mine "
+                    f"{c['id']}' or 'cadence sync --keep-theirs {c['id']}' "
+                    f"with CADENCE_DB_PATH={path}, then sync again."
+                )
+        else:
+            print(f"{name:<{name_w}}  synced: pulled {pulled}, pushed {pushed}. Up to date.")
+    return 1 if any_conflict else 0
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
+    if getattr(args, "all_projects", False):
+        return _cmd_sync_all_projects(args)
     store = Store()
     if args.keep_mine is not None or args.keep_theirs is not None:
         task_id = _require_id(args.keep_mine or args.keep_theirs)
@@ -527,6 +698,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="List tasks. Example: cadence list")
     p_list.set_defaults(func=cmd_list)
 
+    p_register = sub.add_parser(
+        "register",
+        help=(
+            "Register this project's store for cross-project commands "
+            "(overdue --all-projects, sync --all-projects). Example: "
+            "cadence register"
+        ),
+    )
+    p_register.set_defaults(func=cmd_register)
+
+    p_overdue = sub.add_parser(
+        "overdue",
+        help=(
+            "Show overdue tasks. Example: cadence overdue --all-projects "
+            "(across every 'cadence register'-ed project)"
+        ),
+    )
+    p_overdue.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Merge overdue tasks across every registered project (see 'cadence register')",
+    )
+    p_overdue.set_defaults(func=cmd_overdue)
+
     p_done = sub.add_parser("done", help="Complete a task. Example: cadence done 3")
     p_done.add_argument("id")
     p_done.set_defaults(func=cmd_done)
@@ -587,6 +782,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sync.add_argument(
         "--keep-theirs", metavar="ID", help="Resolve a conflict by keeping the other side's version"
+    )
+    p_sync.add_argument(
+        "--all-projects",
+        action="store_true",
+        help=(
+            "Sync every registered project (see 'cadence register'), one line per "
+            "project. --remote then means the path to another client's own "
+            "registry file (its ~/.config/cadence/projects.txt), matched to "
+            "this client's projects by project name."
+        ),
     )
     p_sync.set_defaults(func=cmd_sync)
 
