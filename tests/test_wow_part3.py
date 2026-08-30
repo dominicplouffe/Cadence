@@ -414,4 +414,7 @@ def test_cli_why_output_never_exceeds_narrow_columns(tmp_path):
     )
     out = _run_cli("why", "1", env={**env, "COLUMNS": "40"}).stdout
     longest = max((len(line) for line in out.splitlines()), default=0)
+    if longest > 40:
+        import sys as _sys
+        print(f"DEBUG longest={longest!r} out={out!r}", file=_sys.stderr)
     assert longest <= 40
