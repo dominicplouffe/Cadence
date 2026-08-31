@@ -130,14 +130,27 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
     from mcp.client.streamable_http import streamablehttp_client
 
     token = get_or_create_http_token()
+    # 0.2.14 regression (Noor's tunnel finding, docs/dogfooding-log.md): a
+    # real tunnel (Cloudflare Quick Tunnel, Tailscale Funnel) forwards the
+    # request with Host: <random>.trycloudflare.com, never 127.0.0.1 or
+    # localhost. The MCP SDK used to auto-attach DNS-rebinding Host-header
+    # protection scoped to those two, ahead of BearerAuth, so this exact
+    # Host 421'd even with the correct token. mcp_server.py now disables
+    # that SDK-level check (see the comment on the FastMCP(...)
+    # construction there) since BearerAuth is the actual security boundary
+    # for --http mode. Every request below is repeated with this tunnel-
+    # shaped Host header to prove the fix, not just asserted once in
+    # isolation.
+    tunnel_host = "some-name.trycloudflare.com"
 
-    async def _round_trip(base_url: str) -> dict:
+    async def _round_trip(base_url: str, extra_headers: dict) -> dict:
         # streamablehttp_client (not the newer streamable_http_client,
         # which in this SDK version takes an httpx.AsyncClient instead of
         # a plain headers dict and is more ceremony for no behavior change
         # here) -- this is the same call shape a real remote client (e.g.
         # Claude web/mobile) makes against this mcp SDK version.
-        async with streamablehttp_client(base_url, headers={"Authorization": f"Bearer {token}"}) as (
+        headers = {"Authorization": f"Bearer {token}", **extra_headers}
+        async with streamablehttp_client(base_url, headers=headers) as (
             read,
             write,
             _,
@@ -172,10 +185,28 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
                 "Authorization": "Bearer wrong-token-entirely",
             },
         )
-        outcome = asyncio.run(_round_trip(live.base_url))
+        # Wrong token AND a tunnel-shaped Host: must still be a clean 401,
+        # not a 421 -- disabling DNS-rebinding protection must not also
+        # have weakened BearerAuth, which still has to see and reject a
+        # bad token regardless of Host.
+        wrong_token_tunnel_host = httpx.post(
+            live.base_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+                "Authorization": "Bearer wrong-token-entirely",
+                "Host": tunnel_host,
+            },
+        )
+        outcome = asyncio.run(_round_trip(live.base_url, {}))
+        # The same authorized round trip again, this time with every
+        # request's Host header set to a tunnel hostname -- the case that
+        # 421'd before the fix.
+        tunnel_outcome = asyncio.run(_round_trip(live.base_url, {"Host": tunnel_host}))
 
-    for resp in (no_token, wrong_token):
-        assert resp.status_code == 401
+    for resp in (no_token, wrong_token, wrong_token_tunnel_host):
+        assert resp.status_code == 401, (resp.status_code, resp.text)
         body = resp.json()
         assert body == {
             "ok": False,
@@ -187,17 +218,19 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
             ),
         }
 
-    assert outcome["why"]["ok"] is True
-    assert outcome["undone"]["ok"] is True
+    for result in (outcome, tunnel_outcome):
+        assert result["why"]["ok"] is True
+        assert result["undone"]["ok"] is True
 
     # Not the HTTP session's own view -- a fresh Store opened directly on
     # the same CADENCE_DB_PATH the CLI would use, proving one store, not a
     # divergent copy the HTTP transport kept to itself.
     store = Store()
-    task = store.get(outcome["id"])
-    assert task.title == "Remote task via HTTP MCP"
-    # undo reverted the reprioritise (low -> back to high), leaving the
-    # decompose in place, exactly as a local `cadence undo` would.
-    assert task.priority == "high"
-    children = [t for t in store.list(status="all") if t.parent_id == outcome["id"]]
-    assert sorted(t.title for t in children) == ["step one", "step two"]
+    for result in (outcome, tunnel_outcome):
+        task = store.get(result["id"])
+        assert task.title == "Remote task via HTTP MCP"
+        # undo reverted the reprioritise (low -> back to high), leaving the
+        # decompose in place, exactly as a local `cadence undo` would.
+        assert task.priority == "high"
+        children = [t for t in store.list(status="all") if t.parent_id == result["id"]]
+        assert sorted(t.title for t in children) == ["step one", "step two"]

@@ -18,6 +18,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError as _FastMCPToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import ValidationError as _PydanticValidationError
 
 from cadence.registry import project_name, read_projects_file, read_registry
@@ -33,6 +34,24 @@ from cadence.store import (
 
 mcp = FastMCP(
     "cadence",
+    # The MCP SDK auto-attaches DNS-rebinding protection (a Host-header
+    # allow-list defaulting to 127.0.0.1/localhost/[::1]) any time no
+    # transport_security is given. That check runs inside
+    # mcp.streamable_http_app() itself, *before* BearerAuth in
+    # _make_http_app below ever sees the request -- so a correct bearer
+    # token behind a tunnel or reverse proxy (Host: some-name.example.com)
+    # still got a bare 421, unauthenticated or not. DNS rebinding is a
+    # browser-JS attack that tricks same-origin checks by resolving an
+    # attacker domain to 127.0.0.1 after the fact; it has nothing to
+    # defend against here, because `--http` mode's actual boundary is the
+    # bearer token (see _make_http_app's docstring), checked on every
+    # request regardless of Host. Disabling this SDK-level Host check
+    # trades a redundant, transport-only guard for the one the app
+    # already documents as authoritative, and is what makes the
+    # documented "expose over a tunnel to Claude web/mobile" path work at
+    # all. Stdio mode (`cadence mcp`, the default) never goes through
+    # this HTTP app and is unaffected either way.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     instructions=(
         "Cadence is a local-first todo store. Use add_task to create work, "
         "list_tasks to see it, schedule_task to set/change a due date, and "
