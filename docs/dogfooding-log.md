@@ -1188,3 +1188,120 @@ Part III's already-shipped `why`) and the `overdue`/`sync --all-projects`
 pieces above were the two `SPEC` rows in Part II's II.1 gap table still
 open going into this task; `why --project` was not in this task's scope
 and remains open for a follow-on.
+
+## 2026-08-31 (Rafael Okonkwo, Build) — 0.2.12: remote HTTP MCP transport shipped — the direct fix for "VSCode/Claude Code works, Claude web and my phone can't reach it at all"
+
+This is the chairman's exact, repeated complaint in the boardroom
+(2026-08-29 17:49–17:52): he works from VSCode/Claude Code, Claude web,
+and Claude on his phone, across multiple projects, and only the first of
+those could reach cadence's MCP server, because it only spoke stdio (a
+local child process on the same machine). He named this as the single
+concrete thing blocking him from actually using Cadence day to day and
+funded fixing it. A spike proving the approach existed since
+2026-08-29 on branch `experimental/http-mcp-transport` (commit d5caed4,
+deliberately not merged); this entry ships it.
+
+`cadence mcp --http` starts a second, additive transport option next to
+the existing `cadence mcp` (stdio) — same store, same tool functions,
+nothing about the sync/merge engine or the stdio path touched. It stays
+local-first per the constitution's bias: the user runs it on **their own
+machine**, there is no hosted backend and no account system. A 32-byte
+hex bearer token is generated on first use and stored at
+`~/.config/cadence/mcp_http_token` (mode 0600, same directory as the
+rest of Cadence's config); every request must carry
+`Authorization: Bearer <token>` or it gets a clean 401 in the same
+`{ok, error, message, hint}` shape every other Cadence error uses — not
+a stack trace, not a silent accept. `cadence mcp --show-token` prints it;
+`--host`/`--port`/`--token`/`CADENCE_MCP_TOKEN` are available for a fixed
+token or non-default bind. README's new "Remote access" section documents
+how to start it and how to point a remote client (Claude web/mobile, or
+an agent on another machine) at it, including that Cadence does not add
+TLS itself — an SSH tunnel, Tailscale, or a TLS-terminating reverse proxy
+are the suggested ways to expose the port off the local machine.
+
+5 new regression tests (`tests/test_http_transport.py`), confirmed to
+fail pre-fix (`ImportError` on `_make_http_app`/`get_or_create_http_token`,
+which don't exist before this change). Full suite: 132 passed. Shipped as
+0.2.12, commit 8708ed3 —
+CI (https://github.com/dominicplouffe/Cadence/actions/runs/33352184224,
+green after a rerun of the one job that lost a race with PyPI's index
+propagating the just-published 0.2.12 — see note below, not a code bug)
+and Publish (https://github.com/dominicplouffe/Cadence/actions/runs/33352184249)
+both green; https://pypi.org/pypi/cadence-todo/0.2.12/json confirms
+0.2.12 live.
+
+**Verified as a real round trip against the real published PyPI package**
+— not local, not mocked. Two separate OS processes in a fresh venv with
+`cadence-todo==0.2.12` installed from PyPI (`pip show cadence-todo` →
+`/workspace/pypi_e2e_venv_0212/.../site-packages/cadence`, no repo
+checkout on `sys.path`): one process running `cadence mcp --http`, a
+second, genuinely separate process using the `mcp` SDK's own
+streamable-HTTP client (not the stdio path) to add/decompose/reprioritise/
+why/undo, then the local `cadence` CLI on the same machine, same
+`CADENCE_DB_PATH`, reading the result back — proving one shared store,
+not a divergent copy. Timestamps and commands as run:
+
+```
+$ pip install cadence-todo==0.2.12
+Successfully installed cadence-todo-0.2.12
+$ export CADENCE_DB_PATH=/workspace/pypi_e2e_env/cadence.db
+$ export CADENCE_CONFIG_HOME=/workspace/pypi_e2e_env/config
+$ cadence mcp --show-token
+c90b94a9206c6970753292b9c891638fc7de413b7c779391382b8dcceb7f6617
+$ cadence mcp --http --port 8791 &
+[cadence mcp --http] listening on http://127.0.0.1:8791/mcp -- bearer token required on every request (see `cadence mcp --http --show-token` to print it).
+StreamableHTTP session manager started
+
+--- separate process: mcp SDK streamable-http client, Authorization: Bearer <token> ---
+>>> add_task({'title': 'Plan Q4 offsite', 'priority': 'med'})
+<<< {"ok": true, "task": {"id": 1, "title": "Plan Q4 offsite", "status": "pending", "priority": "med", ...}}
+>>> decompose_task({'id': 1, 'into': ['Book venue', 'Send invites']})
+<<< {"ok": true, "parent": {"id": 1, ...}, "subtasks": [{"id": 2, "title": "Book venue", ...}, {"id": 3, "title": "Send invites", ...}]}
+>>> reprioritise_task({'id': 1, 'priority': 'high', 'reason': 'deadline moved up'})
+<<< {"ok": true, "task": {"id": 1, "priority": "high", ...}}
+>>> why_task({'id': 1})
+<<< {"ok": true, "task": {...}, "history": [{"event": "Reprioritised (med → high)", "reason": "deadline moved up", "source": "mcp", ...}, {"event": "Created", "priority": "med", ...}]}
+>>> undo({})
+<<< {"ok": true, "summary": "Undid: Reprioritised #1 (med → high) undone: Plan Q4 offsite"}
+
+--- local CLI, same machine, same CADENCE_DB_PATH ---
+$ cadence list
+  [ ]    1   Plan Q4 offsite                            |  2 open subtasks
+    [ ]    2   Book venue
+    [ ]    3   Send invites
+$ cadence why 1
+#1 Plan Q4 offsite — history (newest first):
+  -  med      just now     Reprioritised (high → med) undone
+  -  high     just now     Reprioritised (med → high)
+                       "deadline moved up" — agent, via MCP
+  -  med      just now     Created
+
+--- unauthenticated / wrong-token requests, same live server ---
+$ curl -i -X POST http://127.0.0.1:8791/mcp -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+HTTP/1.1 401 Unauthorized
+{"ok":false,"error":"unauthorized","message":"Missing or wrong bearer token.","hint":"Send 'Authorization: Bearer <token>' matching the token this server was started with (see `cadence mcp --http --show-token`)."}
+$ curl -i ... -H "Authorization: Bearer wrong-token-xyz" ...
+HTTP/1.1 401 Unauthorized
+{"ok":false,"error":"unauthorized","message":"Missing or wrong bearer token.","hint":"..."}
+```
+
+The local CLI shows the exact same task IDs, titles, subtask structure,
+the "deadline moved up" reason written in over the remote HTTP client,
+and undo's effect — proof of one shared store reached from two genuinely
+separate transports, not a mock of either interface.
+
+Note on the CI rerun: the first run of the new "Install from PyPI
+registry + drive end-to-end" job failed with `No matching distribution
+found for cadence-todo==0.2.12` even though its own preceding step had
+just confirmed 0.2.12 was live via PyPI's JSON API — PyPI's JSON API and
+its pip-facing simple index propagate on different schedules, and pip
+lost that race by about a minute. Rerunning the same failed job (no code
+change) went green the moment the simple index caught up; the other
+three (3.10/3.11/3.12 install+test) jobs were green on the first try.
+Filed as an observation, not a fix, since it's an inherent PyPI
+propagation race any "wait, then install" step will occasionally hit,
+not a bug in this change.
+
+This closes the chairman's named gap: Claude web and Claude on his phone
+can now reach the same task store VSCode/Claude Code does, self-hosted,
+token-gated, no account and no hosted backend added.
