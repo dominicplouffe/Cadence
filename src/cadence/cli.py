@@ -21,6 +21,10 @@ Usage:
     cadence sync --all-projects [--remote PROJECTS_FILE]
     cadence export [--format json|table] [--out PATH]
     cadence mcp                     # start the MCP server over stdio (agent surface)
+    cadence mcp --http [--host H] [--port P] [--token T]  # same tools, over HTTP for
+                                     # remote clients (Claude web/mobile); token is
+                                     # generated on first run if not given, see README
+    cadence mcp --show-token        # print this machine's remote-MCP bearer token
 """
 from __future__ import annotations
 
@@ -677,6 +681,24 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
+    if getattr(args, "http", False):
+        from cadence.registry import get_or_create_http_token, http_token_path
+        from cadence.mcp_server import run_http
+
+        token = args.token or os.environ.get("CADENCE_MCP_TOKEN") or get_or_create_http_token()
+        if getattr(args, "show_token", False):
+            print(token)
+            print(f"(stored at {http_token_path()})", file=sys.stderr)
+            return 0
+        run_http(args.host, args.port, token)
+        return 0
+    if getattr(args, "show_token", False):
+        from cadence.registry import get_or_create_http_token, http_token_path
+
+        print(get_or_create_http_token())
+        print(f"(stored at {http_token_path()})", file=sys.stderr)
+        return 0
+
     from cadence.mcp_server import run
 
     run()
@@ -803,6 +825,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.set_defaults(func=cmd_export)
 
     p_mcp = sub.add_parser("mcp", help="Start the MCP server over stdio (agent surface)")
+    p_mcp.add_argument(
+        "--http",
+        action="store_true",
+        help="Serve over HTTP instead of stdio, so a non-local client (Claude "
+        "web/mobile, or an agent on another machine) can reach this store. "
+        "Self-hosted, bearer-token-protected -- see README's 'Remote access' "
+        "section.",
+    )
+    p_mcp.add_argument("--host", default="127.0.0.1", help="Bind host for --http (default 127.0.0.1)")
+    p_mcp.add_argument("--port", type=int, default=8765, help="Bind port for --http (default 8765)")
+    p_mcp.add_argument(
+        "--token",
+        help="Bearer token --http clients must present (or set CADENCE_MCP_TOKEN). "
+        "Default: the token in --show-token, generated and stored on first use.",
+    )
+    p_mcp.add_argument(
+        "--show-token",
+        action="store_true",
+        help="Print this machine's remote-MCP bearer token (generating it on "
+        "first use) and exit, without starting a server.",
+    )
     p_mcp.set_defaults(func=cmd_mcp)
 
     return parser

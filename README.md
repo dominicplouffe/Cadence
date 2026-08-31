@@ -98,6 +98,43 @@ structured JSON returns:
 cadence mcp
 ```
 
+### Remote access (Claude web, Claude mobile, another machine)
+
+`cadence mcp` (above) talks stdio, so only a local process on the same
+machine — e.g. Claude Code / VSCode — can reach it. If you also want Claude
+web or Claude on your phone to reach the *same* task store, run the HTTP
+transport instead:
+
+```
+cadence mcp --http
+```
+
+This is still local-first: it starts a server on **your own machine**
+(default `127.0.0.1:8765`), backed by the exact same store as `cadence
+mcp` and the `cadence` CLI — there is no hosted backend, no account, no
+third party in the middle. It prints the port it's listening on and
+requires a bearer token on every request, generated once on first use and
+stored at `~/.config/cadence/mcp_http_token` (owner-read/write only, same
+directory as the rest of Cadence's config). Get that token with:
+
+```
+cadence mcp --show-token
+```
+
+To use it from a remote client (Claude web/mobile, or an agent on another
+machine): expose the port to that client somehow — an SSH tunnel,
+[Tailscale](https://tailscale.com), or a TLS-terminating reverse proxy are
+all reasonable choices; Cadence does not add TLS itself — then configure
+the client with the resulting URL's `/mcp` path and an `Authorization:
+Bearer <token>` header carrying the token from `cadence mcp --show-token`.
+A request with a missing or wrong token gets a clean `401` with the same
+`{"ok": false, "error", "message", "hint"}` shape every other Cadence
+error uses, not a stack trace.
+
+You can also pass `--host`, `--port`, or an explicit `--token` (or set
+`CADENCE_MCP_TOKEN`) to override the generated one, e.g. for a fixed token
+across restarts in a script.
+
 ### Building from source
 
 ```

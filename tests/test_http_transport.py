@@ -1,0 +1,203 @@
+"""Regression tests for `cadence mcp --http` (docs/dogfooding-log.md:
+remote HTTP MCP transport, closing the VSCode/web/phone gap the chairman
+named 2026-08-29).
+
+These exercise the real network transport end to end -- a live uvicorn
+server in a background thread, a genuinely separate HTTP client (the mcp
+SDK's own streamable-http client, not the stdio path) -- not the bare
+Python functions, because the point of this feature is the wire protocol
+and the bearer-token gate in front of it.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+import httpx
+import pytest
+import uvicorn
+
+from cadence.registry import get_or_create_http_token, http_token_path
+from cadence.store import Store
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class _LiveServer:
+    """Runs `cadence.mcp_server._make_http_app` on a real socket in a
+    background thread for the duration of one test, then shuts it down."""
+
+    def __init__(self, token: str):
+        from cadence.mcp_server import _make_http_app
+
+        self.port = _free_port()
+        self.base_url = f"http://127.0.0.1:{self.port}/mcp"
+        app = _make_http_app(token)
+        config = uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="error")
+        self.server = uvicorn.Server(config)
+        self.thread = threading.Thread(target=self.server.run, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not getattr(self.server, "started", False):
+            time.sleep(0.02)
+        if not getattr(self.server, "started", False):
+            raise RuntimeError("test HTTP MCP server did not start in time")
+        return self
+
+    def __exit__(self, *exc):
+        self.server.should_exit = True
+        self.thread.join(timeout=5)
+
+
+@pytest.fixture
+def http_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADENCE_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("CADENCE_DB_PATH", str(tmp_path / "cadence.db"))
+    return tmp_path
+
+
+# --- token generation/storage ------------------------------------------
+
+
+def test_get_or_create_http_token_persists_and_is_reused(http_env):
+    first = get_or_create_http_token()
+    second = get_or_create_http_token()
+    assert first == second
+    assert len(first) == 64  # 32 random bytes, hex-encoded
+    int(first, 16)  # hex, not e.g. base64 -- raises ValueError otherwise
+
+
+def test_get_or_create_http_token_file_is_owner_only(http_env):
+    get_or_create_http_token()
+    mode = stat.S_IMODE(http_token_path().stat().st_mode)
+    assert mode == stat.S_IRUSR | stat.S_IWUSR, oct(mode)
+
+
+def test_two_projects_get_different_tokens_when_config_home_differs(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADENCE_CONFIG_HOME", str(tmp_path / "a"))
+    token_a = get_or_create_http_token()
+    monkeypatch.setenv("CADENCE_CONFIG_HOME", str(tmp_path / "b"))
+    token_b = get_or_create_http_token()
+    assert token_a != token_b
+
+
+# --- CLI wiring ----------------------------------------------------------
+
+
+def _cli_env(config_home, db_path):
+    env = {**os.environ, "CADENCE_CONFIG_HOME": str(config_home), "CADENCE_DB_PATH": str(db_path)}
+    env.pop("CADENCE_MCP_TOKEN", None)
+    return env
+
+
+def test_cli_show_token_prints_generated_token_without_starting_a_server(tmp_path):
+    env = _cli_env(tmp_path / "config", tmp_path / "cadence.db")
+    result = subprocess.run(
+        [sys.executable, "-m", "cadence.cli", "mcp", "--show-token"],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    token_on_disk = (tmp_path / "config" / "mcp_http_token").read_text().strip()
+    assert result.stdout.strip() == token_on_disk
+    assert len(token_on_disk) == 64
+
+
+# --- HTTP transport: auth gate, then an authorized round trip against
+# the same store as the local CLI. One live server per test process:
+# FastMCP's underlying StreamableHTTPSessionManager is a singleton with a
+# run-once lifespan, so a second `_make_http_app()`/uvicorn boot in the
+# same process fails on startup -- one server, exercised in sequence,
+# matches how it is actually deployed (started once, hit many times).
+
+
+def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env, tmp_path):
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    token = get_or_create_http_token()
+
+    async def _round_trip(base_url: str) -> dict:
+        # streamablehttp_client (not the newer streamable_http_client,
+        # which in this SDK version takes an httpx.AsyncClient instead of
+        # a plain headers dict and is more ceremony for no behavior change
+        # here) -- this is the same call shape a real remote client (e.g.
+        # Claude web/mobile) makes against this mcp SDK version.
+        async with streamablehttp_client(base_url, headers={"Authorization": f"Bearer {token}"}) as (
+            read,
+            write,
+            _,
+        ):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                async def call(name, args):
+                    result = await session.call_tool(name, args)
+                    return json.loads(result.content[0].text)
+
+                added = await call("add_task", {"title": "Remote task via HTTP MCP", "priority": "high"})
+                tid = added["task"]["id"]
+                await call("decompose_task", {"id": tid, "into": ["step one", "step two"]})
+                await call("reprioritise_task", {"id": tid, "priority": "low", "reason": "downgrade via http"})
+                why = await call("why_task", {"id": tid})
+                undone = await call("undo", {})
+                return {"id": tid, "why": why, "undone": undone}
+
+    with _LiveServer(token) as live:
+        no_token = httpx.post(
+            live.base_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
+        )
+        wrong_token = httpx.post(
+            live.base_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+                "Authorization": "Bearer wrong-token-entirely",
+            },
+        )
+        outcome = asyncio.run(_round_trip(live.base_url))
+
+    for resp in (no_token, wrong_token):
+        assert resp.status_code == 401
+        body = resp.json()
+        assert body == {
+            "ok": False,
+            "error": "unauthorized",
+            "message": "Missing or wrong bearer token.",
+            "hint": (
+                "Send 'Authorization: Bearer <token>' matching the token this "
+                "server was started with (see `cadence mcp --http --show-token`)."
+            ),
+        }
+
+    assert outcome["why"]["ok"] is True
+    assert outcome["undone"]["ok"] is True
+
+    # Not the HTTP session's own view -- a fresh Store opened directly on
+    # the same CADENCE_DB_PATH the CLI would use, proving one store, not a
+    # divergent copy the HTTP transport kept to itself.
+    store = Store()
+    task = store.get(outcome["id"])
+    assert task.title == "Remote task via HTTP MCP"
+    # undo reverted the reprioritise (low -> back to high), leaving the
+    # decompose in place, exactly as a local `cadence undo` would.
+    assert task.priority == "high"
+    children = [t for t in store.list(status="all") if t.parent_id == outcome["id"]]
+    assert sorted(t.title for t in children) == ["step one", "step two"]

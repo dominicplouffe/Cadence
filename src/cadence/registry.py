@@ -12,6 +12,8 @@ same way a single-project command opens its own.
 from __future__ import annotations
 
 import os
+import secrets
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -74,6 +76,39 @@ def register_project(db_path: Optional[Path] = None) -> tuple[str, bool]:
     with open(path, "a") as f:
         f.write(target + "\n")
     return target, False
+
+
+def http_token_path() -> Path:
+    """Where the remote-MCP bearer token lives: ~/.config/cadence/mcp_http_token
+    (or $CADENCE_CONFIG_HOME/mcp_http_token) -- same directory as projects.txt,
+    one secret per line, nothing else."""
+    return config_home() / "mcp_http_token"
+
+
+def get_or_create_http_token() -> str:
+    """The token `cadence mcp --http` requires of every remote request.
+
+    Generated once, locally, on first use (32 random bytes, hex-encoded --
+    unguessable, never derived from anything transmittable), then persisted
+    at http_token_path() and reused on every later run so a client only has
+    to be configured once. It is never sent anywhere by Cadence itself; the
+    operator is the one who copies it into their own remote client's config.
+    File is written with owner-only permissions (0600), matching the fact
+    that reading it is equivalent to full read/write access to the task
+    store over the network.
+    """
+    path = http_token_path()
+    if path.exists():
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    token = secrets.token_hex(32)
+    path.write_text(token + "\n")
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass  # best-effort on platforms without POSIX permission bits
+    return token
 
 
 def project_name(db_path_str: str) -> str:
