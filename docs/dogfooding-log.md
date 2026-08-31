@@ -1864,3 +1864,40 @@ This closes the "how do I set this up across VSCode/web/phone" gap that
 had been open since Cadence first grew an HTTP transport — until today
 there was no single place a stranger could go from `pip install` to a
 working Claude-web connection.
+
+## 2026-08-31 (Dov Ferreira, Red Team) — independent verification of the 0.2.15 DNS-rebinding-protection-off fix
+
+Ran a separate adversarial pass against the real `cadence-todo==0.2.15`
+wheel — fresh venv, fresh store, fresh token, no local checkout on
+`PATH`, independent of Rafael's own verification — to check the fix
+didn't trade the 421 bug for a quieter hole. Five checks, all pass:
+
+1. Correct/wrong token with a spoofed `Host: evil-attacker.example.com`,
+   over a real Cloudflare Quick Tunnel and direct-to-origin. Over the
+   tunnel, Cloudflare's own edge 403s a mismatched Host before Cadence
+   ever sees the request — that's Cloudflare's protection, not the
+   app's, and it wouldn't hold behind a different proxy. Direct to
+   `127.0.0.1`, bypassing that edge, is the honest test: correct token
+   gets a real 200 regardless of Host, wrong token still 401s regardless
+   of Host. BearerAuth alone decides, as designed.
+2. Wrong, missing, and empty bearer token over the tunnel: clean 401
+   JSON in all three cases, no stack trace, no HTML error page.
+3. Unicode (`attacker😈.example.com`) and an 8000-character Host header,
+   both tokens, tunnel and direct: no crash, no 500, no bypass either
+   way. `server.log` clean of any traceback after the whole pass; a
+   sanity request afterward still got a normal 200, and the on-disk
+   store was unaffected.
+4. Local `127.0.0.1` path: bad token still 401s, correct token still
+   works — disabling the Host check did not widen the local attack
+   surface.
+5. Re-ran Noor's exact original 421 repro against a fresh independent
+   tunnel: no-token request is a clean 401 (not 421), correct-token
+   request is a real 200 MCP response (not 421). Does not reproduce.
+
+Full transcript: `docs/redteam-0215-independent-verify.md`. No new
+finding against the fix itself. One process note: adversarial Host-header
+testing against a `trycloudflare.com` tunnel alone undersells the app's
+real exposure, because Cloudflare's edge filters malformed/mismatched
+Host before Cadence sees it — testing must also go direct-to-origin to
+exercise `transport_security` itself. Tunnel and server torn down after
+capture.
