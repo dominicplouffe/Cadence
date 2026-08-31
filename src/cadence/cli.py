@@ -392,7 +392,12 @@ def cmd_overdue(args: argparse.Namespace) -> int:
             f"project{plural}. Run 'cadence register' in a project directory "
             "to add another."
         )
-    return 0
+    # Red Team 0.2.13-indep finding: at least one registered project that
+    # couldn't be opened is a store-class failure (same class single-project
+    # commands already exit 2 for, §4.4), not a clean "0 overdue" run -- a
+    # script/agent that only checks the exit code must be able to tell
+    # "some projects are broken" from "genuinely nothing overdue" apart.
+    return 2 if error_count else 0
 
 
 def cmd_done(args: argparse.Namespace) -> int:
@@ -624,6 +629,7 @@ def _cmd_sync_all_projects(args: argparse.Namespace) -> int:
             remote_map[project_name(p)] = p
     name_w = max([len(project_name(p)) for p in entries] + [10])
     any_conflict = False
+    any_store_error = False
     for path in entries:
         name = project_name(path)
         remote_arg = None
@@ -640,6 +646,7 @@ def _cmd_sync_all_projects(args: argparse.Namespace) -> int:
             result = store.sync(remote=remote_arg)
         except CadenceError as exc:
             print(f"{name:<{name_w}}  Error: {_format_err(exc)}")
+            any_store_error = True
             continue
         except Exception as exc:
             # 0.2.12 Red Team finding #3: a registry entry that raises
@@ -651,6 +658,7 @@ def _cmd_sync_all_projects(args: argparse.Namespace) -> int:
                 f"{name:<{name_w}}  Error: something went wrong opening "
                 f"this project's store ({type(exc).__name__}: {exc})."
             )
+            any_store_error = True
             continue
         if result["already_synced"]:
             print(f"{name:<{name_w}}  Already in sync with origin. Nothing to pull or push.")
@@ -680,6 +688,14 @@ def _cmd_sync_all_projects(args: argparse.Namespace) -> int:
                 )
         else:
             print(f"{name:<{name_w}}  synced: pulled {pulled}, pushed {pushed}. Up to date.")
+    # Red Team 0.2.13-indep finding: a registered project this call couldn't
+    # even open is a store-class failure (§4.4's exit-2 class), which is a
+    # worse signal than "some conflicts need you" (exit 1) -- an agent
+    # scripting `sync --all-projects && ...` must see a non-zero exit for
+    # either case, and store errors take precedence when both occur so the
+    # more severe condition isn't masked by the milder one.
+    if any_store_error:
+        return 2
     return 1 if any_conflict else 0
 
 

@@ -176,7 +176,10 @@ def test_cli_overdue_all_projects_reports_deleted_project_instead_of_recreating_
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0
+    # Exit code 2 (store-error class), not 0: this is the 0.2.13-indep Red
+    # Team fix (test_0213_all_projects_exit_code.py) -- the sole registered
+    # project failing to open is a total failure, not a clean run.
+    assert result.returncode == 2
     assert "0 overdue across 1 registered project" not in result.stdout, (
         "must not silently report a phantom zero for a deleted project's store"
     )
@@ -216,7 +219,11 @@ def test_cli_overdue_all_projects_reports_bad_registry_entry_instead_of_aborting
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, result.stderr
+    # Exit code 2 (store-error class), not 0: this finding's own contract
+    # (keep going, report the good project) is orthogonal to whether the
+    # exit code may also carry the "something failed" signal -- see
+    # test_0213_all_projects_exit_code.py for the fix that added it.
+    assert result.returncode == 2, result.stderr
     assert "real task" in result.stdout, "the good project's overdue task must still be reported"
     assert "proj-good" in result.stdout
 
