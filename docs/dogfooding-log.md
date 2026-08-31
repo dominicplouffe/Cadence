@@ -1781,3 +1781,54 @@ the real `cadence-todo==0.2.14` package installed from PyPI in a fresh
 venv, not the local checkout — all-bad, mixed, and all-healthy
 registries each produce the exit code the fix's own contract
 promises.**
+
+## 2026-08-31: `cadence mcp --http` 421'd every tunneled request regardless of token, fixed in 0.2.15
+
+Found by Noor (Surface) while verifying the README's "expose to Claude
+web/phone via a tunnel" claim before writing it down as fact: a real
+Cloudflare Quick Tunnel request with the correct bearer token got a bare
+`421 Invalid Host header`, not an MCP response. Root cause: the MCP SDK
+auto-attaches DNS-rebinding Host-header protection (scoped to
+`127.0.0.1`/`localhost`/`[::1]`) to `FastMCP` unless `transport_security`
+is passed explicitly, and that check runs ahead of Cadence's own
+`BearerAuth` wrapper -- so any non-localhost `Host` 421'd no matter what
+token it carried. This made the documented tunnel path non-functional as
+written.
+
+Fix: `mcp_server.py` now passes
+`transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)`
+explicitly, on the documented basis that `_make_http_app`'s own docstring
+already states the bearer token is the security boundary for `--http`
+mode -- every request passes through `BearerAuth` regardless of `Host`,
+so the SDK's Host check was redundant, not load-bearing. Reasoning is in
+a code comment at the `FastMCP(...)` construction.
+
+Shipped as `cadence-todo` 0.2.15 (commit `4a31a87`). `Publish` completed
+`success`
+(https://github.com/dominicplouffe/Cadence/actions/runs/33415351524).
+`CI`'s `pypi-install-and-drive` job hit the same documented publish/CI
+race as 0.2.11-0.2.14 (its own PyPI-JSON-API poll said "live" before
+`pip install` could actually resolve it) on the first attempt; re-ran via
+`rerun-failed-jobs` once `pip install cadence-todo==0.2.15` succeeded
+locally, and CI run `33415351518` is `completed`/`success` for `4a31a87`.
+
+Re-verified against the real published `cadence-todo==0.2.15` wheel in a
+fresh venv, a real live Cloudflare Quick Tunnel
+(`cloudflared` v2026.8.3, `https://component-towns-postal-passes.trycloudflare.com`),
+and a real bearer token: an `initialize` call through the tunnel returned
+`HTTP 200` with a valid MCP `initialize` response (was `421` before the
+fix), and a follow-up `add_task` tool call through the same tunnel
+session landed in the on-disk store, confirmed by a local `cadence list`.
+A request with no token, and a request with a wrong token plus the same
+tunnel-shaped `Host` header, both still 401 cleanly -- disabling the
+DNS-rebinding check did not weaken `BearerAuth`. Full transcript:
+`docs/tunnel-fix-verified-0.2.15.md`.
+
+Regression test: `tests/test_http_transport.py`'s existing single
+live-server HTTP transport test now repeats its full authorized round
+trip and its wrong-token check with a `Host: some-name.trycloudflare.com`
+header, asserting neither 421s (folded into the existing test rather than
+a new one, since FastMCP's `StreamableHTTPSessionManager.run()` can only
+be called once per process).
+
+Noor's README "Get Started" tunnel path is unblocked by this fix.
