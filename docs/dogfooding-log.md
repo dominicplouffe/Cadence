@@ -1305,3 +1305,215 @@ not a bug in this change.
 This closes the chairman's named gap: Claude web and Claude on his phone
 can now reach the same task store VSCode/Claude Code does, self-hosted,
 token-gated, no account and no hosted backend added.
+
+## 2026-08-31 (Dov Ferreira, Red Team) — Adversarial pass on 0.2.12: HTTP MCP transport + multi-project — 5 real findings, 2 severe
+
+First adversarial pass on the two surfaces shipped in 0.2.12/0.2.11 that
+had not yet had one: `cadence mcp --http` (0.2.12, commit 8708ed3) and
+`cadence register`/`overdue --all-projects`/`sync --all-projects`
+(0.2.11, commit 550f8ba). Every case below was run against the real
+published `cadence-todo==0.2.12` wheel from PyPI in a venv with no repo
+checkout on `sys.path` (`pip show cadence-todo` →
+`/workspace/pypi_e2e_venv_0212/.../site-packages/cadence`), not the
+local editable checkout. Do not fix here — this is the find, not the
+fix; each item below is precise enough for Build to reproduce on the
+first try.
+
+### Findings, worst first
+
+**1. SEVERE — concurrent writes to the same store can report a hard
+failure while the write actually succeeded, and permanently lose that
+task's audit trail.** `Store.add()` (and every other mutator) commits
+the SQLite row first (`store.py:388 conn.commit()`), *then* does a
+separate git-backed history commit
+(`store.py:390 self._snapshot_and_commit(...)`) — the two are not one
+transaction. When two writers touch the same store at once (proven with
+plain local CLI processes; MCP `add_task` calls the identical
+`Store.add()` so the same race applies to a stdio/HTTP writer racing a
+CLI writer), the git step can lose the race for its own
+`store.db.history/.git/index.lock` and raise `HistoryError`, which
+propagates all the way to the caller as `Error: something went wrong on
+Cadence's end (HistoryError: git commit failed: fatal: Unable to create
+'.../index.lock': File exists...)`, exit code 2 — but the SQLite row was
+already durably committed and is visible in `cadence list`. The task
+exists; its "Created" history entry is gone forever (`cadence why <id>`
+on it says "No history recorded for this task yet.", permanently, even
+after the lock clears). An agent that trusts the failure signal will
+plausibly retry the identical `add`, creating a silent duplicate.
+Repro (fresh store, real 0.2.12):
+```
+export CADENCE_DB_PATH=/tmp/x/store.db CADENCE_CONFIG_HOME=/tmp/x/config
+for i in $(seq 1 10); do ( cadence add "cli-$i" > out_$i.txt 2>&1; echo "exit=$?" >> out_$i.txt ) & done; wait
+grep -L '^Added' out_*.txt   # 3/10 in our run: exit=2, HistoryError
+cadence list                 # all 10 tasks present anyway, including the 3 "failed" ones
+cadence why <id-of-a-failed-one>   # "No history recorded for this task yet."
+```
+No leftover `.git/index.lock` after the race — a subsequent single
+`cadence add` works fine, so this is a lossy-error/lost-history bug
+under concurrency, not permanent store corruption.
+
+**2. SEVERE — `overdue --all-projects` silently recreates a deleted or
+moved registered project's store as a fresh, empty database and reports
+"0 overdue" with no error, permanently hiding that the data is gone.**
+Root cause: `Store.__init__` does
+`self.db_path.parent.mkdir(parents=True, exist_ok=True)`
+(`store.py:179`) unconditionally, before anything checks whether the
+file previously existed, so opening a registered store whose directory
+was deleted just fabricates a brand-new empty one instead of erroring.
+Repro:
+```
+cd proj-a && CADENCE_DB_PATH=$PWD/cadence.db cadence add "real task" --due 2020-01-01  # (or schedule)
+cadence register
+rm -rf proj-a                       # simulate deleted/moved project
+cadence overdue --all-projects      # from anywhere else
+# -> "0 overdue across 2 registered projects." exit 0, no warning
+ls proj-a                           # proj-a/ and a fresh empty cadence.db now exist again, silently
+```
+A person who deleted a stale project directory gets no signal at all
+that their "0 overdue" answer is a phantom, not a real absence of
+overdue work.
+
+**3. MODERATE-SEVERE — a single registry line whose content raises
+something other than `sqlite3.Error` (e.g. an embedded null byte)
+crashes the *entire* `overdue --all-projects` / `sync --all-projects`
+call, contradicting the documented per-project-error contract
+(`overdue_tasks`'s own docstring: "A registered store that can't be
+opened is reported as {project, error, message, hint} instead of a
+task, alongside the rest, rather than failing the whole call.").** Same
+root cause as #2: the `mkdir` call in `Store.__init__` sits outside its
+own `except sqlite3.Error` net, so a `ValueError` from it is never
+wrapped into a `CadenceError` — and `cmd_overdue`, `overdue_tasks` (MCP),
+and `_cmd_sync_all_projects` only catch `CadenceError` around
+`Store(db_path=...)`, so the raw exception escapes to the top-level
+handler and aborts the whole command, printing nothing for any other
+registered project. Repro:
+```
+python3 -c "open(os.path.expandvars('$CADENCE_CONFIG_HOME/projects.txt'),'ab').write(b'/tmp/gar\x00bage/cadence.db\n')"
+cadence overdue --all-projects
+# Error: something went wrong on Cadence's end (ValueError: embedded null byte).
+# exit 2 -- ZERO output for the other, perfectly valid registered projects
+cadence sync --all-projects
+# prints per-project lines fine for entries before the bad one, then:
+# Error: something went wrong on Cadence's end (ValueError: embedded null byte).
+# exit 2 -- any entries after the bad line in the file are never reached or reported
+```
+
+**4. MODERATE — a syntactically-valid-but-wrong (relative) registry
+line makes `overdue --all-projects` silently create a real, new SQLite
+file in whatever directory the command happens to be run from, with no
+warning that it just wrote a file into the caller's cwd.** A hand-edit
+that drops the leading `/` (an easy typo) is enough. Repro:
+```
+printf 'not-a-real-path-relative\n' >> "$CADENCE_CONFIG_HOME/projects.txt"
+cd /some/unrelated/dir && cadence overdue --all-projects
+ls /some/unrelated/dir   # -> a new file literally named `not-a-real-path-relative` now exists here
+```
+
+**5. MODERATE, legibility — `cadence register` keys on
+`CADENCE_DB_PATH` (or the single global default store when unset), not
+on the current directory, so two different project directories that
+never set `CADENCE_DB_PATH` silently collapse into one shared store and
+one registry entry, contradicting the tool's own "call once per project"
+framing.** `register_project`'s docstring and `cadence mcp`'s
+`initialize` instructions both say "call once per project (e.g. once
+per repo an agent works in)", which reads as cwd-scoped; it is not.
+Repro:
+```
+cd proj-x && cadence add "task from proj-x" && cadence register   # no CADENCE_DB_PATH set
+cd proj-y && cadence add "task from proj-y" && cadence register   # no CADENCE_DB_PATH set, different dir
+cat ~/.config/cadence/projects.txt   # -> ONE line, not two
+cadence list                          # both "separate" projects' tasks in the same list
+```
+An agent or person who hasn't already learned to set `CADENCE_DB_PATH`
+per project before calling `register` gets silent single-project
+behavior with no indication the multi-project feature never engaged.
+
+**6. MINOR, legibility — HTTP-transport-envelope-level malformed
+requests do not use cadence's own `{ok, error, message, hint}` contract;
+only auth failures and in-session tool-call errors do.** Once inside a
+valid MCP session, a genuine tool-level error (over-long title, wrong
+arg type, unknown id) correctly returns cadence's shape even over HTTP
+— confirmed working. But anything malformed enough to be rejected by
+the underlying `mcp` SDK's own request handling, before a tool is ever
+invoked, returns the SDK's raw JSON-RPC/plain-text error instead:
+```
+# bad JSON body:
+{"jsonrpc":"2.0","id":"server-error","error":{"code":-32700,"message":"Parse error: Expecting property name enclosed in double quotes: line 1 column 62 (char 61)"}}
+# missing 'method' field:
+{"jsonrpc":"2.0","id":"server-error","error":{"code":-32602,"message":"Validation error: 4 validation errors for JSONRPCMessage\n...For further information visit https://errors.pydantic.dev/2.13/v/missing..."}}
+# missing Accept header:
+{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Not Acceptable: Client must accept both application/json and text/event-stream"}}
+# 25MB oversized body:
+HTTP 413, plain-text body "Request body too large" (not even JSON)
+```
+The server's own `initialize` response tells every client "All tools
+return {ok, ...}; on ok=false, read error and hint" — a remote agent
+that takes that literally will not recognise any of the shapes above as
+the same contract. (Auth failures at the same layer, handled by
+cadence's own `BearerAuth` wrapper, are correctly cadence-shaped —
+confirmed with no-header, wrong-token, empty-string-token, and a
+5000-char garbage-token request, all cleanly 401 with the standard
+shape.)
+
+**7. MINOR, legibility — `initialize`'s `serverInfo.version` reports the
+`mcp` SDK's own version ("1.29.1"), not Cadence's ("0.2.12"), because
+`FastMCP(...)` is constructed with no `version=` kwarg.** An agent
+trying to detect which Cadence feature set it's talking to via the
+standard MCP handshake gets a number that has nothing to do with
+Cadence's release cadence.
+
+**Hunch, not independently verified this pass:** the bearer-token check
+(`mcp_server.py`'s `BearerAuth.__call__`) compares
+`presented != self.expected_token` with plain string `!=` rather than
+`hmac.compare_digest`, a timing side-channel in principle. Low priority
+for a single-operator local-first tool and I did not attempt an actual
+timing attack (would need many thousands of samples over a real network
+to say anything conclusive) — flagging for awareness, not filing as a
+proven finding.
+
+### What held (tried, did not break)
+
+- HTTP auth: missing header, wrong token, empty-string token
+  (`Authorization: Bearer ` with nothing after), and a 5000-character
+  garbage token were all cleanly rejected with the standard 401
+  `{ok:false,"error":"unauthorized",...}` shape, never a stack trace or
+  silent accept.
+- `--http` binds `127.0.0.1` by default (confirmed in `cli.py`'s
+  argparse default), not `0.0.0.0` — no unintended network exposure out
+  of the box for a "local-first, your own machine" tool.
+- Oversized payload (25MB tool-call body): rejected fast (413, ~25ms),
+  no hang, no crash (error shape itself is finding #6 above).
+- Once inside a valid MCP session, genuine tool-level errors (over-long
+  title, wrong-typed id, unknown task id) over HTTP correctly return
+  cadence's own `{ok, error, message, hint}` shape, matching stdio.
+- `cadence register` run twice in the exact same directory/`CADENCE_DB_PATH`
+  is properly idempotent — no duplicate registry entry.
+- No leftover git lock file after a concurrency-induced `HistoryError`;
+  the store is usable again immediately, bounding finding #1 to a
+  lossy-error/lost-history bug rather than lasting corruption.
+- `sync --all-projects` correctly prints a per-project error line and
+  keeps going for entries that raise a normal `CadenceError` (e.g. "no
+  remote configured for sync") — it only aborts the whole run on the
+  non-`CadenceError` case in finding #3.
+
+### Not tested this pass
+
+- Timing-attack feasibility on the bearer-token comparison (see hunch
+  above).
+- `sync --all-projects` with a genuine cross-client conflict among N
+  registered projects was not re-run this pass: already verified
+  end-to-end in this log's 2026-08-30 (0.2.11) entry (per-project
+  pulled/pushed/conflict line, exit 1, loop does not abort on a real
+  conflict), and 0.2.12 (commit 8708ed3) touched only the new HTTP
+  transport, not the sync/registry code path, so there is no plausible
+  regression surface to re-check there.
+- Did not attempt to reach the HTTP port from a genuinely separate host
+  (sandbox has no second network-addressable machine available); the
+  `127.0.0.1`-default finding above is a static-config confirmation, not
+  a live cross-host probe.
+
+If only one of the above gets fixed first: **#1 (concurrent-write false
+failure + lost history)** — it is the one that actively lies about
+whether an agent's write happened, which is worse than any crash, and it
+is the exact scenario ("local stdio CLI and a remote HTTP client both
+touching the same store at once") this task was scoped to check.
