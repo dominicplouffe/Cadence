@@ -1685,3 +1685,99 @@ fix — left open for a future pass, not silently dropped.
 fixed and independently re-confirmed against the real
 `cadence-todo==0.2.13` package installed from PyPI in a fresh venv, not
 the local checkout.**
+
+## 2026-08-31 (Rafael Okonkwo, Build) — 0.2.14: fixed `--all-projects` always exiting 0, even on total per-project failure (Dov's independent 0.2.13 re-verification finding)
+
+**The bug.** Dov's independent re-verification pass of 0.2.13 (fresh
+venv, fresh `$HOME`, real PyPI wheel — not trusting the 0.2.13
+transcript) found one new MODERATE defect on top of confirming the 5
+prior findings held: `cadence overdue --all-projects` and `cadence
+sync --all-projects` always exited `0`, even when **every** registered
+project failed to open. The per-project error text lines the 0.2.13 fix
+added were real, but nothing fed them into the exit code, so a
+script/agent following docs/human-surface.md §4.4's exit-code contract
+("so a script can tell 'you asked wrong' from 'we broke' apart
+programmatically") got zero signal from `--all-projects` even in a
+total-failure case — it would have to fall back to parsing free text,
+which nothing in `--help` documents as the check to perform.
+
+**The fix (commit `a186474`).** `cmd_overdue`'s `--all-projects` branch
+and `_cmd_sync_all_projects` (`src/cadence/cli.py`) now return `2` —
+the same store-error class exit code single-project commands already
+use — when at least one registered entry couldn't be opened, while
+still printing every per-project line and not aborting early (the
+0.2.13 "keep going" behavior is unchanged, just no longer silent at the
+exit-code level). For `sync --all-projects`, a store-open error takes
+precedence over an unresolved conflict (exit `2` beats exit `1`) since
+"a project is unreachable" is more severe than "a project synced but
+needs a human for one conflict." Two 0.2.12-finding regression tests in
+`tests/test_0212_severe_findings.py` had their exit-code assertions
+updated from `0` to `2` — they were incidentally testing the exact
+old (buggy) contract this fix replaces. New regression tests in
+`tests/test_0213_all_projects_exit_code.py` (6 cases: all-bad, mixed
+good+bad, and all-healthy/no-registry, on both commands), confirmed
+failing pre-fix via `git stash` on `src/cadence/cli.py` alone (house
+convention).
+
+Full suite: `python -m pytest -q` → **148 passed**, run in
+`/workspace/cadence_push` at commit `a186474`. Version bumped to
+0.2.14; pushed to `main` at `a186474`. `Publish` workflow completed
+`success` for `a186474`
+(`https://github.com/dominicplouffe/Cadence/actions/runs/33385269755`).
+`CI`'s `pypi-install-and-drive` job failed on the first attempt purely
+on the documented publish/CI race (its 65s wait loop timed out before
+PyPI's CDN had propagated `0.2.14`, which was already `Publish`-green
+by then — `pip index versions` lagged the raw `/simple/` index by about
+a minute); re-ran via
+`POST /repos/dominicplouffe/Cadence/actions/runs/33385269751/rerun-failed-jobs`
+once `pip install cadence-todo==0.2.14` succeeded locally, and `CI` run
+`33385269751` is `completed`/`success` for `a186474`
+(`https://github.com/dominicplouffe/Cadence/actions/runs/33385269751`)
+— not a regression from this fix, the same race 0.2.11/0.2.12/0.2.13
+also raced against, just the first time it lost.
+
+**Re-verification against the real published `cadence-todo==0.2.14`
+wheel**, fresh venv (`python3 -m venv /tmp/verify_venv && pip install
+cadence-todo==0.2.14` — `pip show cadence-todo` confirms `Version:
+0.2.14`), fresh `$HOME`/`CADENCE_CONFIG_HOME`, hand-corrupted registry,
+verbatim:
+
+```
+$ cat "$CADENCE_CONFIG_HOME/projects.txt"
+/tmp/gar bage-1/cadence.db
+not-a-real-path-relative
+$ cadence overdue --all-projects; echo "exit=$?"
+gar bage-1                Error: no store found at registered path '/tmp/gar bage-1/cadence.db'. ...
+not-a-real-path-relative  Error: registered path 'not-a-real-path-relative' is not absolute. ...
+0 overdue across 0 of 2 registered projects checked (2 could not be opened; see errors above).
+exit=2
+$ cadence sync --all-projects; echo "exit=$?"
+gar bage-1                Error: no store found at registered path '/tmp/gar bage-1/cadence.db'. ...
+not-a-real-path-relative  Error: registered path 'not-a-real-path-relative' is not absolute. ...
+exit=2
+```
+Both went from `exit=0` (Dov's pre-fix repro) to `exit=2` (store-error
+class) for the same all-bad registry.
+
+Mixed case (one good, one bad entry) — good project's row still prints
+in full, exit code still goes non-zero:
+```
+$ cadence overdue --all-projects; echo "exit=$?"
+[!]  proj-good   #1   Overdue thing                        |  overdue 2434d
+gar bage    Error: no store found at registered path '/tmp/gar bage/cadence.db'. ...
+1 overdue across 1 of 2 registered projects checked (1 could not be opened; see errors above).
+exit=2
+```
+
+All-healthy registry (regression guard — must stay exit 0):
+```
+$ cadence overdue --all-projects; echo "exit=$?"
+0 overdue across 1 registered project. Run 'cadence register' in a project directory to add another.
+exit=0
+```
+
+**Result: the finding is fixed and independently re-confirmed against
+the real `cadence-todo==0.2.14` package installed from PyPI in a fresh
+venv, not the local checkout — all-bad, mixed, and all-healthy
+registries each produce the exit code the fix's own contract
+promises.**
