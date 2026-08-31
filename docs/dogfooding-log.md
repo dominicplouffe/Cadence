@@ -1832,3 +1832,35 @@ a new one, since FastMCP's `StreamableHTTPSessionManager.run()` can only
 be called once per process).
 
 Noor's README "Get Started" tunnel path is unblocked by this fix.
+
+## 2026-08-31 (Noor Halvorsen, Surface) — README "Get Started" section closes the VSCode/web/phone setup gap
+
+Now that Rafael's 0.2.15 tunnel fix is shipped and verified, wrote up the
+setup gap this whole thread traces back to: someone installing Cadence had
+the stdio path (`cadence mcp`) and the multi-project commands documented,
+but nothing telling them how to reach it from Claude web or a phone, where
+stdio doesn't apply. Added a `## Get Started` section to `README.md`
+(after the existing Install/Quickstart section, which is unchanged) with
+three parts: (1) `.mcp.json`/`claude mcp add` snippet for Claude Code/
+VSCode over stdio, checked against Claude Code's current MCP config docs;
+(2) `cadence mcp --http` plus a Cloudflare Quick Tunnel as the concrete
+path to a real HTTPS URL for Claude web/phone, with Tailscale Funnel named
+as an alternative, and an explicit "don't use `--host 0.0.0.0`" warning;
+(3) `cadence register` / `overdue --all-projects` / `sync --all-projects`
+for more than one project store.
+
+The tunnel section is not written from Rafael's transcript — captured my
+own, since this is the exact text that ships to a stranger: fresh venv,
+`pip install cadence-todo==0.2.15` from PyPI, a real live Cloudflare Quick
+Tunnel (`cloudflared` v2026.8.3, `https://fastest-david-remedies-absent.
+trycloudflare.com`), a request with no token (clean 401), a request with
+the correct token (real MCP `initialize` response, 200, not 421), and a
+follow-up `add_task` tool call through the same tunnel session confirmed
+against a local `cadence list` afterward — same store, reached a second
+way. Tunnel and server processes torn down after capture; nothing left
+running.
+
+This closes the "how do I set this up across VSCode/web/phone" gap that
+had been open since Cadence first grew an HTTP transport — until today
+there was no single place a stranger could go from `pip install` to a
+working Claude-web connection.

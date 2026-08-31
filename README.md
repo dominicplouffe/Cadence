@@ -145,6 +145,168 @@ pip install pytest
 pytest -q
 ```
 
+## Get Started
+
+Three ways to point an agent at Cadence, depending on where that agent runs.
+
+### 1. Claude Code / VSCode, running on the same machine (stdio)
+
+This is the simplest path: the client starts `cadence mcp` itself as a
+subprocess, talks to it over stdio, and no network or token is involved.
+
+```
+pip install cadence-todo
+```
+
+Add it as a project-scoped MCP server, either with the CLI:
+
+```
+claude mcp add --transport stdio cadence -- cadence mcp
+```
+
+or by hand in `.mcp.json` at your project root:
+
+```json
+{
+  "mcpServers": {
+    "cadence": {
+      "type": "stdio",
+      "command": "cadence",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Restart Claude Code (or reload the window) and it will list `add_task`,
+`list_tasks`, `complete_task`, `schedule_task`, `decompose_task`,
+`reprioritise_task`, `why_task`, `undo`, `sync_tasks`, `export_tasks`, and
+`register_project` as available tools.
+
+### 2. Claude web or Claude on your phone (HTTP transport, over a tunnel)
+
+Claude web and mobile can't spawn a local process on your machine, so they
+need to reach Cadence over HTTPS instead. Run the HTTP transport locally:
+
+```
+cadence mcp --http
+```
+
+This starts a server on `127.0.0.1:8765` — still on your own machine, still
+backed by the same store as the CLI and the stdio server, no hosted
+backend. It requires a bearer token on every request (`cadence mcp
+--show-token` to print it). By itself this is only reachable from
+`localhost`; you need a tunnel to get a real HTTPS URL a remote client can
+use. **Do not run this with `--host 0.0.0.0`** — that exposes the port to
+your whole network with only the bearer token standing between it and
+anyone on that network; a tunnel keeps the port itself bound to
+`127.0.0.1` and only forwards over an authenticated HTTPS connection.
+
+**Cloudflare Quick Tunnel** (no account needed, URL changes each run):
+
+```
+cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+prints an HTTPS URL like `https://some-random-words.trycloudflare.com`.
+Configure the remote client with `<that URL>/mcp` and an `Authorization:
+Bearer <token>` header carrying the token from `cadence mcp --show-token`.
+
+**Tailscale Funnel** is a reasonable alternative if you already run
+Tailscale on both machines and want a stable URL instead of a new one per
+run: `tailscale funnel 8765` after `cadence mcp --http` is running.
+
+Real transcript, `cadence-todo` 0.2.15, fresh install from PyPI, a live
+Cloudflare Quick Tunnel (not simulated):
+
+```
+$ pip install cadence-todo==0.2.15
+$ cadence add "Verify README Get Started (0.2.15)"
+Added #1: Verify README Get Started (0.2.15)
+$ cadence mcp --http --port 8767
+[cadence mcp --http] listening on http://127.0.0.1:8767/mcp -- bearer token required on every request
+$ cloudflared tunnel --url http://127.0.0.1:8767
+...
+Your quick Tunnel has been created!
+https://fastest-david-remedies-absent.trycloudflare.com
+```
+
+No token, over the tunnel — still a clean 401:
+
+```
+$ curl -sS -i https://fastest-david-remedies-absent.trycloudflare.com/mcp \
+    -X POST -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}'
+
+HTTP/2 401
+{"ok":false,"error":"unauthorized","message":"Missing or wrong bearer token.","hint":"Send 'Authorization: Bearer <token>' matching the token this server was started with (see `cadence mcp --http --show-token`)."}
+```
+
+Correct token, over the tunnel — a real `initialize` response:
+
+```
+$ curl -sS -i https://fastest-david-remedies-absent.trycloudflare.com/mcp \
+    -X POST -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Authorization: Bearer 29bd96fe9fd267b0f7cb33a188d947ce14267654be081e0d2ae44153dd660f9c" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"verify-client","version":"1.0"}}}'
+
+HTTP/2 200
+mcp-session-id: d77b4b16fe114b1eb85633a11f106834
+content-type: text/event-stream
+
+event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18",
+  "capabilities":{...},
+  "serverInfo":{"name":"cadence","version":"1.29.1"},
+  "instructions":"Cadence is a local-first todo store. ..."}}
+```
+
+A follow-up tool call over that same tunnel session lands in the real,
+local store — confirmed with a plain `cadence list` afterward, no
+difference between a task created locally and one created through the
+tunnel:
+
+```
+$ curl ... -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add_task","arguments":{"title":"Confirmed via tunnel (README verify)"}}}'
+HTTP/2 200
+data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\n  \"ok\": true,\n  \"task\": {\n    \"id\": 2,\n    \"title\": \"Confirmed via tunnel (README verify)\", ...}}"}],"isError":false}}
+
+$ cadence list
+  [ ]    1   Verify README Get Started (0.2.15)
+  [ ]    2   Confirmed via tunnel (README verify)
+```
+
+### 3. More than one project
+
+If you keep separate Cadence stores per project (separate `CADENCE_DB_PATH`
+values, e.g. one per git repo), register each one so the cross-project
+commands can find it:
+
+```
+$ cd ~/proj1 && cadence register
+Registered /home/you/proj1/cadence.db (as 'proj1').
+
+$ cd ~/proj2 && cadence add "File Q3 taxes"
+Added #1: File Q3 taxes
+$ cadence schedule 1 2026-01-01
+Scheduled #1 for 2026-01-01: File Q3 taxes
+$ cadence register
+Registered /home/you/proj2/cadence.db (as 'proj2').
+
+$ cadence overdue --all-projects
+[!]  proj2       #1   File Q3 taxes                        |  overdue 242d
+1 overdue across 2 registered projects. Run 'cadence register' in a project directory to add another.
+```
+
+`cadence sync --all-projects` works the same way — one call syncs every
+registered project's store against whatever remote it already has
+configured, instead of running `cadence sync` separately in each project
+directory. The MCP tool equivalents are `register_project`,
+`overdue_tasks(all_projects=true)`, and
+`sync_tasks(all_projects=true)`.
+
 ## What "agentic-first" means here
 
 - **Primary interface is agent-legible by design.** An agent that has never
