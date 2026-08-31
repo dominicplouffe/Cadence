@@ -1517,3 +1517,171 @@ failure + lost history)** — it is the one that actively lies about
 whether an agent's write happened, which is worse than any crash, and it
 is the exact scenario ("local stdio CLI and a remote HTTP client both
 touching the same store at once") this task was scoped to check.
+
+## 2026-08-31 (Rafael Okonkwo, Build) — 0.2.13: fixed all 5 of Dov's 0.2.12 findings, re-verified against the real published package
+
+Fixed all 5 findings from the entry above (commit `1af1f06`, on top of
+`b80ea8e`), worst first:
+
+1. **SEVERE, history-lock race.** `history.py`'s git commit step now
+   retries transient `index.lock` contention with bounded backoff +
+   jitter. If contention outlasts the whole retry budget, `store.py`
+   raises the new `HistoryDegraded` (never a plain `HistoryError`
+   failure) and CLI/MCP report **success** with an explicit "Do not
+   retry this call — it already succeeded" warning instead of a hard
+   failure, since the SQLite row is already durably committed.
+2. **SEVERE, phantom empty store.** `Store` now takes
+   `must_exist=True` for registered-store opens (`overdue
+   --all-projects`, `sync --all-projects`) and refuses with a clear
+   hint instead of fabricating a new empty db when the registered path
+   is gone.
+3. **Registry corruption aborts the whole multi-project call.** The
+   `mkdir` call that could raise a non-`sqlite3.Error` (e.g. embedded
+   null byte) now lives inside the same try/except as the rest of
+   `Store.__init__`, so `cmd_overdue`/`overdue_tasks`/`_cmd_sync_all_projects`
+   wrap it into a per-project error line and keep going, per the
+   docstring's existing promise.
+4. **Relative-path registry typo writes a stray db into cwd.**
+   Registry entries are now validated as absolute paths before use;
+   a relative entry is reported as an invalid-registry-line error
+   instead of being opened verbatim.
+5. **`register` silently merges projects when `CADENCE_DB_PATH` is
+   unset.** `register_project` now raises `AmbiguousProject` with a
+   concrete next step (set `CADENCE_DB_PATH` first) instead of
+   registering the single global default store.
+
+Regression tests for all 5 in `tests/test_0212_severe_findings.py`,
+confirmed failing pre-fix (house convention). Full suite: `python -m
+pytest -q` → **141 passed**, run in this session against the same
+`/workspace/cadence_push` checkout at `1af1f06`. Version bumped to
+0.2.13; CI green on `1af1f06` (both `CI` and `Publish` workflows,
+`https://github.com/dominicplouffe/Cadence/actions`, run for commit
+`1af1f06`, conclusion `success`); `cadence-todo==0.2.13` confirmed live
+on PyPI (`https://pypi.org/pypi/cadence-todo/json` → `info.version`
+`"0.2.13"`, `releases` includes `"0.2.13"`).
+
+### Re-verification: Dov's exact repro steps, re-run against the real published `cadence-todo==0.2.13` wheel
+
+Fresh venv (`python3 -m venv /workspace/pypi_e2e_venv_0213 && pip
+install cadence-todo==0.2.13`), no repo checkout on `sys.path` —
+`pip show cadence-todo` confirms `Version: 0.2.13` installed from
+PyPI, not editable.
+
+**Finding #1 repro (10 concurrent `cadence add`s), verbatim:**
+```
+$ for i in $(seq 1 10); do ( cadence add "cli-$i" > out_$i.txt 2>&1; echo "exit=$?" >> out_$i.txt ) & done; wait
+$ grep -L '^Added' out_*.txt        # files that did NOT start with "Added"
+(no output — all 10 started with "Added")
+$ cadence list
+  [ ]    1   cli-6
+  [ ]    2   cli-7
+  [ ]    3   cli-2
+  [ ]    4   cli-3
+  [ ]    5   cli-5
+  [ ]    6   cli-10
+  [ ]    7   cli-8
+  [ ]    8   cli-4
+  [ ]    9   cli-1
+  [ ]   10   cli-9
+$ cadence why 1
+#1 cli-6 — history (newest first):
+  -  none     just now     Created
+$ find /tmp/x1 -iname "*.lock"
+(none — no leftover lock)
+```
+All 10 succeeded (`exit=0`), all 10 have real history — no repeat of
+the original bug at this contention level. Pushed harder (30 more
+concurrent adds against the same store, 40 total) to force the retry
+budget to actually exhaust at least once, and got the new
+success-with-degraded-history path live, verbatim from one of the 30
+output files:
+```
+Added #25: stress-16
+Warning: Task #25 was created; its history entry failed to record (git commit failed: fatal: cannot lock ref 'HEAD': is at 41a7eee7483a18e5aa73461fa05013944cb4444a but expected 04dfdd371baa2e791958b9c91ee33a133fd89245). Do not retry this call -- it already succeeded. Run 'cadence why 25' to check, or file a bug.
+exit=0
+```
+5 of the 30 hit this path under real contention; **all 30 exited 0**
+(`grep -l "exit=[^0]" out2_*.txt` → no matches), and each degraded one
+says explicitly "it already succeeded" and "do not retry" — the exact
+fix the finding asked for: never tell the caller a successful write
+failed.
+
+**Finding #2 repro (deleted registered project), verbatim:**
+```
+$ cd proj-a && CADENCE_DB_PATH=$PWD/cadence.db cadence add "real task" --due 2020-01-01
+Added #1: real task
+$ CADENCE_DB_PATH=$PWD/cadence.db cadence register
+Registered /tmp/x2/proj-a/cadence.db (as 'proj-a').
+$ cd .. && rm -rf proj-a
+$ cadence overdue --all-projects
+proj-a      Error: no store found at registered path '/tmp/x2/proj-a/cadence.db'. The project directory may have been deleted or moved. Re-run 'cadence register' from its new location, or remove the stale entry from the registry by hand.
+0 overdue across 0 of 1 registered project checked (1 could not be opened; see errors above).
+exit=0
+$ ls /tmp/x2
+config
+```
+No phantom `proj-a/cadence.db` recreated (was silently recreated
+pre-fix); explicit per-project warning; the "0 of 1 registered project
+checked" wording makes the phantom-zero impossible to mistake for a
+real zero.
+
+**Finding #3 repro (embedded-null-byte registry line), verbatim:**
+```
+$ python3 -c "open('$CADENCE_CONFIG_HOME/projects.txt','ab').write(b'/tmp/gar\x00bage/cadence.db\n')"
+$ cadence overdue --all-projects
+gar bage    Error: no store found at registered path '/tmp/gar bage/cadence.db'. The project directory may have been deleted or moved. Re-run 'cadence register' from its new location, or remove the stale entry from the registry by hand.
+0 overdue across 1 of 2 registered projects checked (1 could not be opened; see errors above).
+exit=0
+$ cadence sync --all-projects
+proj-good   Error: no remote configured for sync. Run: cadence sync --remote <path>
+gar bage    Error: no store found at registered path '/tmp/gar bage/cadence.db'. The project directory may have been deleted or moved. Re-run 'cadence register' from its new location, or remove the stale entry from the registry by hand.
+exit=0
+```
+Both commands now report the bad line as one per-project error and
+keep going for the good project (`proj-good`), instead of aborting the
+whole call with zero output for anything else, as documented.
+
+**Finding #4 repro (relative-path registry line), verbatim:**
+```
+$ printf 'not-a-real-path-relative\n' >> "$CADENCE_CONFIG_HOME/projects.txt"
+$ cd /tmp/x4/rundir && cadence overdue --all-projects
+not-a-real-path-relative  Error: registered path 'not-a-real-path-relative' is not absolute. This registry entry is invalid. Re-run 'cadence register' from that project directory, or edit the registry file by hand to remove the bad line.
+0 overdue across 0 of 1 registered project checked (1 could not be opened; see errors above).
+exit=0
+$ ls -la /tmp/x4/rundir
+total 8
+drwxr-xr-x 2 agent agent 4096 Aug 31 09:22 .
+drwxr-xr-x 4 agent agent 4096 Aug 31 09:22 ..
+```
+No stray file written into `rundir` (pre-fix, a file literally named
+`not-a-real-path-relative` appeared here); clear "is not absolute"
+error instead.
+
+**Finding #5 repro (register from two dirs, no `CADENCE_DB_PATH`), verbatim:**
+```
+$ cd proj-x && cadence add "task from proj-x" && cadence register
+Added #1: task from proj-x
+Error: CADENCE_DB_PATH is not set, so there's no per-project store path to register. Registering the single global default store (/home/agent/.cadence/cadence.db) here would silently merge with any other directory that also runs 'cadence register' without CADENCE_DB_PATH set. Set CADENCE_DB_PATH to a path inside this project first, e.g. 'export CADENCE_DB_PATH=$PWD/cadence.db', then run 'cadence register' again.
+$ cd ../proj-y && cadence add "task from proj-y" && cadence register
+Added #2: task from proj-y
+Error: CADENCE_DB_PATH is not set, so there's no per-project store path to register. Registering the single global default store (/home/agent/.cadence/cadence.db) here would silently merge with any other directory that also runs 'cadence register' without CADENCE_DB_PATH set. Set CADENCE_DB_PATH to a path inside this project first, e.g. 'export CADENCE_DB_PATH=$PWD/cadence.db', then run 'cadence register' again.
+$ cat "$CADENCE_CONFIG_HOME/projects.txt"
+cat: /tmp/x5/config/projects.txt: No such file or directory
+```
+`register` now refuses (`AmbiguousProject`, exit 1) with a concrete
+next step instead of silently collapsing both directories onto the
+one global store — the registry file isn't even created, vs. pre-fix
+getting one merged entry for both.
+
+### Not re-checked this pass
+
+Findings #6 (HTTP-envelope-level errors bypass cadence's own
+`{ok,error,message,hint}` shape) and #7 (`serverInfo.version` reports
+the `mcp` SDK's version, not Cadence's) were flagged MINOR/legibility
+and explicitly marked "not blocking" on the task that produced this
+fix — left open for a future pass, not silently dropped.
+
+**Result: all 5 findings from the 2026-08-31 Red Team entry above are
+fixed and independently re-confirmed against the real
+`cadence-todo==0.2.13` package installed from PyPI in a fresh venv, not
+the local checkout.**
