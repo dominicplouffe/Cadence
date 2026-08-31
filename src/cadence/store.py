@@ -16,7 +16,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from cadence.history import GitHistory
+from cadence.history import GitHistory, HistoryError
 
 ### Priority values match docs/human-surface.md exactly ("high"/"med"/"low");
 ### a task may also carry no priority at all (None), which is the default.
@@ -88,6 +88,55 @@ class StoreUnavailable(CadenceError):
     error per docs/human-surface.md §4.4 (exit code 2, not 1)."""
 
     code = "store_unavailable"
+
+
+class AmbiguousProject(CadenceError):
+    """0.2.12 Red Team finding #5: `register` refuses to register the
+    unscoped global default store. default_db_path() is NOT cwd-scoped --
+    it resolves to the same ~/.cadence/cadence.db (or CADENCE_HOME
+    override) no matter which directory it's called from -- so silently
+    registering it would collapse every project directory that hasn't set
+    CADENCE_DB_PATH into a single shared registry entry, exactly
+    contradicting `register`'s own "once per project" framing
+    (mcp_server.py's `initialize` instructions and registry.py's own
+    docstring both say so). This is a bad-input/missing-config situation
+    (exit code 1), not an internal store failure."""
+
+    code = "ambiguous_project"
+
+
+class HistoryDegraded(Exception):
+    """0.2.12 Red Team finding #1: raised by _snapshot_and_commit only when
+    the git history-repo commit step still can't get past lock contention
+    even after history.py's own bounded retry -- real, sustained
+    multi-writer contention, not the momentary race the retry already
+    absorbs. By the time this can ever be raised, the SQLite row for
+    every task in `tasks` has ALREADY been durably committed (every
+    mutator commits to sqlite first, then calls _snapshot_and_commit) --
+    so this is never "the write failed"; it is "the write succeeded, but
+    its audit-trail entry could not be recorded". Deliberately NOT a
+    CadenceError: existing `except CadenceError` call sites must not
+    treat this as an ordinary failure (that was the original bug -- a
+    caller trusting a hard failure signal here would retry into a silent
+    duplicate). CLI/MCP callers catch this specifically and report
+    SUCCESS with an explicit degraded-history warning instead."""
+
+    def __init__(self, tasks: list["Task"], reason: str):
+        self.tasks = tasks
+        self.reason = reason
+        super().__init__(reason)
+
+
+def history_degraded_warning(task_id: int, verb: str, reason: str) -> str:
+    """Shared wording for the CLI/MCP degraded-history warning (Noor's
+    design note on 0.2.12 finding #1): explicit about what happened, and
+    explicit that retrying is the wrong move, so an agent or person
+    reading only this string has everything it needs."""
+    return (
+        f"Task #{task_id} was {verb}; its history entry failed to record "
+        f"({reason}). Do not retry this call -- it already succeeded. "
+        f"Run 'cadence why {task_id}' to check, or file a bug."
+    )
 
 
 class SyncInconsistent(CadenceError):
@@ -174,10 +223,49 @@ class Task:
 class Store:
     """Thin wrapper around a SQLite file holding one `tasks` table."""
 
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(self, db_path: Optional[Path] = None, must_exist: bool = False):
         self.db_path = Path(db_path) if db_path else default_db_path()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if must_exist:
+            # Multi-project callers (overdue/sync --all-projects) open a
+            # REGISTERED store read-only -- unlike a normal Store() call,
+            # which legitimately creates a fresh store on first use, this
+            # is never "first use": the path came from a prior
+            # `cadence register`. Silently fabricating it here would mask
+            # a deleted/moved project as an empty, valid one (0.2.12 Red
+            # Team finding #2), and a relative-path typo hand-edited into
+            # the registry would silently write a stray db file into
+            # whatever directory the multi-project command happens to run
+            # from (finding #4). Both are checked BEFORE any filesystem
+            # side effect, so a bad registry entry never touches disk.
+            if not self.db_path.is_absolute():
+                raise StoreUnavailable(
+                    f"registered path '{self.db_path}' is not absolute",
+                    hint=(
+                        "This registry entry is invalid. Re-run 'cadence "
+                        "register' from that project directory, or edit "
+                        "the registry file by hand to remove the bad line."
+                    ),
+                )
+            if not self.db_path.exists():
+                raise StoreUnavailable(
+                    f"no store found at registered path '{self.db_path}'",
+                    hint=(
+                        "The project directory may have been deleted or "
+                        "moved. Re-run 'cadence register' from its new "
+                        "location, or remove the stale entry from the "
+                        "registry by hand."
+                    ),
+                )
         try:
+            # mkdir lives inside this try (0.2.12 Red Team finding #3):
+            # a bad CADENCE_DB_PATH / registry entry (e.g. one containing
+            # an embedded null byte) can make mkdir itself raise
+            # OSError/ValueError, which used to escape uncaught straight
+            # past every "except CadenceError" call site -- aborting a
+            # whole --all-projects loop instead of reporting one bad
+            # project and continuing, contradicting that call's own
+            # documented per-project-error contract.
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
             with closing(self._connect()) as conn:
                 conn.execute(SCHEMA)
                 # Migration for stores created before parent_id existed
@@ -201,11 +289,15 @@ class Store:
                             (uuid.uuid4().hex, row["id"]),
                         )
                 conn.commit()
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, OSError, ValueError) as exc:
             # e.g. CADENCE_DB_PATH points at a directory ("unable to open
             # database file") or a non-sqlite file ("file is not a
             # database") -- both otherwise surface as a raw sqlite3
             # traceback on every command (Red Team pass-1 finding #2).
+            # OSError/ValueError (e.g. an embedded null byte reaching
+            # mkdir, now inside this same try -- finding #3 above) get the
+            # identical treatment: one clean CadenceError shape regardless
+            # of which layer under the store actually objected.
             raise StoreUnavailable(
                 f"can't open the task store at '{self.db_path}' ({exc})",
                 hint="Check CADENCE_DB_PATH, or unset it to use the default store.",
@@ -351,7 +443,18 @@ class Store:
             hist.write_task_file(t.to_full_dict())
         if reason:
             message = f"{message}\n\nReason: {reason}\nSource: {source or 'cli'}"
-        hist.commit(message)
+        try:
+            hist.commit(message)
+        except HistoryError as exc:
+            # 0.2.12 Red Team finding #1: every caller of
+            # _snapshot_and_commit has already committed `tasks` to
+            # SQLite by this point -- see each mutator below -- so a
+            # failure here must never look like the whole call failed.
+            # history.py's own bounded retry (GitHistory._git) already
+            # absorbed the ordinary transient race; reaching this except
+            # means it's still contended after that, which is worth
+            # surfacing, but as a degraded-success signal, not a lie.
+            raise HistoryDegraded(tasks, str(exc)) from exc
 
     def add(
         self,

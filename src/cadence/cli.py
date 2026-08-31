@@ -46,10 +46,12 @@ from cadence.registry import (
 )
 from cadence.store import (
     CadenceError,
+    HistoryDegraded,
     MAX_TITLE_LEN,
     Store,
     StoreUnavailable,
     VALID_PRIORITIES,
+    history_degraded_warning,
 )
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -221,6 +223,16 @@ def cmd_add(args: argparse.Namespace) -> int:
     store = Store()
     try:
         task = store.add(args.text, due=due, priority=args.priority)
+    except HistoryDegraded as exc:
+        # 0.2.12 Red Team finding #1: the task WAS created (SQLite already
+        # committed before history recording was even attempted) -- this
+        # must read as success, with an explicit warning, never as the
+        # failure it used to look like (which invited a caller to retry
+        # into a silent duplicate).
+        task = exc.tasks[0]
+        print(f"Added #{task.id}: {task.title}")
+        print(f"Warning: {history_degraded_warning(task.id, 'created', exc.reason)}")
+        return 0
     except CadenceError as exc:
         # §4.4: code 2 is reserved for internal/store failures; everything
         # store.add() can otherwise raise (bad title/priority/due that slipped
@@ -277,7 +289,10 @@ def cmd_register(args: argparse.Namespace) -> int:
     `overdue --all-projects` / `sync --all-projects` can find it.
     Idempotent -- running this twice in the same directory (same resolved
     CADENCE_DB_PATH) never duplicates the registry entry."""
-    path, already = register_project()
+    try:
+        path, already = register_project()
+    except CadenceError as exc:
+        _err(_format_err(exc))
     name = project_name(path)
     if already:
         print(f"Already registered: {path} (as '{name}').")
@@ -330,26 +345,53 @@ def cmd_overdue(args: argparse.Namespace) -> int:
     for path in entries:
         name = project_name(path)
         try:
-            store = Store(db_path=Path(path))
+            store = Store(db_path=Path(path), must_exist=True)
         except CadenceError as exc:
             rows.append((name, None, _format_err(exc)))
+            continue
+        except Exception as exc:
+            # 0.2.12 Red Team finding #3: a registry entry that raises
+            # something other than CadenceError (e.g. an embedded null
+            # byte) must not abort every other, perfectly valid
+            # registered project's overdue check -- same per-project-error
+            # contract as _cmd_sync_all_projects and the MCP overdue_tasks
+            # tool already apply.
+            rows.append((
+                name, None,
+                f"something went wrong opening this project's store "
+                f"({type(exc).__name__}: {exc}).",
+            ))
             continue
         for t in store.list(status="pending"):
             if t.due and _days_overdue(t.due) > 0:
                 rows.append((name, t, None))
     name_w = max([len(r[0]) for r in rows] + [10])
     overdue_count = sum(1 for r in rows if r[1] is not None)
+    error_count = sum(1 for r in rows if r[2] is not None)
     for name, task, err in rows:
         if err is not None:
             print(f"{name:<{name_w}}  Error: {err}")
         else:
             print(_overdue_row(name, name_w, task))
     plural = "" if len(entries) == 1 else "s"
-    print(
-        f"{overdue_count} overdue across {len(entries)} registered "
-        f"project{plural}. Run 'cadence register' in a project directory "
-        "to add another."
-    )
+    if error_count:
+        # 0.2.12 Red Team findings #2/#3: never fold an errored project's
+        # unknown overdue state into the same clean "N overdue" summary a
+        # fully-successful check would print -- that reads as a real
+        # answer when part of it is actually "couldn't check", which is
+        # exactly the silent-data-loss shape those findings caught.
+        ok_count = len(entries) - error_count
+        print(
+            f"{overdue_count} overdue across {ok_count} of {len(entries)} "
+            f"registered project{plural} checked ({error_count} could not "
+            "be opened; see errors above)."
+        )
+    else:
+        print(
+            f"{overdue_count} overdue across {len(entries)} registered "
+            f"project{plural}. Run 'cadence register' in a project directory "
+            "to add another."
+        )
     return 0
 
 
@@ -358,6 +400,11 @@ def cmd_done(args: argparse.Namespace) -> int:
     store = Store()
     try:
         task = store.complete(task_id)
+    except HistoryDegraded as exc:
+        task = exc.tasks[0]
+        print(f"Done #{task.id}: {task.title}")
+        print(f"Warning: {history_degraded_warning(task.id, 'marked done', exc.reason)}")
+        return 0
     except CadenceError as exc:
         _err(_format_err(exc))
     print(f"Done #{task.id}: {task.title}")
@@ -372,6 +419,11 @@ def cmd_schedule(args: argparse.Namespace) -> int:
     store = Store()
     try:
         task = store.schedule(task_id, due, reason=args.reason, source="cli")
+    except HistoryDegraded as exc:
+        task = exc.tasks[0]
+        print(f"Scheduled #{task.id} for {due}: {task.title}")
+        print(f"Warning: {history_degraded_warning(task.id, 'scheduled', exc.reason)}")
+        return 0
     except CadenceError as exc:
         _err(_format_err(exc))
     print(f"Scheduled #{task.id} for {due}: {task.title}")
@@ -383,6 +435,12 @@ def cmd_decompose(args: argparse.Namespace) -> int:
     store = Store()
     try:
         parent, children = store.decompose(task_id, args.into or [], reason=args.reason, source="cli")
+    except HistoryDegraded as exc:
+        parent, children = exc.tasks[0], exc.tasks[1:]
+        ids = ", ".join(f"#{c.id}" for c in children)
+        print(f"Decomposed #{parent.id} into {len(children)} subtasks: {ids}")
+        print(f"Warning: {history_degraded_warning(parent.id, 'decomposed', exc.reason)}")
+        return 0
     except CadenceError as exc:
         _err(_format_err(exc))
     ids = ", ".join(f"#{c.id}" for c in children)
@@ -396,6 +454,11 @@ def cmd_reprioritise(args: argparse.Namespace) -> int:
     try:
         old = store.get(task_id)
         task = store.reprioritise(task_id, args.priority, reason=args.reason, source="cli")
+    except HistoryDegraded as exc:
+        task = exc.tasks[0]
+        print(f"Reprioritised #{task.id} ({old.priority or 'none'} → {task.priority}): {task.title}")
+        print(f"Warning: {history_degraded_warning(task.id, 'reprioritised', exc.reason)}")
+        return 0
     except CadenceError as exc:
         _err(_format_err(exc))
     print(f"Reprioritised #{task.id} ({old.priority or 'none'} → {task.priority}): {task.title}")
@@ -573,10 +636,21 @@ def _cmd_sync_all_projects(args: argparse.Namespace) -> int:
                 )
                 continue
         try:
-            store = Store(db_path=Path(path))
+            store = Store(db_path=Path(path), must_exist=True)
             result = store.sync(remote=remote_arg)
         except CadenceError as exc:
             print(f"{name:<{name_w}}  Error: {_format_err(exc)}")
+            continue
+        except Exception as exc:
+            # 0.2.12 Red Team finding #3: a registry entry that raises
+            # something other than CadenceError (e.g. an embedded null
+            # byte) must not abort every other, perfectly valid
+            # registered project's sync -- same per-project-error
+            # contract as the CadenceError branch above.
+            print(
+                f"{name:<{name_w}}  Error: something went wrong opening "
+                f"this project's store ({type(exc).__name__}: {exc})."
+            )
             continue
         if result["already_synced"]:
             print(f"{name:<{name_w}}  Already in sync with origin. Nothing to pull or push.")

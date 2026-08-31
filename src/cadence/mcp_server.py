@@ -22,7 +22,14 @@ from pydantic import ValidationError as _PydanticValidationError
 
 from cadence.registry import project_name, read_projects_file, read_registry
 from cadence.registry import register_project as _register_project
-from cadence.store import CadenceError, InvalidTask, MAX_TITLE_LEN, Store
+from cadence.store import (
+    CadenceError,
+    HistoryDegraded,
+    InvalidTask,
+    MAX_TITLE_LEN,
+    Store,
+    history_degraded_warning,
+)
 
 mcp = FastMCP(
     "cadence",
@@ -45,16 +52,39 @@ mcp = FastMCP(
         "in one call. export_tasks returns every task, open and done. "
         "register_project adds this store (its current CADENCE_DB_PATH) to "
         "a cross-project registry so overdue_tasks(all_projects=true) and "
-        "sync_tasks(all_projects=true) can find it -- call this once per "
-        "project before using either. All tools return {ok, ...}; on "
-        "ok=false, read `error` and `hint` and retry with corrected input "
-        "rather than giving up."
+        "sync_tasks(all_projects=true) can find it -- call it once per "
+        "distinct CADENCE_DB_PATH you use (two projects that never set "
+        "CADENCE_DB_PATH share this machine's one default store, so "
+        "registering both from there just re-registers that same store) "
+        "before using either. All tools return {ok, ...}; on ok=false, "
+        "read `error` and `hint` and retry with corrected input rather "
+        "than giving up. A write tool (add_task/complete_task/"
+        "schedule_task/decompose_task/reprioritise_task) can rarely come "
+        "back ok=true with history_recorded=false: the task itself was "
+        "saved, only its audit-trail entry wasn't -- read `warning`, do "
+        "NOT retry the call (it already succeeded; retrying would create "
+        "a duplicate)."
     ),
 )
 
 
 def _err(exc: CadenceError) -> dict:
     return {"ok": False, "error": exc.code, "message": exc.message, "hint": exc.hint}
+
+
+def _degraded(task, verb: str, reason: str) -> dict:
+    """0.2.12 Red Team finding #1: `task` was already durably written --
+    this is SUCCESS with a degraded audit trail, never `ok: false`. An
+    agent that only branches on `ok` (per this server's own `initialize`
+    instructions) sees success and moves on instead of retrying into a
+    silent duplicate; `history_recorded: false` + `warning` are there for
+    an agent (or person) that reads further."""
+    return {
+        "ok": True,
+        "task": task.to_dict(),
+        "history_recorded": False,
+        "warning": history_degraded_warning(task.id, verb, reason),
+    }
 
 
 def _err_unexpected(exc: Exception) -> dict:
@@ -99,6 +129,8 @@ def add_task(
             )
         task = Store().add(title, due=due, priority=priority)
         return {"ok": True, "task": task.to_dict()}
+    except HistoryDegraded as exc:
+        return _degraded(exc.tasks[0], "created", exc.reason)
     except CadenceError as exc:
         return _err(exc)
     except Exception as exc:
@@ -142,6 +174,8 @@ def register_project() -> dict:
     try:
         path, already = _register_project()
         return {"ok": True, "path": path, "already_registered": already}
+    except CadenceError as exc:
+        return _err(exc)
     except Exception as exc:
         return _err_unexpected(exc)
 
@@ -184,9 +218,18 @@ def overdue_tasks(all_projects: bool = False) -> dict:
         for path in entries:
             name = project_name(path)
             try:
-                store = Store(db_path=path)
+                store = Store(db_path=path, must_exist=True)
             except CadenceError as exc:
                 rows.append({"project": name, "error": exc.code, "message": exc.message, "hint": exc.hint})
+                continue
+            except Exception as exc:
+                # 0.2.12 Red Team finding #3: never let one bad registry
+                # entry abort the whole multi-project call.
+                rows.append({
+                    "project": name, "error": "internal_error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "hint": "Check the registry for a corrupt entry and remove it by hand if needed.",
+                })
                 continue
             for t in store.list(status="pending"):
                 if t.due and _days_overdue(t.due) > 0:
@@ -217,6 +260,8 @@ def complete_task(id: int) -> dict:
     try:
         task = Store().complete(id)
         return {"ok": True, "task": task.to_dict()}
+    except HistoryDegraded as exc:
+        return _degraded(exc.tasks[0], "marked done", exc.reason)
     except CadenceError as exc:
         return _err(exc)
     except Exception as exc:
@@ -242,6 +287,8 @@ def schedule_task(id: int, due: str, reason: Optional[str] = None) -> dict:
     try:
         task = Store().schedule(id, due, reason=reason, source="mcp")
         return {"ok": True, "task": task.to_dict()}
+    except HistoryDegraded as exc:
+        return _degraded(exc.tasks[0], "scheduled", exc.reason)
     except CadenceError as exc:
         return _err(exc)
     except Exception as exc:
@@ -277,6 +324,15 @@ def decompose_task(id: int, into: list[str], reason: Optional[str] = None) -> di
             "parent": parent.to_dict(),
             "subtasks": [c.to_dict() for c in children],
         }
+    except HistoryDegraded as exc:
+        parent, children = exc.tasks[0], exc.tasks[1:]
+        return {
+            "ok": True,
+            "parent": parent.to_dict(),
+            "subtasks": [c.to_dict() for c in children],
+            "history_recorded": False,
+            "warning": history_degraded_warning(parent.id, "decomposed", exc.reason),
+        }
     except CadenceError as exc:
         return _err(exc)
     except Exception as exc:
@@ -306,6 +362,8 @@ def reprioritise_task(id: int, priority: str, reason: Optional[str] = None) -> d
     try:
         task = Store().reprioritise(id, priority, reason=reason, source="mcp")
         return {"ok": True, "task": task.to_dict()}
+    except HistoryDegraded as exc:
+        return _degraded(exc.tasks[0], "reprioritised", exc.reason)
     except CadenceError as exc:
         return _err(exc)
     except Exception as exc:
@@ -457,7 +515,7 @@ def sync_tasks(remote: Optional[str] = None, all_projects: bool = False) -> dict
                 )
                 continue
         try:
-            result = Store(db_path=path).sync(remote=remote_arg)
+            result = Store(db_path=path, must_exist=True).sync(remote=remote_arg)
             results.append({"project": name, "ok": True, **result})
         except CadenceError as exc:
             results.append({"project": name, "ok": False, "error": exc.code, "message": exc.message, "hint": exc.hint})

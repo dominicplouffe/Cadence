@@ -17,7 +17,7 @@ import stat
 from pathlib import Path
 from typing import Optional
 
-from cadence.store import default_db_path
+from cadence.store import AmbiguousProject, default_db_path
 
 
 def config_home() -> Path:
@@ -61,13 +61,33 @@ def read_registry() -> list[str]:
 
 def register_project(db_path: Optional[Path] = None) -> tuple[str, bool]:
     """Append the resolved, absolute form of db_path (default: the
-    current CADENCE_DB_PATH / default store) to the registry, unless it's
-    already there.
+    current CADENCE_DB_PATH) to the registry, unless it's already there.
 
     Returns (resolved_path_str, already_registered) -- idempotent: running
     this twice in the same directory (same resolved CADENCE_DB_PATH)
     never duplicates the entry.
+
+    Raises AmbiguousProject if db_path is None and CADENCE_DB_PATH is not
+    set: falling through to default_db_path() here would register the one
+    global default store regardless of the calling directory (0.2.12 Red
+    Team finding #5) -- there is no per-cwd default store convention to
+    fall back on, so this is refused rather than silently collapsing
+    distinct project directories onto one registry entry.
     """
+    if db_path is None and not os.environ.get("CADENCE_DB_PATH"):
+        raise AmbiguousProject(
+            "CADENCE_DB_PATH is not set, so there's no per-project store "
+            "path to register",
+            hint=(
+                "Registering the single global default store "
+                f"({default_db_path()}) here would silently merge with "
+                "any other directory that also runs 'cadence register' "
+                "without CADENCE_DB_PATH set. Set CADENCE_DB_PATH to a "
+                "path inside this project first, e.g. "
+                "'export CADENCE_DB_PATH=$PWD/cadence.db', then run "
+                "'cadence register' again."
+            ),
+        )
     target = str(Path(db_path or default_db_path()).expanduser().resolve())
     existing = read_registry()
     if target in existing:

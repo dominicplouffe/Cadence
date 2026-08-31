@@ -24,16 +24,40 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
 _GIT_IDENTITY = ["-c", "user.email=cadence@local", "-c", "user.name=Cadence"]
 
+### 0.2.12 Red Team finding #1: two writers touching the same store at once
+### (e.g. a CLI `add` racing an MCP `add_task`, or two concurrent CLI
+### processes) can both reach for this repo's `.git/index.lock` (or a ref
+### lock) at nearly the same instant. Git itself holds that lock only for
+### the few milliseconds an `add`/`commit`/`update-ref` actually takes, so
+### this is real, transient, same-machine contention -- not a genuine
+### multi-host conflict -- and a short bounded retry resolves it in every
+### case Red Team's 10-concurrent-process repro produced. Total worst-case
+### wait across all attempts is a few seconds, never unbounded.
+_LOCK_RETRY_ATTEMPTS = 10
+_LOCK_RETRY_BASE_DELAY = 0.05
+_LOCK_RETRY_MAX_DELAY = 0.5
+
 
 class HistoryError(Exception):
     pass
+
+
+def _is_lock_contention(stderr: str) -> bool:
+    """True for git's own "another process is holding this lock" wording
+    (index.lock, or a ref lock like refs/heads/main.lock) -- never for any
+    other failure, so a genuine problem (corrupt repo, bad ref, etc.)
+    still fails immediately instead of retrying pointlessly for seconds."""
+    s = (stderr or "").lower()
+    return ".lock" in s and "file exists" in s
 
 
 class GitHistory:
@@ -43,12 +67,27 @@ class GitHistory:
 
     # -- plumbing -----------------------------------------------------
     def _git(self, *args, check=True, env=None):
-        result = subprocess.run(
-            ["git", "-C", str(self.repo_dir), *_GIT_IDENTITY, *args],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        attempt = 0
+        while True:
+            result = subprocess.run(
+                ["git", "-C", str(self.repo_dir), *_GIT_IDENTITY, *args],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if (
+                result.returncode != 0
+                and attempt < _LOCK_RETRY_ATTEMPTS
+                and _is_lock_contention(result.stderr)
+            ):
+                # Bounded exponential backoff + jitter, so many concurrent
+                # losers of the same race don't all retry in lockstep and
+                # collide again.
+                delay = min(_LOCK_RETRY_BASE_DELAY * (2 ** attempt), _LOCK_RETRY_MAX_DELAY)
+                time.sleep(delay + random.uniform(0, delay / 2))
+                attempt += 1
+                continue
+            break
         if check and result.returncode != 0:
             raise HistoryError(
                 f"git {' '.join(args)} failed: {result.stderr.strip()}"
