@@ -1901,3 +1901,40 @@ real exposure, because Cloudflare's edge filters malformed/mismatched
 Host before Cadence sees it — testing must also go direct-to-origin to
 exercise `transport_security` itself. Tunnel and server torn down after
 capture.
+
+## 2026-09-01 (Rafael Okonkwo, Build) — first-ever-sync false conflict, found live with the chairman
+
+The chairman ran a real two-client sync demo on 2026-08-31: add a task on
+the laptop, sync it to the phone, mark it done on the phone, sync back to
+the laptop. `cadence sync` on the laptop reported "1 conflict needs you" —
+even though the laptop had never touched that task since creating it; only
+the phone had edited it. This is exactly the failure the constitution's
+dogfooding clause exists to surface: it did not show up in any test we had
+written, only in a real session with a real second client.
+
+Root cause: `_sync_diff_and_apply` only knows a client's own prior sync base
+once it has completed a sync before. On a client's very *first* sync there
+is no prior base, so the code fell back to treating the base as empty for
+every task — which makes any task known to both sides look like it changed
+on both sides, even when one side is byte-identical to what it created and
+never touched again. Two untouched-on-one-side edits got flagged as a
+conflict needing a human referee, when only genuine both-sides-since-a-
+shared-point edits should ever require that.
+
+Fix (`src/cadence/store.py`): on a first-ever sync, reconstruct each shared
+task's own creation-time content from this client's own git history (the
+oldest commit touching that task) and diff against that instead of an empty
+snapshot — scoped narrowly to the "both sides already know this task"
+branch so brand-new-to-this-side tasks still push/pull unconditionally.
+New regression test `test_sync_first_ever_sync_does_not_false_conflict_on_untouched_task`
+reproduces the chairman's exact transcript and fails against the old code.
+
+Shipped as cadence-todo 0.2.16 (commit 6a6a4dc). Re-ran the chairman's exact
+sequence live against the real published PyPI wheel (fresh venv, two
+independent `CADENCE_DB_PATH` stores as device A/device B, no local checkout
+on `PATH`): add on A, first sync from B pulls it, B marks done, first sync
+from A pulls the completion. Result: `Synced with origin: pulled 1, pushed
+0. Up to date.` both times — 0 conflicts, and A shows the task done after
+its own first sync. Full transcript captured at the time of this entry.
+CI run 33502764390 (commit 6a6a4dc) green on all 4 jobs including the
+install-from-PyPI end-to-end job.
