@@ -997,6 +997,34 @@ class Store:
         origin is never part of that contract (see Task.to_dict)."""
         return {k: v for k, v in data.items() if k != "origin"}
 
+    @staticmethod
+    def _first_sync_task_base(hist: GitHistory, task_id: int) -> Optional[dict]:
+        """This client's own creation-time content for local id
+        `task_id`, used ONLY as a stand-in base for the "both sides
+        already know this origin" branch of `_sync_diff_and_apply` on a
+        client's first-ever sync (no refs/cadence/sync-base commit yet
+        -- see the call site). Every task file this client has ever
+        written -- add, complete, schedule, decompose, undo, or an
+        earlier (possibly still-conflicted) sync's pull -- is committed
+        to this client's own git history one file per id, so the OLDEST
+        commit that ever touched tasks/<id>.json is exactly the content
+        this row would have carried into a sync had one happened the
+        moment this client first came to hold it. Returns None (never a
+        crash) for an id with no history at all (pre-migration row);
+        the caller then falls back to the prior "no base known"
+        behaviour for that one origin only."""
+        relpath = f"tasks/{task_id}.json"
+        commits = hist.log_for_file(relpath)
+        if not commits:
+            return None
+        content = hist.show_file(commits[-1], relpath)
+        if not content:
+            return None
+        try:
+            return json.loads(content)
+        except ValueError:
+            return None
+
     def _sync_diff_and_apply(self, hist: GitHistory, theirs_ref: str) -> dict:
         """Structural sync-identity fix (task
         task_01a04b9b39057fc952517775, spec
@@ -1063,13 +1091,29 @@ class Store:
             m, t, b = mine_by_o.get(o), theirs_by_o.get(o), base_by_o.get(o)
             m_fp = self._content_fingerprint(m) if m is not None else None
             t_fp = self._content_fingerprint(t) if t is not None else None
-            b_fp = self._content_fingerprint(b) if b is not None else None
 
             if m is not None and t is not None and m_fp == t_fp:
                 continue  # same content already, whatever id each side shows it under
             if m is None and t is None:
                 continue
 
+            # Chairman demo, 2026-08-31 (docs/dogfooding-log.md): on this
+            # client's FIRST-EVER sync (no refs/cadence/sync-base commit
+            # yet) `b` is always None here, which used to make ANY row
+            # both sides already know (m and t both present) look
+            # "changed on both sides" -- even one this client has never
+            # touched since creating it. Scoped tightly to that one
+            # case (never to the t-is-None/m-is-None branches below,
+            # where "no base" correctly means "brand new, always
+            # push/pull"): a client can only already hold an origin
+            # before its own first sync by having created that row
+            # itself, so that row's own creation content -- read back
+            # from this client's own git log -- is the real base to
+            # diff against, not an empty one.
+            if b is None and base_ref is None and m is not None and t is not None:
+                b = self._first_sync_task_base(hist, m["id"])
+
+            b_fp = self._content_fingerprint(b) if b is not None else None
             mine_changed = m_fp != b_fp
             theirs_changed = t_fp != b_fp
 

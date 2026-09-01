@@ -503,6 +503,44 @@ def test_sync_remote_accepts_plain_db_path_and_converges(tmp_path):
     assert {t.id for t in store_b.list(status="all")} == {task_a.id, task_b.id}
 
 
+def test_sync_first_ever_sync_does_not_false_conflict_on_untouched_task(tmp_path):
+    """Chairman demo, 2026-08-31 (docs/dogfooding-log.md): laptop (A)
+    creates a task and never touches it again after that; phone (B)
+    pulls it on B's own first-ever sync, marks it done, and pushes; A
+    then runs `cadence sync` for the very first time ever (A had never
+    called sync() before -- only `add`, which just commits to A's own
+    local history) and pulls that completion. A must NOT see this as a
+    conflict -- A never edited the task since creating it, only B did.
+    Reproduces the exact false positive live-demoed to the chairman:
+    `cadence sync` reported "1 conflict needs you" on a task the laptop
+    had never touched."""
+    store_a = Store(db_path=tmp_path / "laptop.db")
+    store_b = Store(db_path=tmp_path / "phone.db")
+
+    task_a = store_a.add("Ship the fix")  # A: create, never touched again
+
+    # B's own first-ever sync: points straight at A's plain
+    # CADENCE_DB_PATH (the only address a real client can produce) and
+    # pulls the task. A itself has never called sync() at this point --
+    # A's task only exists via `add`'s own auto-commit to A's history.
+    r_b1 = store_b.sync(remote=str(store_a.db_path))
+    assert r_b1["conflicts"] == []
+    assert r_b1["pulled"] == 1
+
+    store_b.complete(task_a.id)
+
+    r_b2 = store_b.sync()  # remote already saved from the first call
+    assert r_b2["conflicts"] == []
+    assert r_b2["pushed"] == 1
+
+    # A's FIRST-EVER sync call: pulls B's completion. This is exactly
+    # the false-positive-conflict scenario -- A's own base_ref is None.
+    r_a = store_a.sync(remote=str(store_b.db_path))
+    assert r_a["conflicts"] == [], f"false conflict on A's first sync: {r_a}"
+    assert r_a["pulled"] == 1
+    assert store_a.get(task_a.id).status == "done"
+
+
 def test_sync_push_into_peer_that_only_ever_listed_bootstraps_and_succeeds(tmp_path):
     """R-08 re-verify Finding D
     (redteam_run7_0224/REDTEAM_PASS_0.2.4_sync_deep.md): a peer whose store
