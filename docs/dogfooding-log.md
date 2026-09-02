@@ -1938,3 +1938,71 @@ from A pulls the completion. Result: `Synced with origin: pulled 1, pushed
 its own first sync. Full transcript captured at the time of this entry.
 CI run 33502764390 (commit 6a6a4dc) green on all 4 jobs including the
 install-from-PyPI end-to-end job.
+
+## 2026-09-02 (Rafael Okonkwo, Build) — 0.2.12 findings #6 and #7 fixed
+
+The two legibility gaps from the 0.2.12 Red Team pass, left open at the
+time as "for a future pass" (see above): HTTP-transport-envelope-level
+malformed requests bypassing cadence's own error contract (#6), and
+`serverInfo.version` reporting the `mcp` SDK's version instead of
+Cadence's (#7). That future pass is this one.
+
+**Fix.** An ASGI shim (`_EnvelopeErrorShim` in `mcp_server.py`) now sits
+between `BearerAuth` and the raw `mcp` SDK's streamable-HTTP app. It
+buffers only error responses (status >= 400) and reshapes the SDK's raw
+JSON-RPC/plain-text error into cadence's `{ok, error, message, hint}`
+contract; success and SSE responses pass through untouched and
+unbuffered, so no live streaming reply is held up. `cadence.__version__`
+now reads back from the installed package's own metadata
+(`importlib.metadata.version("cadence-todo")`) instead of a hardcoded
+string, and `mcp._mcp_server.version` is set from it, so `initialize`'s
+`serverInfo.version` can no longer drift from the real release the way
+the old hardcoded "0.2.4" had since 0.2.5. Picked up the unverified
+`BearerAuth` timing hunch in the same pass: `hmac.compare_digest` instead
+of `!=`.
+
+New regression tests in `test_http_transport.py` cover all four malformed
+envelope cases and the version assertion; confirmed failing pre-fix by
+stashing the source change and rerunning. Full suite: 149 passed.
+
+Shipped as cadence-todo 0.2.17 (commit eeb2df5). Re-ran Dov's exact
+0.2.12 repro steps live against the real published PyPI wheel — fresh
+venv, `pip install cadence-todo==0.2.17` (nothing local/editable on
+`PATH`), `cadence mcp --http --host 127.0.0.1 --port 8917 --token
+verify-token-0217`:
+
+```
+$ curl -s -X POST http://127.0.0.1:8917/mcp -H "Authorization: Bearer verify-token-0217" \
+    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize", ...}'
+...
+"serverInfo":{"name":"cadence","version":"0.2.17"}    # was "1.29.1" (mcp SDK's version) pre-fix
+
+$ curl -s -i ... -d '{not valid json'
+{"ok": false, "error": "malformed_json", "message": "Parse error: Expecting property name
+enclosed in double quotes: line 1 column 2 (char 1)", "hint": "Send a single well-formed
+JSON object as the request body."}
+
+$ curl -s -i ... -d '{"jsonrpc":"2.0","id":2}'          # missing method
+{"ok": false, "error": "invalid_request", "message": "Validation error: 4 validation errors
+for JSONRPCMessage JSONRPCRequest.method Field required ...", "hint": "Include the required
+JSON-RPC fields ('jsonrpc', 'id', 'method') in the request body."}
+
+$ curl -s -i ... (no Accept header) -d '{"jsonrpc":"2.0","id":3,"method":"initialize",...}'
+{"ok": false, "error": "not_acceptable", "message": "Not Acceptable: Client must accept both
+application/json and text/event-stream", "hint": "Send an 'Accept: application/json,
+text/event-stream' header on every request."}
+
+$ curl -s -i ... --data-binary @big.json   # 6MB body
+{"ok": false, "error": "request_too_large", "message": "Request body too large", "hint":
+"Send a smaller request body -- split it into multiple calls if needed."}
+
+$ curl -s -i -X POST ... -H "Authorization: Bearer wrong-token" -d '{"jsonrpc":"2.0",...}'
+{"ok":false,"error":"unauthorized","message":"Missing or wrong bearer token.",...}   # still correct
+```
+
+All four envelope-level cases now come back cadence-shaped; the version
+handshake reports Cadence's own release; wrong-token auth is still
+correctly rejected (hmac.compare_digest change did not break auth).
+Server torn down after capture, `server.log` clean of tracebacks
+throughout.
