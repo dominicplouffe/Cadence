@@ -2322,3 +2322,57 @@ Simple index in ~64 seconds (12:05:45 → 12:06:49 UTC) instead of
 burning the full 600-second timeout. All 4 jobs (3 Python-version
 matrix + the PyPI-install job) went green:
 https://github.com/dominicplouffe/Cadence/actions/runs/33628043435
+
+## 2026-09-02 (Rafael Okonkwo, Build) — 0.2.21: oversized bare JSON integer no longer crashes to a misleading-hint 500
+
+Dov's independent verify of 0.2.20 (fresh venv, real PyPI, not the
+local checkout) confirmed the 0.2.18 5xx-classification fix holds, and
+found a narrower sibling: a JSON-RPC body with a bare (unquoted)
+integer literal over 4300 digits -- Python's
+`sys.get_int_max_str_digits()` -- makes stdlib `json.loads` raise
+`ValueError` inside `int()`, a different crash than the nesting-depth
+RecursionError 0.2.18 already guards (this input has no nesting at
+all). It correctly classified as a 500 `server_error` (no crash, no
+leaked traceback -- the 0.2.18 fix generalizes right), but every 5xx's
+hint says "editing the request will not help," which is false here:
+the request genuinely is malformed and shrinking the number fixes it
+every time.
+
+Fix in `mcp_server.py`: extended the same pre-validation approach the
+nesting guard already uses. `_json_number_too_long` does a single-pass
+scan of the raw body (same string/escape-tracking technique as
+`_json_nesting_too_deep`, so it cannot itself recurse or build the
+oversized int) for a run of digits outside any string literal longer
+than the interpreter's digit limit, and `_DepthBoundedJSONForStream
+ableHTTP.loads` now raises `json.JSONDecodeError` on it before handing
+off to the real `json.loads` -- so this degrades to the same clean 400
+`malformed_json` path ordinary bad JSON already takes, with the
+existing accurate hint ("send a single well-formed JSON object"), same
+as Noor's read: no new wording needed, this is a second trigger for an
+existing, already-correct 4xx path, not a new error shape.
+
+New regression test in `test_http_transport.py`, alongside the nesting
+round-trip: a 4301-digit integer now gets 400 `malformed_json` with no
+"will not help" wording; the exact boundary (4300 digits, one under
+the limit) still parses fine and falls through to an ordinary
+`session_error` (this request never called `initialize`), confirming
+the new check doesn't over-trigger. Full suite: 150 passed.
+
+Shipped as cadence-todo 0.2.21 (commit `9829d3d`), confirmed live on
+PyPI (`https://pypi.org/pypi/cadence-todo/0.2.21/json` returns the
+release). CI green same push, `pypi-install-and-drive` first try:
+https://github.com/dominicplouffe/Cadence/actions/runs/33631782231
+
+**External verify, not just local unit tests.** Added
+`scripts/verify_live/oversized_int_hint.py`: pip installs cadence-todo
+fresh from real PyPI into a brand-new temp venv (never the local
+checkout), starts the installed `cadence mcp --http` console script,
+and POSTs a live 4301-digit-integer JSON-RPC body at it over a real
+HTTP connection. Run against the published 0.2.21:
+
+```
+Installed cadence-todo==0.2.21 from real PyPI into /tmp/cadence-verify-oversized-int-.../venv
+4301-digit integer -> HTTP 400, error='malformed_json', hint='Send a single well-formed JSON object as the request body.'
+4300-digit integer (boundary, must still parse) -> HTTP 400, error='session_error'
+PASS: cadence-todo==0.2.21 (real PyPI) rejects an oversized bare JSON integer with a clean 4xx and an accurate hint; the boundary (4300 digits) still parses fine.
+```
