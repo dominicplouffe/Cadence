@@ -2169,3 +2169,56 @@ finding. Full transcript (scripts + raw output) in
 `/workspace/redteam_0217_indep/` (`test_envelope.py`,
 `test_success_and_auth.py`, `raw_auth_probe.py`, `server.log`, and their
 `*_output.txt` captures). Server torn down after capture.
+
+## 2026-09-02 (Rafael Okonkwo, Build) — 0.2.18: server 5xx no longer mislabeled as client malformed_request
+
+Direct fix for the one finding above. Two changes in `mcp_server.py`:
+`_classify_envelope_error` now checks `status_code >= 500` before any
+4xx pattern match and returns a distinct `"server_error"` code with a
+hint that says plainly this is not the caller's fault and retrying the
+identical request will not help; and the RecursionError itself is
+closed at the root — a shim scoped only to the `json` name as looked up
+inside `mcp.server.streamable_http` bounds JSON nesting depth (limit
+200, comfortably under where Dov's repro showed the crash starts, at
+1000, and comfortably over any real cadence message's nesting) before
+`json.loads` ever runs, so a too-deep body now degrades to the same
+clean 400 `malformed_json` path ordinary bad JSON already takes instead
+of reaching CPython's recursion limit at all.
+
+Confirmed locally against Dov's exact repro (depth 1000, same server
+code path used by the published package) before publishing:
+
+```
+depth 1000 -> 400 {"ok": false, "error": "malformed_json", "message":
+"Parse error: JSON nesting exceeds this server's 200-level limit: line 1
+column 1 (char 0)", "hint": "Send a single well-formed JSON object as the
+request body."}
+```
+
+versus the pre-fix behaviour (confirmed by stashing the source change
+and rerunning the same request): `500`,
+`{"ok": false, "error": "malformed_request", ...}`. New regression
+tests in `test_http_transport.py` cover both the classifier directly
+and this exact live repro; both confirmed failing pre-fix. Full suite:
+150 passed.
+
+Shipped as cadence-todo 0.2.18 (commit 8c96e47), confirmed live on PyPI
+(`https://pypi.org/pypi/cadence-todo/0.2.18/json` returns the release).
+
+**New finding, out of scope for this task, left for a follow-up**: the
+repo's own CI (`Install from PyPI registry ... end-to-end` job in
+`ci.yml`) failed on this push (`pip install cadence-todo==0.2.18` inside
+the CI runner: "No matching distribution found") even though the
+Publish workflow had already succeeded and `pypi.org/pypi/.../json`
+already reported the new version. Root cause: the job's wait-loop polls
+PyPI's JSON API, which updates fast, but `pip install` resolves against
+the Simple index, which sits behind a CDN whose cache can lag the JSON
+API by several minutes and by edge location -- confirmed independently
+(`pip index versions cadence-todo` still showed only up to 0.2.17 from
+one location well after the JSON API and a different location both
+already showed 0.2.18). A re-run shortly after failed again for the same
+reason before eventually succeeding. This is a pre-existing race in
+`ci.yml`'s wait condition (present for every prior release too, just not
+hit here before), not something introduced by this fix. Worth a
+dedicated fix: wait on the Simple index (what `pip` actually uses)
+rather than the JSON API, or retry the install step itself with backoff.
