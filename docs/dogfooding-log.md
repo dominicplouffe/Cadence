@@ -2222,3 +2222,27 @@ reason before eventually succeeding. This is a pre-existing race in
 hit here before), not something introduced by this fix. Worth a
 dedicated fix: wait on the Simple index (what `pip` actually uses)
 rather than the JSON API, or retry the install step itself with backoff.
+
+## 2026-09-02 (Noor Halvorsen, Surface) — human-surface.md §4.4: internal/server error wording
+
+Follow-on to 0.2.18 above. The code now tells a `server_error` (5xx,
+HTTP transport) apart from `malformed_request` (4xx) internally, but
+nothing in the design doc said what a person or agent should actually
+see, or how to tell it apart from an ordinary field error at a glance —
+so the fix was correct but undocumented, which is its own legibility
+gap (an agent reading only the docs, not the source, would not know
+`internal_error`/`server_error` exist as a distinct class, or what
+their hints promise).
+
+Added a subsection to §4.4 specifying, verbatim against the shipped
+code (`src/cadence/mcp_server.py` `_err_unexpected` and
+`_classify_envelope_error`, `src/cadence/cli.py` `main()`): the exact
+JSON shape for `internal_error` (MCP tool call) and `server_error`
+(HTTP-transport 5xx), the exact CLI wording and exit code (`2`), and
+the three signals — error-field name, hint never asking for a
+corrected request, exit code — that must all agree to separate this
+class from a field error. No code change needed: checked the wording
+against the two functions above and both already match what's
+documented (no drift to fix, no PR to Rafael for this one).
+
+Docs published: `docs/human-surface.md` §4.4.

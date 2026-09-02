@@ -146,6 +146,59 @@ tell "you asked wrong" from "we broke" apart programmatically — this is
 the same legibility bar the agent surface holds itself to, extended to
 shell scripts and humans reading exit codes.
 
+**Internal / server-side error — must never wear a field error's clothes.**
+Added 2026-09-02, driven by a Red Team finding (docs/dogfooding-log.md):
+a field error above means the caller's request was wrong; an internal or
+server-side error means Cadence's own code broke, or the request never
+reached one — the caller did nothing wrong, and editing the request
+cannot fix it. The two must never look, or read, alike, on any surface:
+
+Agent surface, MCP tool call (an uncaught exception inside a tool, e.g. a
+corrupt store file — `error: "internal_error"`):
+```
+{"ok": false, "error": "internal_error", "message": "KeyError: 2",
+ "hint": "Run list_tasks to check current state, or check CADENCE_DB_PATH."}
+```
+
+Agent surface, remote `--http` transport (the server itself faults on a
+5xx before any tool runs — `error: "server_error"`, added in 0.2.18):
+```
+{"ok": false, "error": "server_error",
+ "message": "Error handling POST request",
+ "hint": "This failed on the server's side, not because of anything
+ wrong with your request -- sending the identical request again will
+ fail the same way. Wait and try again later, or report it; editing
+ the request will not help."}
+```
+
+Human surface (CLI, any command):
+```
+$ cadence list
+Error: something went wrong on Cadence's end (KeyError: 2). Run 'cadence
+list' to check your tasks, or check CADENCE_DB_PATH.
+```
+exit code `2`.
+
+Three signals separate this from a field error at a glance, and all three
+agree on every surface — never rely on just one:
+1. **The `error` field never carries a client-fault name.**
+   `internal_error` and `server_error` are the only two codes that mean
+   "not your request"; every other code (`malformed_request`,
+   `malformed_json`, `invalid_request`, `request_too_large`,
+   `not_acceptable`, `session_error`) means the opposite.
+2. **The hint never asks for a corrected request.** A field-error hint is
+   always "try `<corrected command>`" — an edit. An internal/server hint
+   is always wait-or-report ("wait and try again later, or report it",
+   "run list_tasks to check current state") and, for `server_error`, says
+   outright that editing the request will not help.
+3. **CLI exit code.** `1` for a field error, `2` for internal/server —
+   scriptable without parsing any text at all.
+
+This is what the ten-step script's malformed-request step actually
+checks: that an agent (or a human reading a log) can tell "I asked
+wrong" from "it broke on its own" from the response's shape alone, never
+by guessing at message wording.
+
 ### 4.5 Loading / in-progress state
 
 None, by default: local operations complete in well under the ~100ms a
