@@ -18,6 +18,7 @@ import hmac
 import json
 from typing import Optional
 
+import mcp.server.streamable_http as _streamable_http_module
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError as _FastMCPToolError
 from mcp.server.transport_security import TransportSecuritySettings
@@ -34,6 +35,89 @@ from cadence.store import (
     Store,
     history_degraded_warning,
 )
+
+# 0.2.17 independent Red Team pass (docs/dogfooding-log.md): a ~2KB request
+# body nested >=1000 levels deep (`[[[...]]]`) makes the `mcp` SDK's own
+# `json.loads(body)` (streamable_http.py, inside `_handle_post_request`)
+# raise an uncaught RecursionError at CPython's default recursion limit --
+# not the `json.JSONDecodeError` that function already catches and turns
+# into a clean 400. The SDK's own outer handler still catches it (nothing
+# crashes), but only as a generic 500, which _classify_envelope_error
+# above now reports honestly as a server fault rather than a client
+# mistake -- but a request that can make the server raise an exception at
+# all, for ~2KB of input, is worth closing outright rather than merely
+# labelling correctly after the fact.
+#
+# Fix: bound JSON nesting *before* it ever reaches the SDK's json.loads,
+# so this case degrades to the exact same clean 400 "Parse error" path
+# ordinary invalid JSON already takes (tested, classified as
+# `malformed_json`) instead of reaching CPython's recursion limit at all.
+# Scoped as narrowly as possible: only the `json` name as looked up
+# *inside `mcp.server.streamable_http`* is replaced (a fresh shim object,
+# not a mutation of the real stdlib `json` module every other importer,
+# including the rest of cadence, shares) so this cannot change JSON
+# parsing behavior anywhere else in the process. Every other attribute
+# (JSONDecodeError, dumps, ...) is delegated straight through to the real
+# module, so `except json.JSONDecodeError` inside that file keeps working
+# unchanged -- it just also now catches this case.
+_MAX_JSON_NESTING_DEPTH = 200  # Dov's repro: 800 does not reproduce the
+# RecursionError, 1000 does -- 200 leaves generous headroom under that
+# while sitting far above any nesting a real cadence JSON-RPC message
+# uses (a handful of levels at most).
+
+
+def _json_nesting_too_deep(data: object, limit: int) -> bool:
+    """Cheap single-pass structural scan for JSON array/object nesting
+    depth -- counts `[`/`{` and `]`/`}` outside of string literals,
+    without actually parsing (so it cannot itself recurse). Brackets
+    inside a JSON string value (e.g. a title containing literal `[[[`)
+    are correctly ignored because we track string/escape state."""
+    text = data.decode("utf-8", "replace") if isinstance(data, (bytes, bytearray)) else str(data)
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch in "]}":
+            depth -= 1
+    return False
+
+
+class _DepthBoundedJSONForStreamableHTTP:
+    """Stand-in for the `json` module, installed only as the `json` name
+    inside `mcp.server.streamable_http`'s own namespace (see below) --
+    every attribute other than `loads` is the real stdlib `json` module,
+    untouched."""
+
+    def __getattr__(self, name):
+        return getattr(json, name)
+
+    @staticmethod
+    def loads(data, *args, **kwargs):
+        if _json_nesting_too_deep(data, _MAX_JSON_NESTING_DEPTH):
+            text = data.decode("utf-8", "replace") if isinstance(data, (bytes, bytearray)) else str(data)
+            raise json.JSONDecodeError(
+                f"JSON nesting exceeds this server's {_MAX_JSON_NESTING_DEPTH}-level limit",
+                text,
+                0,
+            )
+        return json.loads(data, *args, **kwargs)
+
+
+_streamable_http_module.json = _DepthBoundedJSONForStreamableHTTP()
 
 mcp = FastMCP(
     "cadence",
@@ -688,7 +772,28 @@ def _classify_envelope_error(status_code: int, message_text: str) -> tuple[str, 
     a cadence (error_code, hint) pair. `message_text` is the SDK's own
     plain-English message text -- either the `message` field of its raw
     JSON-RPC error object, or (for the 413 case, which isn't JSON at all)
-    its bare plain-text body."""
+    its bare plain-text body.
+
+    0.2.17 independent Red Team pass (docs/dogfooding-log.md): this used
+    to pattern-match on `message_text` only and never looked at
+    `status_code`, so a genuine server-side fault (e.g. an uncaught
+    exception the SDK's own generic handler turns into a 500 "Error
+    handling POST request") fell through every named pattern into the
+    same `malformed_request` / "check your request and retry" bucket a
+    client's own bad input gets -- wrongly blaming the caller, and
+    telling them to retry the one thing (editing their request) that
+    cannot help, since the request was never the problem. Any 5xx is
+    checked first, before the 4xx pattern matching below, so a server
+    fault can never be misread as a client mistake regardless of what
+    the SDK's own message text happens to say.
+    """
+    if status_code >= 500:
+        return "server_error", (
+            "This failed on the server's side, not because of anything wrong "
+            "with your request -- sending the identical request again will "
+            "fail the same way. Wait and try again later, or report it; "
+            "editing the request will not help."
+        )
     lower = message_text.lower()
     if status_code == 413 or "too large" in lower:
         return "request_too_large", (

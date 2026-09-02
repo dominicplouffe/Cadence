@@ -75,6 +75,39 @@ def http_env(tmp_path, monkeypatch):
     return tmp_path
 
 
+# --- envelope error classification --------------------------------------
+
+
+def test_classify_envelope_error_never_blames_the_caller_for_a_5xx():
+    from cadence.mcp_server import _classify_envelope_error
+
+    # 0.2.17 independent Red Team pass: any status_code >= 500 must be
+    # classified as a server fault, distinctly from a 4xx client mistake
+    # -- regardless of what the SDK's own message text happens to say
+    # (here, the SDK's real generic message for an uncaught exception).
+    code, hint = _classify_envelope_error(500, "Error handling POST request")
+    assert code == "server_error"
+    # The old hint told the caller to retry the identical request -- the
+    # one thing that cannot help a server-side fault. The new one must
+    # say plainly that retrying the same request will not help.
+    assert "will not help" in hint.lower() or "cannot help" in hint.lower()
+
+    # The concrete old bug: this text ("Error handling POST request")
+    # matches none of the 4xx substring patterns, so pre-fix it fell all
+    # the way through to the generic 4xx default, "malformed_request".
+    assert code != "malformed_request"
+
+    # Any other 5xx must also be classified this way, not just 500.
+    code2, hint2 = _classify_envelope_error(502, "Bad Gateway")
+    assert code2 == "server_error"
+    assert hint2 == hint
+
+    # A genuine 4xx must still classify as before -- this fix must not
+    # swallow ordinary client-mistake classification.
+    code3, _ = _classify_envelope_error(400, "Parse error: some detail")
+    assert code3 == "malformed_json"
+
+
 # --- token generation/storage ------------------------------------------
 
 
@@ -248,6 +281,33 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
             ).encode(),
             headers=good_headers,
         )
+        # 0.2.17 independent Red Team pass (docs/dogfooding-log.md): a
+        # ~2KB body nested >=1000 levels deep used to make the `mcp` SDK's
+        # own json.loads(body) raise an uncaught RecursionError, which its
+        # outer handler turned into a bare 500 "Error handling POST
+        # request" -- and _classify_envelope_error's fallback bucket
+        # (never checking status_code) shaped that identically to an
+        # ordinary client mistake, with a hint telling the caller to
+        # retry the one thing (fixing their own request) that could not
+        # help. Fixed two ways, both exercised here: (1) nesting this deep
+        # is now bounded before it ever reaches the SDK's json.loads, so
+        # it degrades to the same clean 400 malformed_json path ordinary
+        # bad JSON already takes; (2) belt-and-braces, _classify_envelope_
+        # error now classifies *any* status_code >= 500 as a distinct
+        # "server_error", never "malformed_request", so a real server
+        # fault (this one or any other) can never be mis-blamed on the
+        # caller. This deliberately mirrors Dov's exact repro: depth 1000
+        # is where the old code first reproduced the RecursionError.
+        deeply_nested = "[" * 1000 + "1" + "]" * 1000
+        deeply_nested_body = httpx.post(
+            live.base_url,
+            content=(
+                '{"jsonrpc": "2.0", "id": 1, "method": "ping", "params": '
+                + deeply_nested
+                + "}"
+            ).encode(),
+            headers=good_headers,
+        )
 
     for resp in (no_token, wrong_token, wrong_token_tunnel_host):
         assert resp.status_code == 401, (resp.status_code, resp.text)
@@ -278,6 +338,7 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
         (missing_method, 400, "invalid_request"),
         (missing_accept, 406, "not_acceptable"),
         (oversized_body, 413, "request_too_large"),
+        (deeply_nested_body, 400, "malformed_json"),
     ):
         assert resp.status_code == expected_status, (resp.status_code, resp.text)
         assert resp.headers["content-type"].startswith("application/json"), resp.headers
