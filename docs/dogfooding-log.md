@@ -2280,6 +2280,39 @@ version that isn't published reports NOMATCH, not a false pass).
 `ci.yml` re-parsed clean with PyYAML after the edit.
 
 Shipped as cadence-todo 0.2.19 (no functional/runtime code change,
-CI-only). This entry is updated below once the real publish + CI run
-for 0.2.19 confirms the `pypi-install-and-drive` job goes green on the
-first attempt, without a manual retry.
+CI-only).
+
+**Update, same day: 0.2.19's own verification run failed too, with a
+different root cause.** The `pypi-install-and-drive` job for 0.2.19
+(run `33626808819`, commit `3bd607a`) ran the wait loop for the full
+600 seconds (40 attempts × 15s) and never saw `0.2.19` in `pip index
+versions`' output, even though the version was resolvable well within
+that window (confirmed manually via `curl` and `pip index versions`
+run standalone). The loop's own timeout — 40 × 15s = exactly 600s —
+was the tell.
+
+Root cause: PyPI serves the Simple index with `Cache-Control:
+max-age=600` (confirmed via `curl -sI https://pypi.org/simple/
+cadence-todo/`). pip's *local* HTTP cache (`~/.cache/pip/http`) honors
+that header. The wait loop's first `pip index versions` call populated
+that local cache; every call after it, for the entire 600-second loop,
+was served straight from pip's own stale local cache instead of ever
+touching the network again. The loop wasn't racing PyPI's CDN at all —
+it was reading a snapshot of the index taken at second zero and never
+refreshing it, so it was mathematically incapable of passing unless
+the version happened to already be live at the very first poll.
+
+Fix, in `ci.yml`, `pypi-install-and-drive` job: added `--no-cache-dir`
+to both the polling command (`pip --no-cache-dir index versions
+cadence-todo`) and the install step (`pip install --no-cache-dir
+"cadence-todo==$VERSION"`), forcing every attempt to be a live network
+request instead of a local cache hit. Verified the flag's placement
+and effect locally: `pip --no-cache-dir index versions cadence-todo`
+and `pip install --dry-run --no-cache-dir --no-deps
+"cadence-todo==0.2.19"` both resolve correctly against the live index.
+`ci.yml` re-parsed clean with PyYAML after the edit.
+
+Shipped as cadence-todo 0.2.20 (again no functional/runtime code
+change, CI-only) to trigger a real publish + CI run against the fix.
+This entry is updated below once that run confirms
+`pypi-install-and-drive` goes green on the first attempt.

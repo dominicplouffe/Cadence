@@ -96,9 +96,20 @@ jobs:
           # `pip index versions` queries that same Simple index through
           # pip's own resolver, so a pass here means the install step
           # below is resolving against data that has actually landed.
+          #
+          # PyPI serves the Simple index with `Cache-Control: max-age=600`
+          # (confirmed via `curl -sI https://pypi.org/simple/<pkg>/`).
+          # pip's own local HTTP cache (~/.cache/pip/http) honors that
+          # header: the *first* poll below populates the cache, and every
+          # poll after it -- for the full 600s the loop originally ran --
+          # was silently served from that local cache instead of ever
+          # touching the network again. That's exactly what happened on
+          # 0.2.19's first CI run: it failed at precisely 600s (40 x 15s)
+          # having never re-checked upstream after the first request.
+          # `--no-cache-dir` forces every poll to be a live network hit.
           echo "Waiting for cadence-todo==$VERSION to resolve on the Simple index (what pip install actually queries)..."
           for i in $(seq 1 40); do
-            OUT=$(pip index versions cadence-todo 2>/dev/null || true)
+            OUT=$(pip --no-cache-dir index versions cadence-todo 2>/dev/null || true)
             AVAILABLE=$(echo "$OUT" | grep -oP 'Available versions:\s*\K.*' | tr ',' '\n' | tr -d ' ')
             if echo "$AVAILABLE" | grep -qx "$VERSION"; then
               echo "cadence-todo $VERSION is resolvable on the Simple index."
@@ -121,7 +132,7 @@ jobs:
           # this install hits. Retry with backoff rather than failing the
           # whole job on a transient edge miss.
           for i in 1 2 3 4 5; do
-            if pip install "cadence-todo==$VERSION"; then
+            if pip install --no-cache-dir "cadence-todo==$VERSION"; then
               break
             fi
             if [ "$i" -eq 5 ]; then
