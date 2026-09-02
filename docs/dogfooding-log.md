@@ -2376,3 +2376,106 @@ Installed cadence-todo==0.2.21 from real PyPI into /tmp/cadence-verify-oversized
 4300-digit integer (boundary, must still parse) -> HTTP 400, error='session_error'
 PASS: cadence-todo==0.2.21 (real PyPI) rejects an oversized bare JSON integer with a clean 4xx and an accurate hint; the boundary (4300 digits) still parses fine.
 ```
+
+## 2026-09-02 (Dov Ferreira, Red Team) — independent verification of the 0.2.21 numeric guard, 5 checks, no new finding
+
+Separate pass against the real `cadence-todo==0.2.21` wheel — fresh
+venv (`python3 -m venv`), `pip install cadence-todo` from live PyPI, no
+local checkout on `PATH`, own token, own port. Confirmed installed
+version first: `pip show cadence-todo` → `Version: 0.2.21`. Server
+started from the installed `cadence` console script
+(`cadence mcp --http --port 8811`); every request below sent with
+`urllib`/`curl` as real bearer-authenticated HTTP POSTs to
+`http://127.0.0.1:8811/mcp`. Five checks, all pass:
+
+1. **Threshold constant, boundary at all three points.** Confirmed the
+   real constant first: `python -c "import sys;
+   print(sys.get_int_max_str_digits())"` inside the installed venv →
+   `4300`, matching the code comment in `mcp_server.py`
+   (`_MAX_JSON_INT_DIGITS = sys.get_int_max_str_digits()`). Bare
+   top-level int, digit run of 4299 (one under), 4300 (exact), 4301
+   (one over):
+   ```
+   bare-int-4299-digits -> HTTP 400, error='session_error'   (parses fine)
+   bare-int-4300-digits -> HTTP 400, error='session_error'   (parses fine, exact boundary)
+   bare-int-4301-digits -> HTTP 400, error='malformed_json'  (blocked)
+   ```
+   `session_error` here just means the JSON itself parsed and the
+   server correctly complained the session was never initialized —
+   the point is neither 4299 nor 4300 hit the numeric guard. Matches
+   the 4300/4301 split already in `test_http_transport.py`, now
+   confirmed against the shipped artifact instead of the local suite,
+   plus the previously-untested 4299 point.
+
+2. **Not just bare top-level ints.** The guard is a single-pass scan
+   over the *whole* raw request body for any run of digit characters
+   outside a string literal — it has no notion of JSON position, sign,
+   or number type, so it catches all of these, not only the one shape
+   already tested:
+   ```
+   negative-int-4301-digits (leading minus)        -> malformed_json
+   negative-int-4300-boundary (leading minus)       -> session_error (correctly not blocked)
+   nested-in-array-4301 ({"x":[1,2,999...9,3]})     -> malformed_json
+   nested-in-object-4301 ({"x":{"a":{"b":999...9}}})-> malformed_json
+   oversized-float-4301-int-part (999...9.5)        -> malformed_json
+   oversized-float-4301-frac-part (1.999...9)       -> malformed_json
+   oversized-sci-notation-exponent (1e999...9)      -> malformed_json
+   oversized-sci-notation-mantissa (999...9e1)      -> malformed_json
+   ```
+   One thing worth naming, not a defect: the float and
+   scientific-notation cases above are actually harmless even without
+   the guard — Python's `float()` has no int-conversion digit limit,
+   so an oversized float literal never hit the original crash. The
+   guard blocks them anyway because it can't tell a huge float's digit
+   run from a huge int's; that's over-inclusive by one bug class, not
+   under-inclusive, and the cost is a clean 400 on an input no real
+   client sends (a JSON number with 4000+ literal digits). Safe
+   direction to be wrong in.
+
+3. **Regression: ordinary large-but-legal numbers.** A real unix
+   timestamp, an int64-max-sized id, and an ordinary decimal all
+   parse fine, unaffected by the guard:
+   ```
+   ordinary-unix-timestamp (1735689600)               -> session_error
+   ordinary-int64-max (9223372036854775807)            -> session_error
+   ordinary-float (3.14159265358979)                   -> session_error
+   ```
+   No false-positive rejection.
+
+4. **`scripts/verify_live/oversized_int_hint.py` is real and would
+   catch a reversion.** Ran it unmodified against live PyPI (picks up
+   latest, which is 0.2.21): `PASS`, confirming §"External verify"
+   above. Then proved it isn't a script that would pass regardless of
+   what's published: made a throwaway copy that pins the install to
+   `cadence-todo==0.2.20` — the last version *without* this fix — and
+   ran that. It correctly fails:
+   ```
+   Installed cadence-todo==0.2.20 from real PyPI into /tmp/.../venv
+   4301-digit integer -> HTTP 500, error='server_error', hint="... editing the request will not help."
+   FAIL: 4301-digit integer literal still crashes to a 500 -- fix not present in cadence-todo==0.2.20: {...}
+   ```
+   Exit code 1. If the guard were ever reverted and republished, this
+   script would fail CI's `pypi-install-and-drive` job the same way,
+   not silently pass.
+
+5. **Original 0.2.20 repros re-confirmed against 0.2.21, not the local
+   suite.** Both of Dov's original findings, replayed as raw HTTP
+   against the live installed server:
+   ```
+   depth-1000-nesting  -> HTTP 400, error='malformed_json', hint='Send a single well-formed JSON object as the request body.'
+   oversized-int-4301-repro -> HTTP 400, error='malformed_json', hint='Send a single well-formed JSON object as the request body.'
+   ```
+   Neither is a `server_error` any more; both get the accurate
+   "send a well-formed JSON object" hint instead of the old "editing
+   won't help" 500 wording. `server.log` for the whole session has no
+   traceback — the guard pre-empts before the SDK's own parser ever
+   sees the bad input, exactly as designed. A bonus nesting-depth
+   boundary check (199/200/201, not required by this pass but free
+   once the server was up) also lined up with `_MAX_JSON_NESTING_DEPTH
+   = 200` once the JSON-RPC envelope's own outer `{` is counted as one
+   level: 199 parses, 200 and 201 are blocked.
+
+No new finding. The fix holds against all five checks, generalizes
+correctly beyond the one case already tested, and the live-PyPI verify
+script is a real regression trap, not decoration. Server and venv torn
+down after capture; nothing left running.
