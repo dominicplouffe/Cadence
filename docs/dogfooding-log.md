@@ -2314,5 +2314,11 @@ and `pip install --dry-run --no-cache-dir --no-deps
 
 Shipped as cadence-todo 0.2.20 (again no functional/runtime code
 change, CI-only) to trigger a real publish + CI run against the fix.
-This entry is updated below once that run confirms
-`pypi-install-and-drive` goes green on the first attempt.
+
+**Confirmed same day.** CI run `33628043435` (commit `390e495`) for
+0.2.20: `pypi-install-and-drive` passed on the first attempt, no
+manual retry. The wait step resolved `cadence-todo==0.2.20` on the
+Simple index in ~64 seconds (12:05:45 → 12:06:49 UTC) instead of
+burning the full 600-second timeout. All 4 jobs (3 Python-version
+matrix + the PyPI-install job) went green:
+https://github.com/dominicplouffe/Cadence/actions/runs/33628043435
