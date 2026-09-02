@@ -2006,3 +2006,166 @@ handshake reports Cadence's own release; wrong-token auth is still
 correctly rejected (hmac.compare_digest change did not break auth).
 Server torn down after capture, `server.log` clean of tracebacks
 throughout.
+
+## 2026-09-02 (Dov Ferreira, Red Team) — independent adversarial pass on 0.2.17: envelope shim + version fix + hmac hardening — 1 real finding
+
+Separate from Rafael's own verification above: fresh venv, `pip install
+cadence-todo==0.2.17` (confirmed `cadence.__file__` resolves inside that
+venv's `site-packages`, nothing on `sys.path` under `/workspace`), fresh
+token, fresh store. Went beyond his repro on all five points the task
+asked for.
+
+### 1. Envelope shim edge cases he did not try — all shaped correctly, one real gap found (see finding below)
+
+- Chunked-encoded request body (no `Content-Length`, generator-fed):
+  works identically to a normal body on both the error path (`ping`
+  without a session → `400 session_error`, correctly shaped) and the
+  success path (`initialize` sent chunked → `200`, real SSE stream, same
+  as unchunked). The shim only cares about response status, never
+  request framing.
+- Bare JSON array top-level (`[1,2,3]`) and bare JSON string top-level
+  (`"hello"`): both `400 invalid_request`, correctly shaped, message
+  correctly reports pydantic's "Input should be a valid dictionary"
+  error.
+- `Content-Type: text/plain` with an otherwise-valid JSON-RPC body, and
+  `Content-Type` header omitted entirely: both `400 malformed_request`,
+  `"message": "Invalid Content-Type header"` — correctly shaped, falls
+  into the shim's generic bucket because `_classify_envelope_error` has
+  no pattern for this SDK message string, but message+hint are still
+  honest and actionable.
+- `"jsonrpc": "9.9"` (unsupported version string) and `jsonrpc` field
+  missing entirely: both `400 invalid_request`, pydantic's literal-value
+  error correctly surfaced and shaped.
+- Successful (2xx) and SSE responses: full real round trip via the
+  actual `mcp` client SDK (`streamablehttp_client` + `ClientSession`) —
+  `initialize`, `add_task`, `list_tasks` — every response arrived
+  unbuffered and unmangled, exactly the JSON-RPC shape the SDK expects,
+  not reshaped into cadence's envelope. Confirms the code comment's
+  claim (`state["status"] < 400` bypasses buffering entirely) by
+  behavior, not just by reading it: the `mcp` client library itself
+  parses SSE incrementally and would hang/timeout if the shim held the
+  stream to buffer it, and it didn't.
+
+### 2. Honest-severity check — real finding, see below. A genuine unhandled server-side exception (not a client mistake) comes back wearing the exact same `"malformed_request"` clothing and "check your request and retry" hint as an ordinary bad request.
+
+### 3. serverInfo.version
+
+Matches `pip show cadence-todo` exactly: both report `0.2.17`. Confirmed
+the informational editable-install caveat by reproducing it, not just
+reasoning about it: `pip install -e .` into a scratch venv against a
+throwaway copy of the repo captures `0.2.17` into that install's static
+metadata; editing the throwaway copy's `pyproject.toml` to `9.9.9`
+*without* rerunning `pip install -e .` leaves `cadence.__version__`
+reporting the stale `0.2.17` — it freezes at install time, it does not
+silently drift to track live source edits. Matches what the task
+predicted. Informational only, not a defect: this is inherent to
+`importlib.metadata` reading static setuptools metadata, not something
+this fix could have avoided, and it only affects contributors running an
+editable install who then edit `pyproject.toml` without reinstalling —
+not the published wheel a real user gets.
+
+### 4. hmac.compare_digest inspection
+
+Read `_make_http_app`'s `BearerAuth.__call__` directly (not just the
+diff): the comparison is
+`presented is None or not hmac.compare_digest(presented, self.expected_token)`.
+Both operands are `str` — `presented` is a slice of the latin-1-decoded
+header value, `self.expected_token` is the `str` token `BearerAuth` was
+constructed with — so there is no mixed str/bytes `TypeError` path that
+could leak a stack trace. The `presented is None` branch (no `Bearer `
+prefix at all: missing header, wrong scheme, etc.) short-circuits before
+`compare_digest` is ever called, but that is a structurally different
+request class with no token content to time against, not a live
+byte-by-byte oracle — consistent with the fix's intent. `compare_digest`
+itself does not raise on a length mismatch (Python stdlib guarantee); its
+one documented residual side-channel (length-based, not content-based)
+is the accepted trade-off of using it and is not something this fix
+introduced or could avoid. No exception path found.
+
+### 5. Auth re-confirmation — right/wrong token both correct; two new edge cases surfaced one non-issue and one point worth knowing, no defect
+
+- Right token: `200`, real handshake. Wrong token: `401`, standard
+  envelope (`error: "unauthorized"`), no stack trace.
+- Empty-string token (`Authorization: Bearer ` with nothing after) vs.
+  `Authorization` header omitted entirely: byte-for-byte identical `401`
+  response both times (same message, same hint, same content-length).
+  They are intentionally *not* distinguished, and neither leaks a stack
+  trace — correct, uniform-denial design; a distinguishable response
+  here would be a minor oracle for "is a client even attempting auth."
+- Token with trailing whitespace: sent over a raw socket (bypassing
+  `httpx`'s own header-value validation, which refuses to send this at
+  all) as `Authorization: Bearer rt0217-secret \r\n` — one literal space
+  before the line terminator. Result: `200`, accepted. This is **not** a
+  BearerAuth bug: `h11`/`uvicorn`'s HTTP parser strips leading/trailing
+  optional whitespace (OWS) from header field values per RFC 9110 §5.5
+  before the ASGI app ever sees them, so `presented` is already
+  `"rt0217-secret"` with no trailing space by the time `compare_digest`
+  runs. Confirmed this is standard HTTP-layer normalization, not a loose
+  comparison, by contrast: extra whitespace placed *inside* the value
+  (`Authorization: Bearer  rt0217-secret`, two spaces after the scheme,
+  raw socket, so genuinely present in `presented`) correctly `401`s —
+  internal bytes are compared exactly, only the RFC-mandated edge OWS is
+  gone before cadence's code runs. No finding.
+- Wrong scheme (`Basic <token>`) and lowercase scheme (`bearer <token>`,
+  raw socket): both `401`, same envelope. Correct — the code's
+  `auth.startswith("Bearer ")` check is deliberately case-sensitive and
+  scheme-sensitive.
+
+### Finding — real, one, worth fixing, moderate
+
+**A genuine unhandled server exception (RecursionError, not a client
+input-shape mistake) is shaped identically to an ordinary malformed
+request, with a hint that tells the caller to do the one thing that
+cannot help: retry.** Repro against the real published wheel:
+
+```
+python3 -c "print('[' * 1000 + '1' + ']' * 1000)" > deep.json
+curl -s -i -X POST http://127.0.0.1:<port>/mcp \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" --data-binary @deep.json
+```
+→ `HTTP/1.1 500 Internal Server Error`, body
+`{"ok": false, "error": "malformed_request", "message": "Error handling
+POST request", "hint": "Check the request against the MCP Streamable
+HTTP spec (headers, JSON-RPC body shape) and retry."}`. `server.log`
+shows the real cause is an uncaught `RecursionError` inside the `mcp`
+SDK's own `json.loads(body)` at `streamable_http.py:494` — Python's
+`json` decoder recurses per nesting level and CPython's default
+recursion limit (~1000) is exceeded, well below any size limit
+(`request_too_large` triggers separately, at ~5MB; this triggers at
+~2KB of `[[[...]]]`). Deterministic at any nesting depth ≥ ~1000
+(1000/1500/3000 all reproduce; 200/500/800 do not — SDK's normal
+`400 invalid_request` instead). Confirmed the process itself survives —
+a pre-existing session on the same server answered a normal `tools/list`
+correctly immediately after — so this is not a full-server crash, and no
+traceback or internal detail reaches the client (`message` is the SDK's
+generic "Error handling POST request", nothing more). The bug is purely
+in how `_classify_envelope_error`'s fallback bucket works: it pattern-
+matches on message text only and never looks at `status_code`, so a
+`500` and a `400` that both fail every named pattern land in the exact
+same `"malformed_request"` / "check your request and retry" bucket. A
+client — human or agent — cannot tell "you made a mistake, fix your
+request" from "the server broke processing your request, retrying
+identically will fail identically again," and nothing distinguishes this
+class of error for anyone watching server health from an ordinary bad
+request. Consequence: wasted agent retries (the hint's own advice
+cannot succeed) and a real reliability signal (a cheap, ~2KB,
+deterministic way to make the server 500) reads exactly like routine
+client noise in any log or metric keyed off the `error` field, so it
+won't get noticed or tracked as the input-driven crash it is. Not
+severe — contained to the one request, no data loss, no info leak — but
+real and precisely what the task's honest-severity check was checking
+for. Only finding from this pass; it is the one to fix first.
+**Fix direction, not prescribed**: have `_classify_envelope_error` (or
+its caller) branch on `status_code >= 500` before falling into the
+generic client-fault bucket — a distinct `error` code (e.g.
+`"internal_error"`) and a hint that does not tell the caller to retry
+the identical request would be honest about what actually happened.
+
+### What held
+
+All five task items pass except the one finding above. No other new
+finding. Full transcript (scripts + raw output) in
+`/workspace/redteam_0217_indep/` (`test_envelope.py`,
+`test_success_and_auth.py`, `raw_auth_probe.py`, `server.log`, and their
+`*_output.txt` captures). Server torn down after capture.
