@@ -81,21 +81,32 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Wait for pyproject.toml's version to be live on PyPI
+      - name: Wait for pyproject.toml's version to resolve on the Simple index
         id: version
         run: |
+          python -m pip install --upgrade pip
           VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Waiting for cadence-todo==$VERSION to be available on PyPI (publish.yml may still be running)..."
+          # The JSON API (pypi.org/pypi/.../json) and the Simple index
+          # (pypi.org/simple/...) are served from different CDN paths and
+          # can disagree for a few minutes after a publish. `pip install`
+          # resolves against the Simple index, not the JSON API, so that's
+          # what this wait loop has to poll -- otherwise the JSON API can
+          # report the version live while `pip install` still 404s.
+          # `pip index versions` queries that same Simple index through
+          # pip's own resolver, so a pass here means the install step
+          # below is resolving against data that has actually landed.
+          echo "Waiting for cadence-todo==$VERSION to resolve on the Simple index (what pip install actually queries)..."
           for i in $(seq 1 40); do
-            STATUS=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/cadence-todo/$VERSION/json")
-            if [ "$STATUS" = "200" ]; then
-              echo "cadence-todo $VERSION is live on PyPI."
+            OUT=$(pip index versions cadence-todo 2>/dev/null || true)
+            AVAILABLE=$(echo "$OUT" | grep -oP 'Available versions:\s*\K.*' | tr ',' '\n' | tr -d ' ')
+            if echo "$AVAILABLE" | grep -qx "$VERSION"; then
+              echo "cadence-todo $VERSION is resolvable on the Simple index."
               exit 0
             fi
             sleep 15
           done
-          echo "cadence-todo $VERSION never appeared on PyPI within the timeout."
+          echo "cadence-todo $VERSION never became resolvable on the Simple index within the timeout."
           exit 1
 
       - name: Install cadence-todo from PyPI into a fresh venv (no -e, no local source)
@@ -103,7 +114,23 @@ jobs:
           python -m venv "$RUNNER_TEMP/pypi-venv"
           source "$RUNNER_TEMP/pypi-venv/bin/activate"
           python -m pip install --upgrade pip
-          pip install "cadence-todo==${{ steps.version.outputs.version }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          # Belt-and-suspenders: the Simple index itself is a CDN with
+          # multiple edge nodes, so a resolve that succeeds in the wait
+          # step above can still occasionally miss on the specific edge
+          # this install hits. Retry with backoff rather than failing the
+          # whole job on a transient edge miss.
+          for i in 1 2 3 4 5; do
+            if pip install "cadence-todo==$VERSION"; then
+              break
+            fi
+            if [ "$i" -eq 5 ]; then
+              echo "pip install cadence-todo==$VERSION failed after 5 attempts."
+              exit 1
+            fi
+            echo "Install attempt $i failed, retrying in 15s..."
+            sleep 15
+          done
           echo "$RUNNER_TEMP/pypi-venv/bin" >> "$GITHUB_PATH"
 
       - name: CLI smoke check against the PyPI-installed package, run outside the repo

@@ -2246,3 +2246,40 @@ against the two functions above and both already match what's
 documented (no drift to fix, no PR to Rafael for this one).
 
 Docs published: `docs/human-surface.md` §4.4.
+
+## 2026-09-02 (Rafael Okonkwo, Build) — 0.2.19: fix CI PyPI-install race against the Simple-index CDN
+
+Direct fix for the finding logged under the 0.2.18 entry above: the
+`pypi-install-and-drive` job in `ci.yml` waited for the version to
+appear on PyPI's JSON API, then ran `pip install`, which resolves
+against the Simple index — a separate CDN path that can lag the JSON
+API by several minutes. First CI run after 0.2.18 failed with "No
+matching distribution found"; a retry succeeded once the Simple index
+caught up.
+
+Two changes in `ci.yml`, both scoped to the `pypi-install-and-drive`
+job:
+
+1. The wait step now polls `pip index versions cadence-todo` instead
+   of the JSON API. `pip index versions` walks the same Simple index
+   `pip install` resolves against, through pip's own resolver, so a
+   pass here means the data the install step is about to query has
+   actually landed — not a different, faster-updating API that can
+   disagree with it.
+2. The install step itself now retries up to 5 times with a 15s
+   backoff, because the Simple index is a CDN with multiple edge
+   nodes: a resolve that succeeds against one edge in the wait step
+   can still occasionally miss on whichever edge the install request
+   happens to land on next.
+
+Verified locally before shipping: `pip index versions cadence-todo`
+against the live index returns `Available versions: 0.2.18, 0.2.17,
+...` and the exact-match parsing (`grep -qx`) picks the right version
+out of that list; confirmed the false-negative case too (querying a
+version that isn't published reports NOMATCH, not a false pass).
+`ci.yml` re-parsed clean with PyYAML after the edit.
+
+Shipped as cadence-todo 0.2.19 (no functional/runtime code change,
+CI-only). This entry is updated below once the real publish + CI run
+for 0.2.19 confirms the `pypi-install-and-drive` job goes green on the
+first attempt, without a manual retry.
