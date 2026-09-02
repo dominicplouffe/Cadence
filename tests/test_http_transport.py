@@ -19,13 +19,17 @@ import subprocess
 import sys
 import threading
 import time
+from importlib.metadata import version as _pkg_version
 
 import httpx
 import pytest
 import uvicorn
 
+from cadence import __version__ as _cadence_version
 from cadence.registry import get_or_create_http_token, http_token_path
 from cadence.store import Store
+
+_installed_mcp_sdk_version = _pkg_version("mcp")
 
 
 def _free_port() -> int:
@@ -156,7 +160,7 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
             _,
         ):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                init_result = await session.initialize()
 
                 async def call(name, args):
                     result = await session.call_tool(name, args)
@@ -168,7 +172,12 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
                 await call("reprioritise_task", {"id": tid, "priority": "low", "reason": "downgrade via http"})
                 why = await call("why_task", {"id": tid})
                 undone = await call("undo", {})
-                return {"id": tid, "why": why, "undone": undone}
+                return {
+                    "id": tid,
+                    "why": why,
+                    "undone": undone,
+                    "server_version": init_result.serverInfo.version,
+                }
 
     with _LiveServer(token) as live:
         no_token = httpx.post(
@@ -205,6 +214,41 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
         # 421'd before the fix.
         tunnel_outcome = asyncio.run(_round_trip(live.base_url, {"Host": tunnel_host}))
 
+        # 0.2.12 Red Team pass, finding #6 (docs/dogfooding-log.md): these
+        # four are malformed at the HTTP-transport-envelope level -- below
+        # the session/tool-call layer BearerAuth and cadence's own tool
+        # functions already cover -- rejected by the `mcp` SDK's own
+        # request parsing before a tool (or even a session) ever exists.
+        # A valid token is presented on every one of these; only the
+        # request itself is malformed.
+        good_headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        bad_json_body = httpx.post(
+            live.base_url,
+            content=b'{"jsonrpc": "2.0", "id": 1, "method": "ping"',  # truncated -- invalid JSON
+            headers=good_headers,
+        )
+        missing_method = httpx.post(
+            live.base_url,
+            json={"jsonrpc": "2.0", "id": 1},  # valid JSON, no "method" field
+            headers=good_headers,
+        )
+        missing_accept = httpx.post(
+            live.base_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={k: v for k, v in good_headers.items() if k != "Accept"},
+        )
+        oversized_body = httpx.post(
+            live.base_url,
+            content=json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"pad": "x" * 5_000_000}}
+            ).encode(),
+            headers=good_headers,
+        )
+
     for resp in (no_token, wrong_token, wrong_token_tunnel_host):
         assert resp.status_code == 401, (resp.status_code, resp.text)
         body = resp.json()
@@ -221,6 +265,27 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
     for result in (outcome, tunnel_outcome):
         assert result["why"]["ok"] is True
         assert result["undone"]["ok"] is True
+        # 0.2.12 Red Team pass, finding #7: initialize's serverInfo.version
+        # used to be the `mcp` SDK's own version (FastMCP has no version=
+        # kwarg in this pinned SDK release), not Cadence's, so an agent
+        # doing the standard handshake could not tell which Cadence
+        # feature set it was talking to.
+        assert result["server_version"] == _cadence_version
+        assert result["server_version"] != _installed_mcp_sdk_version
+
+    for resp, expected_status, expected_error in (
+        (bad_json_body, 400, "malformed_json"),
+        (missing_method, 400, "invalid_request"),
+        (missing_accept, 406, "not_acceptable"),
+        (oversized_body, 413, "request_too_large"),
+    ):
+        assert resp.status_code == expected_status, (resp.status_code, resp.text)
+        assert resp.headers["content-type"].startswith("application/json"), resp.headers
+        body = resp.json()
+        assert body["ok"] is False, body
+        assert body["error"] == expected_error, body
+        assert body["message"], body
+        assert body["hint"], body
 
     # Not the HTTP session's own view -- a fresh Store opened directly on
     # the same CADENCE_DB_PATH the CLI would use, proving one store, not a

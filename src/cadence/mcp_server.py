@@ -14,6 +14,8 @@ request comes back as data, not a stack trace.
 """
 from __future__ import annotations
 
+import hmac
+import json
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -21,6 +23,7 @@ from mcp.server.fastmcp.exceptions import ToolError as _FastMCPToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import ValidationError as _PydanticValidationError
 
+from cadence import __version__ as _cadence_version
 from cadence.registry import project_name, read_projects_file, read_registry
 from cadence.registry import register_project as _register_project
 from cadence.store import (
@@ -85,6 +88,16 @@ mcp = FastMCP(
         "a duplicate)."
     ),
 )
+
+# 0.2.12 Red Team pass, finding #7: this SDK version's FastMCP(...)
+# constructor has no `version=` kwarg (only the lower-level mcp.server.
+# lowlevel.server.Server it wraps does), so without this line the
+# `initialize` handshake's serverInfo.version fell back to the `mcp`
+# package's own version ("1.29.1") -- meaningless to an agent trying to
+# tell which Cadence feature set it's talking to. Setting the attribute
+# `create_initialization_options()` actually reads at request time is the
+# only way to reach it through this SDK version's public surface.
+mcp._mcp_server.version = _cadence_version
 
 
 def _err(exc: CadenceError) -> dict:
@@ -670,6 +683,74 @@ def run() -> None:
     mcp.run(transport="stdio")
 
 
+def _classify_envelope_error(status_code: int, message_text: str) -> tuple[str, str]:
+    """Map a raw mcp-SDK HTTP-transport-envelope error's status/message to
+    a cadence (error_code, hint) pair. `message_text` is the SDK's own
+    plain-English message text -- either the `message` field of its raw
+    JSON-RPC error object, or (for the 413 case, which isn't JSON at all)
+    its bare plain-text body."""
+    lower = message_text.lower()
+    if status_code == 413 or "too large" in lower:
+        return "request_too_large", (
+            "Send a smaller request body -- split it into multiple calls "
+            "if needed."
+        )
+    if "parse error" in lower:
+        return "malformed_json", "Send a single well-formed JSON object as the request body."
+    if "not acceptable" in lower:
+        return "not_acceptable", (
+            "Send an 'Accept: application/json, text/event-stream' header on every request."
+        )
+    if "validation error" in lower or "field required" in lower:
+        return "invalid_request", (
+            "Include the required JSON-RPC fields ('jsonrpc', 'id', 'method') in the request body."
+        )
+    if "session" in lower:
+        return "session_error", "Start a new session with 'initialize' and retry."
+    return "malformed_request", (
+        "Check the request against the MCP Streamable HTTP spec (headers, JSON-RPC body shape) and retry."
+    )
+
+
+def _clean_sdk_message(text: str) -> str:
+    """Strip the pydantic-errors-URL boilerplate the SDK's own validation
+    messages append (e.g. "...For further information visit
+    https://errors.pydantic.dev/...") and collapse embedded newlines, so
+    the message a client reads is the same plain-English sentence a
+    cadence-raised error would give -- without inventing new wording for
+    what is still, honestly, the SDK's own message."""
+    text = text.split("For further information visit", 1)[0].strip()
+    return " ".join(text.split())
+
+
+def _envelope_error_shape(status_code: int, body: bytes, content_type: str) -> Optional[dict]:
+    """Translate a raw mcp-SDK-level HTTP error response -- one rejected
+    by the SDK's own request parsing before a tool was ever invoked, so it
+    never went through cadence's own {ok, error, message, hint} tool-
+    response path -- into that same contract.
+
+    Returns None if `body` is not one of the SDK's raw shapes (e.g. it's
+    already cadence-shaped, such as BearerAuth's own 401), so the caller
+    knows to forward it untouched rather than double-wrap it.
+    """
+    text = body.decode("utf-8", errors="replace")
+    message = text
+    if "json" in content_type:
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            if "ok" in payload:
+                return None
+            err = payload.get("error")
+            if isinstance(err, dict) and "message" in err:
+                message = err["message"]
+    message = _clean_sdk_message(message)
+    error_code, hint = _classify_envelope_error(status_code, message)
+    return {"ok": False, "error": error_code, "message": message, "hint": hint}
+
+
 def _make_http_app(token: str):
     """Wrap the stock MCP Streamable HTTP ASGI app with a bearer-token
     check, so `cadence mcp --http` is safe to bind on an interface other
@@ -688,7 +769,73 @@ def _make_http_app(token: str):
     from starlette.responses import JSONResponse
     from starlette.types import ASGIApp, Receive, Scope, Send
 
-    inner: ASGIApp = mcp.streamable_http_app()
+    class _EnvelopeErrorShim:
+        """Sits between BearerAuth and the raw mcp SDK app. 0.2.12 Red
+        Team pass, finding #6 (docs/dogfooding-log.md): once inside a
+        valid session, a genuine tool-level error correctly comes back
+        cadence-shaped -- confirmed working -- but anything malformed
+        enough to be rejected by the SDK's own request handling before a
+        tool is ever invoked (bad JSON body, missing `method`, missing
+        Accept header, oversized body) returned the SDK's raw JSON-RPC/
+        plain-text error instead, a shape this server's own `initialize`
+        response never told a client to expect.
+
+        Only error responses (status >= 400) are touched, and only once
+        fully buffered -- those are always single Response objects, never
+        streams. Success/SSE responses (status < 400) are forwarded
+        message-for-message, unbuffered, exactly as they arrive: this
+        shim must never hold up or alter a live streaming reply.
+        """
+
+        def __init__(self, app: ASGIApp) -> None:
+            self.app = app
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
+
+            state: dict = {"status": 200, "headers": [], "buffer": bytearray(), "start": None}
+
+            async def wrapped_send(message: dict) -> None:
+                if message["type"] == "http.response.start":
+                    state["status"] = message["status"]
+                    state["headers"] = message.get("headers", [])
+                    if state["status"] < 400:
+                        await send(message)
+                        return
+                    state["start"] = message  # hold until the body is fully seen
+                    return
+                if message["type"] == "http.response.body":
+                    if state["status"] < 400:
+                        await send(message)
+                        return
+                    state["buffer"].extend(message.get("body", b""))
+                    if message.get("more_body"):
+                        return
+                    content_type = next(
+                        (v.decode("latin-1") for k, v in state["headers"] if k == b"content-type"),
+                        "",
+                    )
+                    shaped = _envelope_error_shape(state["status"], bytes(state["buffer"]), content_type)
+                    if shaped is None:
+                        await send(state["start"])
+                        await send({"type": "http.response.body", "body": bytes(state["buffer"])})
+                        return
+                    body_bytes = json.dumps(shaped).encode("utf-8")
+                    new_headers = [
+                        (k, v) for k, v in state["headers"] if k not in (b"content-type", b"content-length")
+                    ]
+                    new_headers.append((b"content-type", b"application/json"))
+                    new_headers.append((b"content-length", str(len(body_bytes)).encode("latin-1")))
+                    await send({"type": "http.response.start", "status": state["status"], "headers": new_headers})
+                    await send({"type": "http.response.body", "body": body_bytes})
+                    return
+                await send(message)
+
+            await self.app(scope, receive, wrapped_send)
+
+    inner: ASGIApp = _EnvelopeErrorShim(mcp.streamable_http_app())
 
     class BearerAuth:
         def __init__(self, app: ASGIApp, expected_token: str) -> None:
@@ -702,7 +849,13 @@ def _make_http_app(token: str):
             headers = dict(scope.get("headers") or [])
             auth = headers.get(b"authorization", b"").decode("latin-1")
             presented = auth[7:] if auth.startswith("Bearer ") else None
-            if presented != self.expected_token:
+            # hmac.compare_digest, not `!=`: a plain string comparison
+            # short-circuits on the first mismatched byte, a theoretical
+            # timing side-channel an attacker could use to recover the
+            # token one byte at a time (0.2.12 Red Team pass, unverified
+            # hunch). compare_digest runs in constant time regardless of
+            # where the strings first differ.
+            if presented is None or not hmac.compare_digest(presented, self.expected_token):
                 response = JSONResponse(
                     {
                         "ok": False,
