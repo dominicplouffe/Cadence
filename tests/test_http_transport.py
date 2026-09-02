@@ -308,6 +308,34 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
             ).encode(),
             headers=good_headers,
         )
+        # Dov's independent-verify finding on 0.2.20 (docs/dogfooding-log.md):
+        # a *flat*, non-nested JSON integer literal with more digits than
+        # Python's int<->str conversion limit (4300) made stdlib json.loads
+        # raise ValueError inside int() before cadence's code ever ran --
+        # unrelated to the nesting-depth guard above (no nesting at all
+        # here), so it slipped past that fix and surfaced as a correctly-
+        # classified but misleadingly-worded 500 ("editing the request will
+        # not help", which was false: shrinking the number fixes it every
+        # time). 4300 digits must still parse fine; 4301 is the exact
+        # boundary Dov confirmed triggers it.
+        oversized_int_body = httpx.post(
+            live.base_url,
+            content=(
+                '{"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"x": '
+                + ("9" * 4301)
+                + "}}"
+            ).encode(),
+            headers=good_headers,
+        )
+        oversized_int_body_at_boundary = httpx.post(
+            live.base_url,
+            content=(
+                '{"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"x": '
+                + ("9" * 4300)
+                + "}}"
+            ).encode(),
+            headers=good_headers,
+        )
 
     for resp in (no_token, wrong_token, wrong_token_tunnel_host):
         assert resp.status_code == 401, (resp.status_code, resp.text)
@@ -339,6 +367,7 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
         (missing_accept, 406, "not_acceptable"),
         (oversized_body, 413, "request_too_large"),
         (deeply_nested_body, 400, "malformed_json"),
+        (oversized_int_body, 400, "malformed_json"),
     ):
         assert resp.status_code == expected_status, (resp.status_code, resp.text)
         assert resp.headers["content-type"].startswith("application/json"), resp.headers
@@ -347,6 +376,25 @@ def test_http_transport_auth_gate_then_authorized_round_trip_same_store(http_env
         assert body["error"] == expected_error, body
         assert body["message"], body
         assert body["hint"], body
+
+    # The whole point: this is a 4xx now, with a hint that matches the real
+    # fix (shrink the number) -- not the old 500 "editing the request will
+    # not help", which was false for this input.
+    oversized_int_hint = oversized_int_body.json()["hint"].lower()
+    assert "will not help" not in oversized_int_hint, oversized_int_body.json()
+
+    # 4300 digits is the exact boundary Dov confirmed still parses fine --
+    # must not be caught by the new pre-validation (only 4301+ is). It falls
+    # through to an ordinary session_error, since this request never called
+    # 'initialize' first -- unrelated to the digit limit, just confirming
+    # this body was accepted as valid JSON.
+    assert oversized_int_body_at_boundary.status_code == 400, (
+        oversized_int_body_at_boundary.status_code,
+        oversized_int_body_at_boundary.text,
+    )
+    assert oversized_int_body_at_boundary.json()["error"] == "session_error", (
+        oversized_int_body_at_boundary.json()
+    )
 
     # Not the HTTP session's own view -- a fresh Store opened directly on
     # the same CADENCE_DB_PATH the CLI would use, proving one store, not a

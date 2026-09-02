@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import sys
 from typing import Optional
 
 import mcp.server.streamable_http as _streamable_http_module
@@ -96,6 +97,54 @@ def _json_nesting_too_deep(data: object, limit: int) -> bool:
     return False
 
 
+# Dov's independent-verify finding on 0.2.20: a bare (unquoted) JSON integer
+# literal with more digits than the interpreter's int<->str conversion limit
+# makes stdlib json.loads raise ValueError *inside* int() -- a different crash
+# than the nesting-depth RecursionError above, but the same family: malformed
+# client input reaching the SDK's raw parser before cadence's own error
+# handling can shape it into a clean 4xx. Pre-validating it here means it
+# degrades to the same malformed_json 400 path as the nesting case, with a
+# hint that matches the actual fix (shrink the number) instead of the 500
+# "editing the request will not help" hint that _classify_envelope_error
+# gives every status_code >= 500, which is simply false for this input.
+_MAX_JSON_INT_DIGITS = sys.get_int_max_str_digits()  # 4300 by default; 0 means
+# the interpreter's limit has been disabled (PYTHONINTMAXSTRDIGITS=0), in which
+# case int() never raises for this reason and there is nothing to pre-empt.
+
+
+def _json_number_too_long(data: object, limit: int) -> bool:
+    """Cheap single-pass scan for a run of digits outside any string literal
+    longer than `limit` -- e.g. a bare JSON integer with more digits than
+    Python allows int() to convert. A JSON integer literal (no `.` or `e`) is
+    always one unbroken run of digits, so this single-pass scan (which cannot
+    itself recurse or build the number) catches it before json.loads would
+    call int() on it. A long numeric *string* value (quoted) is correctly
+    ignored, since that never reaches int()."""
+    text = data.decode("utf-8", "replace") if isinstance(data, (bytes, bytearray)) else str(data)
+    in_string = False
+    escaped = False
+    run = 0
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            run = 0
+        elif ch.isdigit():
+            run += 1
+            if run > limit:
+                return True
+        else:
+            run = 0
+    return False
+
+
 class _DepthBoundedJSONForStreamableHTTP:
     """Stand-in for the `json` module, installed only as the `json` name
     inside `mcp.server.streamable_http`'s own namespace (see below) --
@@ -111,6 +160,13 @@ class _DepthBoundedJSONForStreamableHTTP:
             text = data.decode("utf-8", "replace") if isinstance(data, (bytes, bytearray)) else str(data)
             raise json.JSONDecodeError(
                 f"JSON nesting exceeds this server's {_MAX_JSON_NESTING_DEPTH}-level limit",
+                text,
+                0,
+            )
+        if _MAX_JSON_INT_DIGITS and _json_number_too_long(data, _MAX_JSON_INT_DIGITS):
+            text = data.decode("utf-8", "replace") if isinstance(data, (bytes, bytearray)) else str(data)
+            raise json.JSONDecodeError(
+                f"JSON number exceeds this server's {_MAX_JSON_INT_DIGITS}-digit limit",
                 text,
                 0,
             )
