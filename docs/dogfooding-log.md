@@ -2687,3 +2687,106 @@ Waiting ~2 minutes and retrying with `--no-cache-dir` got a clean
 the fourth time it's shown up, worth building the retry directly into
 whatever eventually re-runs the ten-step finish-line script rather
 than re-diagnosing it by hand each time.
+
+## 2026-09-03 (Dov Ferreira, Red Team) — independent pass on 0.2.23: the passive-relay fix has a second, unguarded hole
+
+Verified 0.2.23 installs clean (6th independent install across three
+engineers/environments today, all clean; PyPI CDN lag is fully settled
+by now). The original A2/X2/C2 sequence from the findings doc — a
+task orphaned on a passive relay survives that relay's own later sync
+with a third client — passes exactly as Rafael's transcript and test
+claim. That part of the fix holds.
+
+But `_absorb_orphan_task_files` only runs inside `_sync_diff_and_apply`,
+i.e. only when the relay client itself runs `cadence sync`. It does
+nothing to protect an orphan file from the relay's own plain, everyday
+`cadence add` (or any other id-allocating write — `decompose` almost
+certainly shares the same code path, not independently tested here) run
+*before* that next sync. `Store.add()` allocates its new id purely from
+sqlite's own autoincrement and writes `tasks/<id>.json` via
+`_snapshot_and_commit`, with zero awareness of what's already sitting in
+`hist.tasks_dir` on disk. If that id happens to match an orphan file's
+id — which it will, on a freshly-relaying store, since sqlite is empty
+and hands out id=1 first — the add silently overwrites the orphan file.
+No error, no warning, no conflict, exit 0. This is exactly the failure
+mode the fix's own docstring names ("or letting a later alloc() hand out
+its on-disk id to some unrelated origin and overwrite it — silently
+destroys the only copy of a task nobody told this client to forget"),
+just at a different call site than the one 0.2.23 closed.
+
+Repro, real published 0.2.23 wheel, fresh venv (`/workspace/sync_repro_0903/venv`,
+upgraded in place with `pip install --upgrade cadence-todo==0.2.23`):
+
+```
+$ export CADENCE_DB_PATH=A/a.db
+$ cadence add "task on A, pre-relay"          # A's task, id=1, origin o1
+$ cadence sync --remote X/x.db                # X has never synced before;
+                                               # its .db.history is init'd first with
+                                               # a bare `cadence sync` (fails "no remote
+                                               # configured" but creates the git history)
+Synced with origin: pulled 0, pushed 1. Up to date.
+$ CADENCE_DB_PATH=X/x.db cadence list
+No tasks yet.                                  # confirms: X's sqlite has no row
+$ find X -iname '*.json'
+X/x.db.history/tasks/1.json                     # orphan file: A's task, id=1, on disk only
+
+$ export CADENCE_DB_PATH=X/x.db
+$ cadence add "task native to X"                # ordinary local add, NOT a sync call
+Added #1: task native to X                      # X's sqlite was empty -> allocates id=1
+$ cadence sync --remote C/c.db                  # trigger self-heal/absorb on X
+Synced with origin: pulled 0, pushed 1. Up to date.
+$ cadence list
+  [ ]    1   task native to X                   # only 1 task. A's task is gone.
+$ cat X/x.db.history/tasks/1.json
+{ "title": "task native to X", "origin": "9be514d6...", ... }   # file 1.json now holds
+                                                                   # X's task; A's task's
+                                                                   # content is not
+                                                                   # anywhere on X anymore
+```
+
+The overwrite happens at the `cadence add` line, before any sync or
+self-heal runs at all — the 0.2.23 fix never gets invoked on this path.
+In this run the loss was not permanent project-wide only because A
+still held its own copy and happened to sync with X again afterward
+(that second sync resolved cleanly via the id-collision/renumber path,
+landing A's task back on X as id=2 — that part works correctly and is
+a separate, healthy code path). But nothing in the design guarantees a
+second sync happens, or that the original owner still has their copy —
+a relay that is someone's only path to a task (e.g. the origin device
+was wiped after the first push) loses that task for good, silently,
+with no exit-code or message signal anything happened.
+
+Root cause: `Store.add()` (`src/cadence/store.py` ~line 479) allocates
+ids from sqlite alone and `_snapshot_and_commit` writes
+`tasks/<id>.json` unconditionally, with no check against
+`hist.tasks_dir` for a same-id file sqlite doesn't know about. Fix
+would need either (a) `add`'s id allocation to also skip ids with an
+existing on-disk file sqlite hasn't absorbed, or (b) run
+`_absorb_orphan_task_files` (or an equivalent scan) before any local
+id allocation, not just inside sync. `decompose`'s subtask creation
+should be checked for the same pattern before calling this closed —
+not tested in this pass.
+
+Severity: high. Silent, undetectable data loss on completely ordinary
+use (add a task on a client that has ever been the target of someone
+else's `--remote`), no adversarial input needed, no error surfaced —
+the exact class of bug the 0.2.23 fix set out to close, just not
+closed all the way. This is the one I'd fix first if only one thing
+from today's pass gets picked up.
+
+What held: the original A2/X2/C2 scenario (relay survives its OWN next
+sync without an intervening local add) — clean, confirmed independently
+again. The id-collision renumber path on a second sync (`"#1 was
+independently created on both clients ... kept #1 as this client's
+version and gave the other client's task a new id, #2. Nothing was lost
+or overwritten"`) — also clean, and its own message is accurate for
+that case, in contrast to the misleading identical message the original
+finding cited against 0.2.22.
+
+Not tested this pass: `decompose` sharing the same alloc pattern;
+concurrent relay writes (two peers pushing to the same passive relay
+between its syncs); whether a corrupted/malformed orphan file on disk
+(present but unreadable JSON) is silently dropped by
+`_absorb_orphan_task_files`'s `except (OSError, ValueError): continue`
+in a way that also loses data with no signal — plausible from reading
+the code, not independently reproduced.
