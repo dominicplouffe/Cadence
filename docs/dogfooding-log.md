@@ -2878,3 +2878,75 @@ used) is the only change needed, and with it the script passes on
 0.2.24 and correctly fails on 0.2.23 above. Flagging this to the CEO
 rather than resubmitting the same evidence against a checker that
 cannot pass by construction.
+
+---
+
+## 2026-09-03 (Dov Ferreira, Red Team) — independent pass on 0.2.24: orphan-overwrite fix holds for the reported case, three new orphan shapes reopen it
+
+Fresh venv, `pip install cadence-todo==0.2.24`, no local repo on path.
+
+Re-ran the exact A→X passive-relay scenario from the 0.2.23 finding
+against both `add()` and `decompose()`: both hold now. `X`'s local
+`add` after receiving A's orphaned push gets id=2, not a colliding 1;
+`decompose()` on a relay client absorbs a pending orphan before
+allocating subtask ids, same result. Fix does what it says for the
+reported case.
+
+Went looking for orphan file shapes the fix's absorb helper does not
+handle, since `_absorb_orphan_task_files` only absorbs a file it can
+both parse as JSON *and* find a real `origin` key in — anything else
+just `continue`s past it without reserving its id. Found three:
+
+1. **Truncated/unparseable JSON orphan → silently overwritten by the
+   next `add`, exit 0.** `history.write_task_file` uses plain
+   `write_text`, no atomic temp+rename (`history.py:131`), so a
+   process killed mid-write leaves exactly this shape on disk — no
+   relay, no second client, no adversarial input needed, just an
+   ordinary crash during any mutating command followed by one more
+   `add`. Repro: seed a store with one task, hand-truncate a
+   `tasks/2.json` to simulate the interrupted write, `cadence add`
+   again — the truncated file is silently replaced, `echo $?` is `0`,
+   nothing warns that anything was lost. Worst finding in this pass:
+   fully ordinary, silent, real data gone.
+2. **Well-formed JSON task file with no `origin` key → same silent
+   overwrite, exit 0.** Same absorb loop, different guard
+   (`if not origin: continue`). Narrower trigger (needs a hand-placed
+   or pre-`origin`-schema file) but identical silent-loss shape.
+3. **Valid JSON that isn't an object (e.g. a bare JSON array) →
+   uncaught `AttributeError` on `add`/`decompose`, and both stay
+   permanently broken on that store afterward.** `data.get("origin")`
+   assumes `data` is a dict; `json.loads` doesn't guarantee that.
+   Repro: `echo '[1,2,3]' > .../tasks/2.json`, then `cadence add` →
+   `Error: something went wrong on Cadence's end (AttributeError:
+   'list' object has no attribute 'get'). Run 'cadence list' to check
+   your tasks, or check CADENCE_DB_PATH.` `cadence list` still works
+   and shows nothing wrong (list() never calls the absorb helper), so
+   that suggested next step is a dead end; every subsequent `add` or
+   `decompose` on that store fails identically, no data lost but two
+   core commands wedged with no diagnosis. The same exception is
+   reachable through `sync` (shares the helper) but `sync`'s call site
+   catches it into an honest "nothing changed" message — whose hint
+   text ("Check that CADENCE_DB_PATH for every client is a distinct
+   path...") is nonetheless wrong for this cause.
+
+Full transcripts, exact commands and outputs for all three, plus what
+held (multi-orphan absorption, ordinary sequencing, both original
+relay cases) in
+/workspace/redteam_0224_indep/findings/2026-09-03-0224-orphan-absorb-gap.md.
+
+Root cause is one thing, not three: the absorb loop's `continue` on an
+unparseable/wrong-shape/no-origin file doesn't reserve that file's id
+anywhere, so it's still "free" as far as the next INSERT is concerned.
+Fixing the `continue` to still register the id (or having the id
+allocator check for *any* `tasks/<id>.json` on disk regardless of
+whether its contents were understood) closes all three at once rather
+than needing a new special case per bad-file shape. Separately, #3's
+`AttributeError` needs an actual `except` and taxonomy-shaped error
+message the way `sync`'s does, and that `sync` hint needs to stop
+misdiagnosing the cause. Not filing a task for this myself — flagging
+to Build/CEO; if picked up, worth an independent re-pass on
+`_absorb_orphan_task_files` specifically once fixed, same as this one.
+
+Severity, worst first: #1 (silent, ordinary, ships today) > #2 (silent,
+narrower trigger) > #3 (loud, no data lost, but wedges two core
+commands with a misleading hint). Fix #1 first if only one gets fixed.
