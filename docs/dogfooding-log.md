@@ -2479,3 +2479,112 @@ No new finding. The fix holds against all five checks, generalizes
 correctly beyond the one case already tested, and the live-PyPI verify
 script is a real regression trap, not decoration. Server and venv torn
 down after capture; nothing left running.
+
+## 2026-09-03 (Dov Ferreira, Red Team) — Week-2 dogfooding: real company queue on cadence-todo 0.2.21, one real sync bug found
+
+Fresh venv, `pip install cadence-todo` from live PyPI (no local
+checkout, no editable install) → confirmed `Version: 0.2.21`. Set
+`CADENCE_DB_PATH` to a new db and actually ran this week's queue
+through it, not staged fixtures:
+
+- `cadence add "Finish bake-off ranking doc: rank 5 concepts, write why the other 4 lost" --priority high`
+- `cadence add "Watch CI pypi-install-and-drive job for flakiness after 0.2.21" --priority low`
+- `cadence add "Red Team: keep dated weekly dogfooding entries going, not one-time backfill" --priority med`
+- `cadence schedule 1 ...` decomposed into 3 real subtasks (`cadence decompose 1 --into "Draft the 5-concept comparison table" "Score each concept against the three finish-line tests" "Write the ranking with the losing-4 rationale"`)
+- scheduled, reprioritised, completed, queried (`list`, `overdue`), undid a reprioritise, exported to JSON, and synced the queue across two clients (a laptop db and a phone db) — 8 of the 10 script-shaped operations, not just the required 2-3.
+
+### Minor friction, not a defect
+
+`cadence add --priority medium` is rejected — only `high`/`med`/`low`
+are accepted, and "medium" is the natural word a person types. The
+error message is good (`Try: --priority high, --priority med, or
+--priority low`), so this cost seconds, not minutes, but it's real
+friction on the very first command of the session.
+
+`add` takes priority/due as flags (`--priority`, `--due`) but
+`reprioritise`/`schedule` take the equivalent value as a bare
+positional (`cadence reprioritise <id> <priority>`, `cadence schedule
+<id> <date>`). I reached for `--priority`/`--when` on both by habit
+from `add` and got a clean argparse usage error both times, never a
+crash — so legibility held — but the surface itself is inconsistent
+about flag vs. positional for the same kind of value across sibling
+commands. Worth a design pass, not urgent.
+
+### Real bug: false sync conflict when a task was edited locally before its owner's own first-ever sync
+
+Severity: moderate. Consequence: sync refuses to converge and reports
+"1 conflict needs you" on a task nobody actually edited concurrently;
+recovery works (`--keep-mine`/`--keep-theirs`, nothing is silently
+overwritten) but costs a manual step every time this shape occurs, and
+an agent picking `--keep-mine` on reflex (favouring its own state)
+would genuinely destroy the other side's real edit, because the tool
+cannot itself tell this apart from a real conflict.
+
+This hit live, in the ordinary flow above: on client A I created task
+#4 then scheduled it (`cadence schedule 4 2026-09-08`), both before A
+had ever run `cadence sync`. Client B pulled it (already scheduled)
+and completed it. When A ran its own first-ever `cadence sync` to pull
+B's completion:
+
+```
+Synced with origin: pulled 0, pushed 1. 1 conflict needs you.
+Error: #4 was edited on both this client and the remote since the
+last sync. Nothing was overwritten. Run 'cadence sync --keep-mine 4'
+or 'cadence sync --keep-theirs 4', then sync again.
+```
+
+Neither side made a real concurrent edit — A's "edit" was the
+schedule, already fully present in what B pulled; B's only edit was
+the completion, made against A's already-scheduled state. Minimal,
+isolated repro (`/workspace/dogfood_week2/repro_conflict2`, not staged
+against the real queue db):
+
+```
+CADENCE_DB_PATH=a/db.sqlite cadence add "task edited on A before A ever syncs"
+CADENCE_DB_PATH=a/db.sqlite cadence schedule 1 2026-09-08 --reason "pre-sync edit on A"
+CADENCE_DB_PATH=b/db.sqlite cadence sync --remote a/db.sqlite      # B's first sync, pulls #1 already scheduled
+CADENCE_DB_PATH=b/db.sqlite cadence done 1                         # B's only edit, post-pull
+CADENCE_DB_PATH=a/db.sqlite cadence add "unrelated new task on A"  # A never touches #1 again
+CADENCE_DB_PATH=a/db.sqlite cadence sync --remote b/db.sqlite      # A's first-ever sync call
+# -> "1 conflict needs you" on #1, false positive
+```
+
+A control run with the schedule step removed (A creates #1 and never
+touches it again before A's first sync) does **not** conflict — pulls
+cleanly, matching the existing regression test
+`tests/test_r08_verbs.py::test_sync_first_ever_sync_does_not_false_conflict_on_untouched_task`.
+That test's own docstring says "A: create, never touched again" —
+exactly the gap: it covers zero pre-sync local edits, not one or more.
+
+Root cause, read from `src/cadence/store.py`
+(`Store._first_sync_task_base`, used from `_sync_diff_and_apply` when
+`base_ref is None`, i.e. a client's first-ever sync): for a row this
+client already held before its first sync, the merge base is
+reconstructed from `hist.log_for_file(relpath)` and taken as
+`commits[-1]` — documented in the function's own docstring as "the
+OLDEST commit that ever touched tasks/<id>.json", i.e. the row's
+content at **creation**. If the client edited that row (schedule,
+reprioritise, decompose — anything that adds a second local commit for
+that file) at any point before its own first sync, the true base
+should be the row's content at the **most recent** pre-sync commit,
+not the oldest. Diffing against the stale creation-time base makes
+`mine_changed` true for an edit the remote already has in full, and if
+the remote independently changed the row afterward, `theirs_changed`
+is also true — both look changed since a base neither side actually
+shares, producing a false "edited on both sides" conflict. Filed here
+for Build to pick up; not fixed by Red Team.
+
+### What held
+
+Malformed/edge requests against the real installed package, all clean
+40x-shaped CLI errors, no crash, no stack trace: `cadence done 999`
+(no such id), `cadence add ""` (empty title), `cadence schedule -5
+2026-09-08` (negative id), `cadence schedule 4 "next tuesday"`
+(unparseable date). `undo` correctly reverted a reprioritise and
+`list` reflected it immediately. `export` produced valid JSON with the
+full real task set. The sync-conflict recovery path itself
+(`--keep-theirs`) resolved cleanly to the correct converged state once
+invoked.
+
+Company queue and both dogfooding-log entries above are the real
+week-2 usage; nothing here was staged purely to fail.
