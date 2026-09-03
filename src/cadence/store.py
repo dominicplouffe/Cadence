@@ -502,6 +502,27 @@ class Store:
             )
         if due is not None:
             due = _validate_due(due)
+        hist = self._history()
+        # Red Team finding, docs/dogfooding-log.md 2026-09-03 ("second
+        # unguarded data-loss path"): the INSERT below lets sqlite pick
+        # this row's id from its own AUTOINCREMENT counter alone. On a
+        # client that has only ever been a PASSIVE sync relay for some
+        # other client (its `tasks/<id>.json` files exist on disk --
+        # written straight into the working tree by the peer's push --
+        # but its sqlite has never absorbed them, exactly the case
+        # `_absorb_orphan_task_files` exists for), that counter starts
+        # from empty and hands out id=1 first, colliding with an
+        # on-disk id this client is unknowingly carrying for someone
+        # else. `_snapshot_and_commit` below then writes tasks/<id>.json
+        # unconditionally, silently overwriting that peer's only copy --
+        # no sync involved, no error, no exit code signal.
+        #
+        # Absorbing every orphan into real sqlite rows FIRST closes the
+        # gap the same way `_sync_diff_and_apply` already does: each
+        # absorbed row's id is inserted into sqlite explicitly, which
+        # advances sqlite's own AUTOINCREMENT high-water mark past it,
+        # so the plain INSERT just below can never pick that id again.
+        self._absorb_orphan_task_files(hist, set())
         with closing(self._connect()) as conn:
             cur = conn.execute(
                 "INSERT INTO tasks (title, status, priority, due, created_at, origin) "
@@ -671,6 +692,14 @@ class Store:
                 f"got {len(titles)}",
                 hint="Split into two decompose calls.",
             )
+        # Same bug and fix as `add()` above (docs/dogfooding-log.md
+        # 2026-09-03): subtask ids below come from the same plain
+        # INSERT/AUTOINCREMENT allocation `add()` uses, so a client only
+        # ever used as a passive sync relay is exposed the same way --
+        # absorb any orphan task file into real sqlite rows first, before
+        # opening the connection that allocates the new ids, so it can
+        # never collide with (and silently overwrite) one.
+        self._absorb_orphan_task_files(self._history(), set())
         with closing(self._connect()) as conn:
             parent = self.get(parent_id, _conn=conn)  # raises TaskNotFound
             depth = self._depth(conn, parent_id)

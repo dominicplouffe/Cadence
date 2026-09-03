@@ -1128,3 +1128,82 @@ def test_sync_passive_relay_task_survives_hosts_own_later_sync(tmp_path):
     x2_titles = [t.title for t in store_x2.list(status="all")]
     assert x2_titles.count("X2's own task") == 1, x2_titles
     assert len(x2_titles) == 3
+
+
+def test_local_add_on_passive_relay_does_not_overwrite_orphan_task_file(tmp_path):
+    """Red Team independent pass on 0.2.23
+    (docs/dogfooding-log.md 2026-09-03, commit 989844d): the 0.2.23 fix
+    above only guards the SYNC path (`_sync_diff_and_apply` absorbs
+    orphans before its own self-heal runs). A relay client's sqlite is
+    still empty, so a plain LOCAL `add` -- no sync involved -- used to
+    allocate its new row's id straight from sqlite's own AUTOINCREMENT
+    counter, which starts from empty and hands out id=1 first. That
+    collided with the on-disk orphan file X is passively carrying for A
+    (written straight into X's tree by A's push, per the test above),
+    and `_snapshot_and_commit` wrote tasks/1.json unconditionally,
+    silently overwriting A's only copy -- no error, no exit code
+    signal. A's task must still be on X after X's own local add."""
+    store_a = Store(db_path=tmp_path / "orphan_add_a.db")
+    store_x = Store(db_path=tmp_path / "orphan_add_x.db")
+
+    store_a.add("A's task")
+    # A's own first sync: pushes straight into X's tree. X's sqlite does
+    # NOT learn about it -- X never calls sync() here, exactly like the
+    # relay case above.
+    r = store_a.sync(remote=str(store_x.db_path))
+    assert r["conflicts"] == []
+    assert r["pushed"] == 1
+    assert store_x.list(status="all") == []  # X's sqlite: still empty
+
+    # X's own local add -- no sync, no peer, nothing but this client.
+    task_x = store_x.add("task native to X")
+
+    x_titles = [t.title for t in store_x.list(status="all")]
+    assert "A's task" in x_titles, (
+        f"X's local add silently overwrote A's passively-relayed orphan "
+        f"task file: {x_titles}"
+    )
+    assert "task native to X" in x_titles
+    assert len(x_titles) == 2
+    # The two rows must have landed at distinct ids -- the whole bug was
+    # sqlite handing task_x the same id (1) A's on-disk file already used.
+    x_by_title = {t.title: t.id for t in store_x.list(status="all")}
+    assert x_by_title["A's task"] != x_by_title["task native to X"]
+
+    # X's next sync against A must not see the just-absorbed row as new
+    # (it already has A's content, verbatim) and must not duplicate it.
+    r2 = store_x.sync(remote=str(store_a.db_path))
+    assert r2["conflicts"] == []
+    a_titles_after = [t.title for t in store_a.list(status="all")]
+    assert a_titles_after.count("A's task") == 1, a_titles_after
+
+
+def test_decompose_on_passive_relay_does_not_overwrite_orphan_task_file(tmp_path):
+    """Same bug, same fix, the other allocation site: `decompose`'s
+    subtask ids come from the identical plain INSERT/AUTOINCREMENT
+    pattern `add` uses, so a passive relay is exposed the same way --
+    Dov flagged this as untested-but-likely-shared in the 0.2.23 finding;
+    confirming it here."""
+    store_a = Store(db_path=tmp_path / "orphan_decomp_a.db")
+    store_x = Store(db_path=tmp_path / "orphan_decomp_x.db")
+
+    store_a.add("A's task")
+    r = store_a.sync(remote=str(store_x.db_path))
+    assert r["conflicts"] == []
+    assert r["pushed"] == 1
+    assert store_x.list(status="all") == []
+
+    # X's parent task, created locally (exercises add's own fix too, but
+    # that is covered above -- here we only need a valid parent to
+    # decompose).
+    parent = store_x.add("X's parent task")
+    _, children = store_x.decompose(parent.id, ["sub one", "sub two"])
+
+    x_titles = [t.title for t in store_x.list(status="all")]
+    assert "A's task" in x_titles, (
+        f"X's decompose silently overwrote A's passively-relayed orphan "
+        f"task file: {x_titles}"
+    )
+    ids = [t.id for t in store_x.list(status="all")]
+    assert len(ids) == len(set(ids)), f"duplicate ids after decompose: {x_titles}"
+    assert len(x_titles) == 4  # A's task + X's parent + 2 subtasks
