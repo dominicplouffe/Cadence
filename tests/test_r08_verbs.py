@@ -1078,3 +1078,53 @@ def test_undo_preserves_origin_identity_across_sync(tmp_path):
     assert b_titles.count("Reprioritise me") == 1, b_titles
     assert len(store_a.list(status="all")) == 2
     assert len(store_b.list(status="all")) == 2
+
+
+def test_sync_passive_relay_task_survives_hosts_own_later_sync(tmp_path):
+    """Red Team independent pass, 2026-09-03
+    (redteam_verify0222_indep/findings/2026-09-03-sync-0.2.22-pass.md):
+    A2 is never touched directly by X2's owner -- X2 just runs `cadence
+    sync --remote A2`, which writes X2's task straight into A2's git
+    tree (`push_safe_merge`) without A2's own sqlite ever learning about
+    it. The very next time A2 runs its OWN `cadence sync`, this time
+    against a third client C2 that never heard of X2's task either,
+    A2's self-heal step used to treat "not in my own sqlite" as drift
+    and delete X2's on-disk file -- permanently, with zero conflict or
+    warning, even though the CLI's own text claims nothing was lost.
+    X2's task must still be on A2 after A2's second sync against a
+    different, unrelated peer."""
+    store_a2 = Store(db_path=tmp_path / "a2.db")
+    store_x2 = Store(db_path=tmp_path / "x2.db")
+    store_c2 = Store(db_path=tmp_path / "c2.db")
+
+    store_a2.add("A2's own task")
+    store_x2.add("X2's own task")
+
+    # X2's own first sync: pushes straight into A2's tree. A2's sqlite
+    # does NOT learn about it -- A2 never calls sync() here.
+    r_x2_1 = store_x2.sync(remote=str(store_a2.db_path))
+    assert r_x2_1["conflicts"] == []
+    assert r_x2_1["pushed"] == 1
+
+    store_c2.add("C2's own task")  # C2 never touched X2 or its task
+
+    # A2's own first sync, against C2 -- who never heard of X2's task.
+    r_a2 = store_a2.sync(remote=str(store_c2.db_path))
+    assert r_a2["conflicts"] == [], f"unexpected conflict: {r_a2}"
+
+    a2_titles = [t.title for t in store_a2.list(status="all")]
+    assert "X2's own task" in a2_titles, (
+        f"X2's passively-relayed task was silently purged by A2's own "
+        f"self-heal: {a2_titles}"
+    )
+    assert "A2's own task" in a2_titles
+    assert "C2's own task" in a2_titles
+    assert len(a2_titles) == 3
+
+    # X2's own second sync must still find its task alive on A2, and
+    # must not need to re-push it (it was never actually lost).
+    r_x2_2 = store_x2.sync(remote=str(store_a2.db_path))
+    assert r_x2_2["conflicts"] == []
+    x2_titles = [t.title for t in store_x2.list(status="all")]
+    assert x2_titles.count("X2's own task") == 1, x2_titles
+    assert len(x2_titles) == 3

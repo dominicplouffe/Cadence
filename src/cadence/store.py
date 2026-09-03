@@ -364,10 +364,22 @@ class Store:
         """
         if "://" in remote or remote.startswith("git@"):
             return remote
-        p = Path(remote)
+        # Absolute, not merely as-given: this string is handed straight to
+        # `git remote add origin <...>` on THIS client's own history repo,
+        # which stores it byte-for-byte and only resolves it later, at
+        # `git fetch` time, via `git -C <this store's own history dir>` --
+        # and `-C` chdir()s into that dir before git resolves anything, so
+        # a relative path here resolves against the WRONG base (this
+        # store's own history dir, not the caller's actual cwd) and either
+        # fetches nothing ("no Cadence store found") or -- worse -- a
+        # coincidentally-present unrelated repo at that relative offset.
+        # Resolving to absolute here, once, up front (while this process's
+        # own cwd is still the caller's real cwd) makes every later git
+        # invocation's own `-C` base irrelevant to this resolution.
+        p = Path(remote).resolve()
         if p.is_dir():
             if (p / ".git").is_dir() or (p / "HEAD").is_file():
-                return remote  # already points at a history repo (or bare repo)
+                return str(p)  # already points at a history repo (or bare repo)
             # Red Team MCP-stress-pass finding 2: a plain directory that is
             # NOT itself a git/bare repo is neither of the two things a
             # caller may legitimately pass (a git URL/bare-repo path, or a
@@ -1068,6 +1080,72 @@ class Store:
         except ValueError:
             return None
 
+    def _absorb_orphan_task_files(self, hist: GitHistory, skip_origins: set) -> None:
+        """A task file can sit in this store's OWN checked-out tree
+        (`tasks/<id>.json`) without this client's sqlite ever having
+        heard of it: `push_safe_merge` writes straight into the
+        checked-out working tree of whichever store it targets
+        (`receive.denyCurrentBranch=updateInstead`), so being used as
+        the passive REMOTE for some OTHER client's sync call leaves a
+        real task file on disk with no corresponding sqlite row at all.
+
+        The self-heal rewrite below (`final = ... from self.list()`)
+        treats "not in my own sqlite" as drift to erase -- correct for
+        a genuine stale duplicate (an old file left behind whose origin
+        sqlite already holds under a different id, the case self-heal
+        was built for) but wrong here: this file's origin is one this
+        client has never seen anywhere, so erasing it -- or letting a
+        later `alloc()` hand out its on-disk id to some unrelated
+        origin and overwrite it -- silently destroys the only copy of a
+        task nobody told this client to forget (redteam A2/X2/C2 hub
+        finding, docs/dogfooding-log.md 2026-09-03).
+
+        Absorb it into sqlite as a genuine local row first, at its own
+        on-disk id (always free, since we only reach here when that id
+        is not already in sqlite), so it becomes real content this
+        client itself now holds: counted in `local_used` so no later
+        allocation can collide with its file, and diffed/pushed like
+        any other row it knows -- never purged, never silently
+        clobbered. A file whose origin IS already known under some
+        other id is left alone here on purpose: that is real drift, and
+        self-heal below still cleans it up exactly as before.
+
+        `skip_origins` is every origin THIS sync call's own peer
+        (`theirs`) already reports -- for those, the ordinary "New to
+        me" pull branch in `_sync_diff_and_apply` below already adopts
+        the file correctly (real `theirs`-vs-`base` content, a
+        genuine `pulled` count in the returned summary). Absorbing
+        those here too would pre-empt that branch with a bare
+        same-content no-op, hiding a real pull as "already_synced" --
+        this is only for a THIRD party's origin, one that never came
+        through this call's own peer at all.
+        """
+        if not hist.tasks_dir.exists():
+            return
+        known = self.list(status="all")
+        known_ids = {t.id for t in known}
+        known_origins = {t.origin for t in known if t.origin}
+        for p in sorted(hist.tasks_dir.glob("*.json")):
+            try:
+                file_id = int(p.stem)
+            except ValueError:
+                continue
+            if file_id in known_ids:
+                continue
+            try:
+                data = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            origin = data.get("origin")
+            if not origin or origin in known_origins or origin in skip_origins:
+                continue
+            row = dict(data, id=file_id)
+            with closing(self._connect()) as conn:
+                self._apply_remote_task(conn, row)
+                conn.commit()
+            known_ids.add(file_id)
+            known_origins.add(origin)
+
     def _sync_diff_and_apply(self, hist: GitHistory, theirs_ref: str) -> dict:
         """Structural sync-identity fix (task
         task_01a04b9b39057fc952517775, spec
@@ -1091,11 +1169,20 @@ class Store:
         identity conflict (two independent rows can never share a UUID).
         """
         base_ref = hist.sync_base_sha()
+        theirs = hist.snapshot_at(theirs_ref)
+        base = hist.snapshot_at(base_ref) if base_ref else {}
+        # Absorb any task file this store is only passively carrying for
+        # a THIRD party (see _absorb_orphan_task_files) into real sqlite
+        # rows BEFORE `mine`/`local_used` are built below, so the diff
+        # loop and the self-heal rewrite both see it as genuinely known
+        # content -- skipping any origin `theirs` (this call's own peer)
+        # already reports, which the ordinary pull branch below already
+        # adopts correctly with a real `pulled` count.
+        theirs_origins = {d.get("origin") for d in theirs.values() if d.get("origin")}
+        self._absorb_orphan_task_files(hist, theirs_origins)
         # to_full_dict, not to_dict: this merge engine needs `origin`;
         # nothing here is returned to a CLI/MCP caller directly.
         mine = {t.id: t.to_full_dict() for t in self.list(status="all")}
-        theirs = hist.snapshot_at(theirs_ref)
-        base = hist.snapshot_at(base_ref) if base_ref else {}
 
         def by_origin(d: dict) -> dict:
             idx = {}
