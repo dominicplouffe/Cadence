@@ -1034,8 +1034,11 @@ class Store:
             raise SyncInconsistent(
                 f"sync hit an internal inconsistency reading history data ({type(exc).__name__}: {exc})",
                 hint=(
-                    "Nothing was changed. Check that CADENCE_DB_PATH for every "
-                    "client is a distinct path ending in '.db', then try again."
+                    "Nothing was changed. This usually means a task file in "
+                    "the history store is corrupted or in an unexpected "
+                    "shape -- inspect <store>.history/tasks/*.json for a bad "
+                    "file, or file a bug. (Distinct clients sharing one "
+                    "CADENCE_DB_PATH is a different, already-guarded case.)"
                 ),
             ) from exc
 
@@ -1148,9 +1151,25 @@ class Store:
         same-content no-op, hiding a real pull as "already_synced" --
         this is only for a THIRD party's origin, one that never came
         through this call's own peer at all.
+
+        Dov's independent 0.2.24 pass (docs/dogfooding-log.md
+        2026-09-03) found this loop only reserves an id for a file it
+        can BOTH parse as JSON and find a real "origin" key in -- a
+        truncated/unparseable write (an ordinary crash mid-write;
+        `write_task_file` has no atomic temp+rename), a well-formed
+        object missing "origin", or valid JSON that isn't an object
+        all just `continue` past, leaving that id free for the next
+        plain INSERT to claim and overwrite unconditionally (or, for
+        the non-object case, `data.get` used to raise an uncaught
+        AttributeError -- see the isinstance guard below). Reserving
+        every on-disk id up front, before any per-file parsing,
+        closes all three shapes with one change: it can only reserve
+        MORE ids than the old code did, never fewer, so it changes
+        nothing about which files get genuinely absorbed as rows.
         """
         if not hist.tasks_dir.exists():
             return
+        self._reserve_orphan_ids(hist)
         known = self.list(status="all")
         known_ids = {t.id for t in known}
         known_origins = {t.origin for t in known if t.origin}
@@ -1165,6 +1184,13 @@ class Store:
                 data = json.loads(p.read_text())
             except (OSError, ValueError):
                 continue
+            if not isinstance(data, dict):
+                # Valid JSON, wrong shape (e.g. a bare array): `.get`
+                # below would raise. Its id is already reserved by
+                # `_reserve_orphan_ids` above, so skipping it here is
+                # safe -- just not something this loop can turn into a
+                # real row.
+                continue
             origin = data.get("origin")
             if not origin or origin in known_origins or origin in skip_origins:
                 continue
@@ -1174,6 +1200,45 @@ class Store:
                 conn.commit()
             known_ids.add(file_id)
             known_origins.add(origin)
+
+    def _reserve_orphan_ids(self, hist: GitHistory) -> None:
+        """Bump sqlite's own AUTOINCREMENT high-water mark (the
+        `sqlite_sequence` row for `tasks`) up to at least the highest
+        `tasks/<id>.json` filename on disk, regardless of whether that
+        file's contents can be parsed or understood.
+
+        This does NOT insert a task row -- it only claims the id so a
+        later plain `INSERT INTO tasks (...)` (no explicit id, in
+        `add`/`decompose`) can never be handed that number by sqlite
+        and silently overwrite the file `write_task_file` would then
+        write there unconditionally. A file the loop below CAN absorb
+        reserves its own id anyway, via its own explicit-id INSERT
+        (`_apply_remote_task`); this is only what closes the gap for
+        the ones it can't.
+        """
+        max_on_disk = 0
+        for p in hist.tasks_dir.glob("*.json"):
+            try:
+                max_on_disk = max(max_on_disk, int(p.stem))
+            except ValueError:
+                continue
+        if max_on_disk <= 0:
+            return
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'tasks'"
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('tasks', ?)",
+                    (max_on_disk,),
+                )
+            elif row["seq"] < max_on_disk:
+                conn.execute(
+                    "UPDATE sqlite_sequence SET seq = ? WHERE name = 'tasks'",
+                    (max_on_disk,),
+                )
+            conn.commit()
 
     def _sync_diff_and_apply(self, hist: GitHistory, theirs_ref: str) -> dict:
         """Structural sync-identity fix (task

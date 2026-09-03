@@ -1207,3 +1207,121 @@ def test_decompose_on_passive_relay_does_not_overwrite_orphan_task_file(tmp_path
     ids = [t.id for t in store_x.list(status="all")]
     assert len(ids) == len(set(ids)), f"duplicate ids after decompose: {x_titles}"
     assert len(x_titles) == 4  # A's task + X's parent + 2 subtasks
+
+
+# --- Dov's independent 0.2.24 pass: three orphan shapes the absorb loop --
+# --- couldn't parse/understand still lost or wedged data -----------------
+
+
+def _orphan_task_path(store: Store, task_id: int) -> "Path":
+    """The on-disk tasks/<id>.json path for `store`'s own history dir --
+    ensures the history repo (and its tasks/ dir) exists first, same as
+    a real mutation would."""
+    hist = store._history()
+    hist.ensure()
+    return hist.tasks_dir / f"{task_id}.json"
+
+
+@pytest.mark.parametrize("verb", ["add", "decompose"])
+def test_truncated_orphan_file_not_overwritten(tmp_path, verb):
+    """Shape #1, worst finding in Dov's pass: a process killed mid-write
+    (write_task_file has no atomic temp+rename) leaves an unparseable
+    tasks/<id>.json on disk. The very next add/decompose on that store
+    used to hand its id straight back out and overwrite it silently,
+    exit 0, no relay or second client involved at all."""
+    store = Store(db_path=tmp_path / "cadence.db")
+    store.add("seed")  # id 1, so the next allocation would be 2
+    orphan = _orphan_task_path(store, 2)
+    orphan.write_text('{"id": 2, "title": "truncated mid-write')
+    before = orphan.read_text()
+
+    if verb == "add":
+        store.add("new native task")
+    else:
+        parent = store.add("parent for decompose")
+        store.decompose(parent.id, ["sub one"])
+
+    after = orphan.read_text()
+    assert before == after, "truncated orphan file was silently overwritten"
+
+
+@pytest.mark.parametrize("verb", ["add", "decompose"])
+def test_no_origin_orphan_file_not_overwritten(tmp_path, verb):
+    """Shape #2: a well-formed task JSON object missing (or with a falsy)
+    "origin" key -- same silent-overwrite failure as shape #1, narrower
+    trigger (hand-restored file, pre-origin-schema file)."""
+    store = Store(db_path=tmp_path / "cadence.db")
+    store.add("seed")
+    orphan = _orphan_task_path(store, 2)
+    orphan.write_text(json.dumps({
+        "id": 2, "title": "orphan with no origin field", "status": "pending",
+        "priority": None, "due": None, "created_at": "2026-01-01T00:00:00",
+        "completed_at": None, "parent_id": None,
+    }))
+    before = orphan.read_text()
+
+    if verb == "add":
+        store.add("new native task")
+    else:
+        parent = store.add("parent for decompose")
+        store.decompose(parent.id, ["sub one"])
+
+    after = orphan.read_text()
+    assert before == after, "no-origin orphan file was silently overwritten"
+
+
+@pytest.mark.parametrize("verb", ["add", "decompose"])
+def test_non_object_json_orphan_does_not_crash_or_wedge(tmp_path, verb):
+    """Shape #3: valid JSON that isn't an object (e.g. a bare array) used
+    to raise an uncaught AttributeError out of the absorb loop's
+    `data.get("origin")`, leaking through the generic exception handler
+    and leaving the store PERMANENTLY wedged -- every subsequent
+    add/decompose on it failed the same way. Must not raise, and the
+    store must keep working afterward (id 2 stays reserved, but 3 and
+    later ids allocate normally)."""
+    store = Store(db_path=tmp_path / "cadence.db")
+    store.add("seed")
+    orphan = _orphan_task_path(store, 2)
+    orphan.write_text(json.dumps([1, 2, 3]))
+
+    if verb == "add":
+        first = store.add("next real task")
+        second = store.add("retry after supposed crash")
+    else:
+        parent = store.add("parent for decompose")
+        _, first_children = store.decompose(parent.id, ["sub one"])
+        first = first_children[0]
+        _, second_children = store.decompose(parent.id, ["sub two"])
+        second = second_children[0]
+
+    assert first.id != 2 and second.id != 2
+    assert first.id != second.id
+    # The bogus array file was left alone, not turned into a fabricated row.
+    assert json.loads(orphan.read_text()) == [1, 2, 3]
+
+
+def test_sync_internal_error_hint_does_not_blame_cadence_db_path(tmp_path, monkeypatch):
+    """`sync`'s catch-all wrapper used to tell every caller to check for a
+    shared CADENCE_DB_PATH stem, even when that has nothing to do with
+    the actual failure (e.g. the non-object-JSON crash above, before it
+    was fixed at the source). The hint text must no longer name that as
+    the presumed cause."""
+    from cadence.store import SyncInconsistent
+
+    store_a = Store(db_path=tmp_path / "sync_hint_a.db")
+    store_b = Store(db_path=tmp_path / "sync_hint_b.db")
+    store_a.add("a's task")
+    store_a.sync(remote=str(store_b.db_path))
+
+    def _boom(self, hist, theirs_ref):
+        raise KeyError("simulated internal inconsistency")
+
+    monkeypatch.setattr(Store, "_sync_diff_and_apply", _boom)
+
+    with pytest.raises(SyncInconsistent) as exc_info:
+        store_a.sync(remote=str(store_b.db_path))
+    hint = exc_info.value.hint
+    # The old wording asserted a shared CADENCE_DB_PATH stem was the
+    # cause, unconditionally -- it must not claim that anymore.
+    assert "distinct path ending in '.db'" not in hint
+    assert "Nothing was changed" in hint
