@@ -2632,3 +2632,58 @@ own check runner doesn't use `--no-cache-dir`/retry the way that
 script does — worth remembering that a check firing immediately after
 a publish can be a false negative on propagation lag alone, not a
 regression signal.
+
+## 2026-09-03 (Rafael Okonkwo, Build) — 0.2.23: fixed silent data loss on a client used as a passive sync hub
+
+Dov's independent Red Team pass found a real, deterministic data-loss
+bug in sync's self-heal step (see
+`redteam_verify0222_indep/findings/2026-09-03-sync-0.2.22-pass.md`): a
+client used as a passive remote for someone else's `cadence sync
+--remote <this>` gets that peer's task written straight into its own
+git tree without its own sqlite ever learning about it. The next time
+this client ran its own sync against a third, unrelated peer,
+self-heal treated "not in my own sqlite" as drift and deleted the
+file — permanently, with zero conflict, warning, or nonzero exit, even
+though the CLI's own text says "Nothing was lost or overwritten." Any
+star/hub sync topology hits this, not just a contrived ordering.
+
+Fix (`src/cadence/store.py`, `_absorb_orphan_task_files`): before
+self-heal runs, any on-disk task file whose id is unknown to this
+client's own sqlite AND whose origin isn't already accounted for by
+this sync call's own peer or this client's own known tasks gets
+absorbed into a real sqlite row first, at its own id. It becomes
+genuinely known content — diffed and pushed like any other row —
+instead of drift to erase. An origin the peer already reports is left
+to the ordinary pull branch, which adopts it correctly with a real
+`pulled` count; absorbing it twice would hide a real pull as a no-op.
+
+Added `test_sync_passive_relay_task_survives_hosts_own_later_sync`
+(tests/test_r08_verbs.py), the exact A2/X2/C2 sequence from the
+findings doc. Confirmed it fails on pre-fix `store.py` (stashed the
+fix, reran: `AssertionError: X2's passively-relayed task was silently
+purged by A2's own self-heal: ["A2's own task", "C2's own task"]`) and
+passes after. Full suite: 152 passed (was 151; +1 new test), 0 failed.
+
+Published `cadence-todo==0.2.23` to PyPI via the existing
+version-bump-on-push CI workflow (commit a8c0680, GitHub Actions run
+33752412915, conclusion success). Verified against the live wheel, not
+local install — fresh venv, `pip install --no-cache-dir cadence-todo`,
+confirmed `importlib.metadata.version('cadence-todo') == '0.2.23'`,
+then ran the task's exact success_test command end to end:
+
+```
+$ CADENCE_DB_PATH=a2/db.sqlite cadence list
+  [ ]    1   A2's own task
+  [ ]    2   X2's own task
+  [ ]    3   C2's own task
+```
+
+X2's task present, exit 0. Note for next time: the first install
+attempt right after publish landed 0.2.22 (JSON API already showed
+0.2.23, but `pip install` still resolved the old wheel) — same
+Simple-index CDN propagation lag as 0.2.19/0.2.20/0.2.22 before it.
+Waiting ~2 minutes and retrying with `--no-cache-dir` got a clean
+0.2.23 install. Not a regression, just the same known lag; this is now
+the fourth time it's shown up, worth building the retry directly into
+whatever eventually re-runs the ten-step finish-line script rather
+than re-diagnosing it by hand each time.
