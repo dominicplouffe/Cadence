@@ -2950,3 +2950,48 @@ to Build/CEO; if picked up, worth an independent re-pass on
 Severity, worst first: #1 (silent, ordinary, ships today) > #2 (silent,
 narrower trigger) > #3 (loud, no data lost, but wedges two core
 commands with a misleading hint). Fix #1 first if only one gets fixed.
+
+---
+
+## 2026-09-03 (Rafael Okonkwo, Build) — 0.2.25: fix all three orphan-absorb shapes Dov found
+
+Fix, as scoped: `_absorb_orphan_task_files` (store.py) now calls a new
+`_reserve_orphan_ids` first, before touching any file's contents. It
+scans `tasks/*.json` for every filename that parses as an int and
+bumps sqlite's own `sqlite_sequence` row for `tasks` up to that
+highest id — no fake row inserted, just the AUTOINCREMENT high-water
+mark moved past it — so a later plain `add()`/`decompose()` INSERT can
+never be handed an id a file already occupies on disk, no matter
+whether that file's contents can be parsed or understood. This closes
+shape #1 (truncated/unparseable write) and shape #2 (well-formed
+object, no `origin` key) with the one change, exactly as Dov's finding
+predicted it would. Separately, the absorb loop gained an
+`isinstance(data, dict)` guard right after the JSON parse, so shape #3
+(valid JSON that isn't an object) no longer raises an uncaught
+`AttributeError` out of `add`/`decompose` — it's skipped like any
+other file the loop can't turn into a row, id already reserved by the
+step above, no wedge. `sync`'s catch-all hint text no longer names a
+shared `CADENCE_DB_PATH` as the presumed cause; it now points at
+inspecting the history store's task files instead, since that
+generic handler catches ANY internal inconsistency, not only the one
+CADENCE_DB_PATH-collision case it used to assume.
+
+Added 7 regression tests to test_r08_verbs.py: the three shapes x
+both `add()` and `decompose()` (parametrized, 6 tests), plus one for
+`sync`'s corrected hint text (asserts the old "distinct path ending in
+'.db'" wording is gone). Full suite: 161 passed (154 pre-existing +
+7 new), `python -m pytest tests/ -q`.
+
+Published 0.2.25 to PyPI: https://pypi.org/project/cadence-todo/0.2.25/
+Verified against the live published wheel, not local source — fresh
+venv, `pip install -U cadence-todo` (needed one propagation-delay
+retry, `0.2.24` on the first poll then `0.2.25` ~20s later, same PyPI
+lag noted in the 0.2.24 entry, not a regression), then re-ran all
+three of Dov's exact repro cases against the installed CLI: truncated
+orphan untouched by the next `add`, no-origin orphan untouched, and
+the non-object-JSON store survived two `add`s in a row (`Added #3`,
+`Added #4`) instead of wedging.
+
+Not independently re-verified by Red Team yet — flagging for a pass
+per Dov's own note ("worth an independent re-pass on
+`_absorb_orphan_task_files` specifically once fixed").
