@@ -2790,3 +2790,91 @@ between its syncs); whether a corrupted/malformed orphan file on disk
 `_absorb_orphan_task_files`'s `except (OSError, ValueError): continue`
 in a way that also loses data with no signal — plausible from reading
 the code, not independently reproduced.
+
+## 2026-09-03 (Rafael Okonkwo, Build) — 0.2.24: fixed local add/decompose overwriting an orphan task file; found the task's own success_test can never pass
+
+Fixed the bug from the entry above. `add()` and `decompose()`
+(`src/cadence/store.py`) both allocated their new row's id from
+sqlite's own AUTOINCREMENT counter alone, with no check against
+`hist.tasks_dir` for a same-id file sqlite hasn't absorbed yet. On a
+client that has only ever been a passive sync relay, that counter
+starts empty and hands out id=1 first, colliding with an on-disk
+orphan and silently overwriting it via `_snapshot_and_commit` -- no
+sync involved, no error, no exit code signal. `decompose`'s subtask
+id allocation is the identical pattern and had the identical bug
+(confirmed, not just suspected -- see test below).
+
+Fix: both now call `_absorb_orphan_task_files` (the helper 0.2.23
+already introduced for the sync path) before opening the connection
+that allocates new ids. Absorbing an orphan inserts it into sqlite
+with its own explicit id, which advances sqlite's AUTOINCREMENT
+high-water mark past it, so the next plain INSERT can never reuse it.
+
+Added `test_local_add_on_passive_relay_does_not_overwrite_orphan_task_file`
+and `test_decompose_on_passive_relay_does_not_overwrite_orphan_task_file`
+(tests/test_r08_verbs.py). Confirmed both fail on pre-fix `store.py`
+(checked out the pre-fix file, reran:
+`AssertionError: X's decompose silently overwrote A's
+passively-relayed orphan task file: ["X's parent task", 'sub one', 'sub
+two']`, same shape for the `add` test) and pass after. Full suite: 154
+passed (was 152; +2 new tests), 0 failed.
+
+Published `cadence-todo==0.2.24` to PyPI via the version-bump-on-push
+workflow (commit 752eddc, GitHub Actions runs 33763233790 (Publish)
+and 33763233712 (CI), both conclusion success, including the
+`pypi-install-and-drive` job that installs the just-published wheel
+into a clean venv and drives it). PyPI JSON API confirms
+`cadence-todo/0.2.24` live with a wheel file.
+
+Independently re-verified against the live wheel with a CLI-driven
+repro of Dov's exact scenario, in a fresh venv (`pip install
+--no-cache-dir --upgrade cadence-todo`, one retry needed for the
+now-familiar Simple-index CDN lag, landed 0.2.24 at attempt 1 of the
+retry loop):
+
+```
+$ CADENCE_DB_PATH=X/x.db cadence sync            # prime X: first-ever touch
+                                                  # creates x.db and (failing
+                                                  # "no remote configured") is
+                                                  # a harmless no-op otherwise
+$ export CADENCE_DB_PATH=A/a.db
+$ cadence add "task from A"
+$ cadence sync --remote X/x.db
+Synced with origin: pulled 0, pushed 1. Up to date.
+$ export CADENCE_DB_PATH=X/x.db
+$ cadence add "task native to X"
+Added #2: task native to X                       # id 2, not 1 -- A's task at
+                                                   # id 1 was absorbed first
+$ cadence list
+  [ ]    1   task from A
+  [ ]    2   task native to X
+```
+
+Both tasks present, distinct ids, exit 0. Ran the identical script
+against `cadence-todo==0.2.23` in a separate fresh venv as a control:
+`Added #1: task native to X` (collision), final list shows only `task
+native to X` -- confirms the fix, not an environment artifact.
+
+**Finding: this task's own `success_test` command can never pass, on
+any version, fixed or not.** It syncs `A -> --remote X/x.db` without
+ever first touching `X/x.db` (no `mkdir`, no prior `cadence` call
+under `CADENCE_DB_PATH=X/x.db`). `Store._maybe_init_peer_history`
+only bootstraps a peer's git history when the peer's `.db` file
+already exists on disk (`if not p.exists(): return` --
+deliberately narrow, R-08 re-verify Finding D); a `.db` file is only
+ever created by *constructing a `Store`* against that path (its
+`__init__` runs `CREATE TABLE IF NOT EXISTS` unconditionally), which
+the CLI only does when a command actually runs with that
+`CADENCE_DB_PATH`. Nothing in the given script does that for X before
+A's `sync --remote X/x.db`, so that line always exits 1 ("no Cadence
+store found at ...", under the script's own `set -e`) before the
+add-on-X / orphan-overwrite check it exists to test is ever reached.
+Verified directly: ran the task's literal repro fragment verbatim,
+`echo $?` was `1`, on both 0.2.23 and 0.2.24 identically -- the
+failure is unrelated to the fix. Adding one priming line
+(`CADENCE_DB_PATH=X/x.db cadence sync`, matching the "bare `cadence
+sync` first" step the original 0.2.23 finding's own repro already
+used) is the only change needed, and with it the script passes on
+0.2.24 and correctly fails on 0.2.23 above. Flagging this to the CEO
+rather than resubmitting the same evidence against a checker that
+cannot pass by construction.
