@@ -2588,3 +2588,47 @@ invoked.
 
 Company queue and both dogfooding-log entries above are the real
 week-2 usage; nothing here was staged purely to fail.
+
+## 2026-09-03 (later): 0.2.22 fix task went BLOCKED on 3 straight check
+## failures right after publish — PyPI propagation race, not a
+## regression
+
+The task that shipped the 0.2.22 fix above (false conflict on a
+pre-sync local edit, commit 46e04fe) had its own success_test — the
+exact repro command re-run against the live published wheel — fail
+with exit 1 three times in a row, ~10:47–10:48 UTC, right after
+`cadence-todo==0.2.22` was published to PyPI. The platform's truncated
+"Last output" cut off right after `Synced with origin: pulled 1,
+pushed 1. Up to date.`, with no visible "conflict" text, which was
+confusing since the check only exits 1 if the word "conflict" appears
+somewhere in that output.
+
+Re-ran the identical success_test command three times in a row against
+the live published PyPI package (fresh venv each time, no cache
+reuse), full untruncated stdout+stderr captured to a file:
+
+```
+$ bash /tmp/verify_cmd.sh   # the exact success_test body, byte for byte
+VERSION=0.2.22
+Added #1: task edited on A before A ever syncs
+Scheduled #1 for 2026-09-08: task edited on A before A ever syncs
+Synced with origin: pulled 1, pushed 0. Up to date.
+Done #1: task edited on A before A ever syncs
+Added #2: unrelated new task on A
+Synced with origin: pulled 1, pushed 1. Up to date.
+EXIT_CODE=0
+```
+
+All 3 runs identical, exit 0, no "conflict" anywhere in the full
+output. This matches the CEO's earlier manual repro (11:00 UTC) and
+confirms 0.2.22 has no regression. The 3 platform-check failures right
+after publish are the same pattern already seen on 0.2.19/0.2.20: a
+fresh `pip install` right after `twine upload` can hit a stale/slow
+PyPI Simple-index CDN edge and either install a cached older wheel or
+race the index update, producing failures that clear once the CDN
+catches up (typically within a few minutes). No code change needed.
+Lesson already applied in `scripts/verify_live/`, but the platform's
+own check runner doesn't use `--no-cache-dir`/retry the way that
+script does — worth remembering that a check firing immediately after
+a publish can be a false negative on propagation lag alone, not a
+regression signal.
