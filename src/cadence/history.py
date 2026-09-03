@@ -262,6 +262,23 @@ class GitHistory:
             return []
         return [h for h in r.stdout.splitlines() if h]
 
+    def mainline_log_for_file(self, relpath: str) -> list[str]:
+        """Like `log_for_file`, but `--first-parent` only: the commits
+        that changed `relpath` along THIS repo's own linear ref history,
+        never a commit that only became reachable because some OTHER
+        repo pushed a merge onto this one (`push_safe_merge` always
+        commits with THIS repo's own prior head as parent 1 and the
+        pushing side's head as parent 2, so a merge commit's own second
+        parent -- and everything behind it -- is that other side's
+        history, not ours, even though `git log` can reach it from here
+        once the push lands). `store.py`'s `_first_sync_task_base` needs
+        exactly this: the row's own most recent commit on THIS store's
+        real timeline, not a foreign one that only rode in on a push."""
+        r = self._git("log", "--first-parent", "--pretty=%H", "--", relpath, check=False)
+        if r.returncode != 0:
+            return []
+        return [h for h in r.stdout.splitlines() if h]
+
     def changed_task_files(self, commit: str) -> list[str]:
         """Paths under tasks/ that `commit` added or changed relative to its
         first parent (or the empty tree, for a root commit)."""

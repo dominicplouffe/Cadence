@@ -23,6 +23,14 @@ from cadence.history import GitHistory, HistoryError
 VALID_PRIORITIES = ("low", "med", "high")
 VALID_STATUSES = ("pending", "done")
 
+### Fixed, never user-derived, commit subject `_sync_diff_and_apply` gives
+### an ordinary sync's `push_safe_merge` call (see the call site below).
+### `_first_sync_task_base` matches on this exact string to tell "a commit
+### I made myself" apart from "a commit that landed on my own checked-out
+### tree only because I was the passive REMOTE side of some OTHER
+### client's sync push" -- see that function's docstring.
+_SYNC_PUSH_LANDING_MESSAGE = "sync: push local changes"
+
 ### docs/human-surface.md §4.7: bounded by construction so a looping agent
 ### can't decompose forever.
 MAX_DECOMPOSE_DEPTH = 3
@@ -999,25 +1007,60 @@ class Store:
 
     @staticmethod
     def _first_sync_task_base(hist: GitHistory, task_id: int) -> Optional[dict]:
-        """This client's own creation-time content for local id
+        """This client's own most-recent-before-now content for local id
         `task_id`, used ONLY as a stand-in base for the "both sides
         already know this origin" branch of `_sync_diff_and_apply` on a
         client's first-ever sync (no refs/cadence/sync-base commit yet
         -- see the call site). Every task file this client has ever
-        written -- add, complete, schedule, decompose, undo, or an
-        earlier (possibly still-conflicted) sync's pull -- is committed
-        to this client's own git history one file per id, so the OLDEST
-        commit that ever touched tasks/<id>.json is exactly the content
-        this row would have carried into a sync had one happened the
-        moment this client first came to hold it. Returns None (never a
+        itself written by calling add/complete/schedule/decompose/undo
+        is committed to this client's own git history one file per id.
+        The true base is this client's own most recent PRE-sync edit --
+        not the OLDEST/creation-time commit: if this client edited the
+        row itself before ever syncing (e.g. scheduled it), the remote
+        may already have received that exact edit through an earlier
+        sync of ITS OWN; diffing against stale creation content would
+        then make `mine_changed` true for an edit the remote already
+        fully has, reporting a false "changed on both sides" conflict
+        (redteam week-2 dogfooding find, docs/dogfooding-log.md, commit
+        08abb36) whenever the remote also touched the row afterward.
+
+        But not every commit reachable from this client's HEAD for this
+        file was actually made BY this client: `_sync_diff_and_apply`'s
+        own push step (`push_safe_merge`) writes a MERGE commit (parent
+        1 = this store's own prior head, parent 2 = the pushING side's
+        head) straight into whichever store it targets, as the passive
+        REMOTE side of some OTHER client's sync call -- landing that
+        other client's entire commit ancestry as reachable history here
+        without this client's sqlite or sync bookkeeping ever finding
+        out (see the "Self-heal" comment at this method's call site).
+        Plain `log_for_file` walks BOTH parents of a merge and would
+        surface that foreign ancestry (and, since default history
+        simplification skips a merge that is TREESAME to one parent for
+        this path, it can even skip straight past the tell-tale
+        `_SYNC_PUSH_LANDING_MESSAGE` merge commit itself and hand back
+        the other side's own commit under its own original message,
+        indistinguishable from a genuine self-edit by message alone).
+        `mainline_log_for_file` (`--first-parent`) instead walks only
+        this store's own real timeline -- a push always lands as a
+        merge on top of it, never spliced into it -- so filtering out
+        any commit whose subject is exactly the landing message and
+        taking the most recent survivor gives this client's own true
+        latest edit even when a peer pushed into this store first. This
+        client created this row itself (the only way it can hold this
+        origin before its own first sync), so at least the creation
+        commit always survives that filter. Returns None (never a
         crash) for an id with no history at all (pre-migration row);
         the caller then falls back to the prior "no base known"
         behaviour for that one origin only."""
         relpath = f"tasks/{task_id}.json"
-        commits = hist.log_for_file(relpath)
+        commits = hist.mainline_log_for_file(relpath)
         if not commits:
             return None
-        content = hist.show_file(commits[-1], relpath)
+        chosen = next(
+            (c for c in commits if hist.message_of(c) != _SYNC_PUSH_LANDING_MESSAGE),
+            commits[-1],
+        )
+        content = hist.show_file(chosen, relpath)
         if not content:
             return None
         try:
@@ -1209,7 +1252,7 @@ class Store:
         pushed_ok = True
         if overlay:
             pushed_ok = hist.push_safe_merge(
-                theirs_ref, overlay, "sync: push local changes", [theirs_ref, local_head]
+                theirs_ref, overlay, _SYNC_PUSH_LANDING_MESSAGE, [theirs_ref, local_head]
             )
         # Fold origin's history into local's own timeline too (pulled
         # writes, and the self-heal rewrite above, are already applied to

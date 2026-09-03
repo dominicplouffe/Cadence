@@ -541,6 +541,38 @@ def test_sync_first_ever_sync_does_not_false_conflict_on_untouched_task(tmp_path
     assert store_a.get(task_a.id).status == "done"
 
 
+def test_sync_first_ever_sync_does_not_false_conflict_on_own_pre_sync_edit(tmp_path):
+    """Week-2 dogfooding find (docs/dogfooding-log.md, commit 08abb36):
+    A edits a task it created (schedules it) BEFORE A's own first-ever
+    sync. B does its own first sync, pulls that already-scheduled task,
+    and marks it done -- A never touches the task again. When A finally
+    runs its own first-ever `sync`, A must not report a conflict: A's
+    pre-sync edit is one the remote (B) already fully has, so the two
+    sides never actually diverged. This covers one-or-more pre-sync
+    local edits on the first-syncing client, which
+    test_sync_first_ever_sync_does_not_false_conflict_on_untouched_task
+    (zero pre-sync edits) does not."""
+    store_a = Store(db_path=tmp_path / "a.db")
+    store_b = Store(db_path=tmp_path / "b.db")
+
+    task_a = store_a.add("task edited on A before A ever syncs")
+    store_a.schedule(task_a.id, "2026-09-08", reason="pre-sync edit on A")
+
+    # B's first-ever sync: pulls #1 already scheduled.
+    r_b1 = store_b.sync(remote=str(store_a.db_path))
+    assert r_b1["conflicts"] == []
+    assert r_b1["pulled"] == 1
+
+    store_b.complete(task_a.id)  # B's only edit, post-pull
+
+    store_a.add("unrelated new task on A")  # A never touches #1 again
+
+    # A's first-ever sync call.
+    r_a = store_a.sync(remote=str(store_b.db_path))
+    assert r_a["conflicts"] == [], f"false conflict on A's first sync: {r_a}"
+    assert store_a.get(task_a.id).status == "done"
+
+
 def test_sync_push_into_peer_that_only_ever_listed_bootstraps_and_succeeds(tmp_path):
     """R-08 re-verify Finding D
     (redteam_run7_0224/REDTEAM_PASS_0.2.4_sync_deep.md): a peer whose store
