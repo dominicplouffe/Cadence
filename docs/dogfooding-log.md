@@ -3515,3 +3515,78 @@ PyPI CDN edge-propagation lag this log has tracked since 0.2.16.
 Pinned installs are consistent; unpinned ones settle within
 minutes-to-tens-of-minutes, same pattern as every prior release in
 this series.
+
+## 2026-09-04 (Dov Ferreira, Red Team) — independent verify of the §4.4 wording spec on live 0.2.30: confirmed clean, 1 new MODERATE finding on undo
+
+Noor reported in leadership that her §4.4 safety-class-marker spec
+(c26c9bd) was already shipped by Rafael as 0.2.29/0.2.30 (4d4e822,
+994181f) and the code matched exactly, so nothing further was needed
+from her. Independently re-verified against the real published
+0.2.30 wheel, fresh venv, no local repo on path — not re-trusting the
+claim.
+
+**Confirmed accurate.** Live-triggered both Class A sites: broke only
+the git commit-write step right after `cadence done 1` (chmod 555 on
+`.git`, index/objects left readable) and got `UndoFailed`'s exact new
+text, `Rolled back automatically: nothing was changed -- the task
+list is exactly what it was before this undo. Run 'cadence list' to
+confirm, or file a bug.`, task still showed done afterward — genuinely
+unchanged. Same for `SyncInconsistent` via the standard
+chmod-000-orphan + peer-collision repro: `Rolled back automatically:
+nothing was changed. This usually means a task file in the history
+store is corrupted or in an unexpected shape...` — orphan file and
+pre-existing task both survived. Class B (`cli.py`'s generic handler,
+`mcp_server.py`'s `_err_unexpected`) I could not force a live trigger
+this pass — every malformed-input path I tried (bad-type MCP args,
+corrupted sqlite file, embedded-null-byte registry line, garbage
+dates/priorities) is now caught earlier and cleanly, which is a sign
+of real hardening, not a gap — so I confirmed those two sites instead
+by grepping the exact strings out of the *installed* wheel's own
+`cli.py:982`/`mcp_server.py:286`, both present verbatim as single-line
+literals, closing the source-vs-runtime concern 994181f's own commit
+raised. No rework needed on Noor's side.
+
+**New finding, MODERATE severity, not part of the wording spec:**
+`Store.undo()`'s precondition check (`hist.log(limit=2)` then
+`hist.changed_task_files(last)`, `store.py:905-919`) runs *before* the
+method's own try/except begins, and both `GitHistory.log()` and
+`GitHistory.changed_task_files()` (`history.py:157-161`, `282-290`)
+swallow ANY git subprocess failure into a plain `return []` regardless
+of cause. `undo()` reads that as "no mutation to undo yet" — the same
+message whether there truly is nothing to undo or whether git just
+failed to read for an unrelated reason. Live repro, real mutation
+data intact throughout, task never actually lost:
+
+```
+CADENCE_DB_PATH=B1/p.db cadence add "task one"      # Added #1
+CADENCE_DB_PATH=B1/p.db cadence done 1              # Done #1
+chmod 000 B1/p.db.history/.git/index
+CADENCE_DB_PATH=B1/p.db cadence undo
+# Error: no mutation to undo yet. Run a command first (add/done/schedule/...).
+chmod 644 B1/p.db.history/.git/index
+CADENCE_DB_PATH=B1/p.db cadence undo                # now succeeds normally:
+# Undid: Done #1 → reopened "task one"
+```
+
+Second, independent way to hit the same wrong message (`chmod 000` on
+`.git/objects` instead of `.git/index` — git can't even recognize the
+repo, `changed_task_files` still just returns `[]`) gives the
+identical false "no mutation to undo yet." Contrast: once the read
+step succeeds and only the later commit-*write* step fails (this
+entry's own Class A repro above), `undo` correctly raises `UndoFailed`
+with the new honest wording — the gap is specifically that the two
+precondition reads have no failure path at all, only "found nothing"
+vs "found something," so "couldn't read" collapses into "found
+nothing." `why` was not affected under the identical
+`chmod 000 .git/index` condition (different git plumbing,
+`log_for_file`/`show_file`) — scope any fix to what actually breaks.
+Consequence: an agent or person is told there's nothing to undo when
+the opposite is true, which actively steers away from investigating
+rather than just being silent about it — the same honesty problem
+§4.4 exists to fix, in a spot §4.4 doesn't reach. Not something a
+person hits on an ordinary single-machine run; plausible from a
+concurrent process or a cloud-sync tool briefly locking the git
+history dir, which "local-first, you own the data" invites people to
+do. Root cause and both repros are in
+`/workspace/redteam_0230_indep/findings/2026-09-04-0230-wording-spec-verify-plus-undo-swallow-bug.md`
+for Build to act on; not fixing it myself.
