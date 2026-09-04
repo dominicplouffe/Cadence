@@ -3466,3 +3466,52 @@ Published to PyPI (https://pypi.org/project/cadence-todo/0.2.28/) via
 the version-bump CI path, verified against the freshly `pip install`-ed
 0.2.28 wheel in a clean venv outside the repo (same repro, same output
 shown above, run against the installed `cadence` binary).
+
+## 2026-09-04 (Rafael Okonkwo, Build) — 0.2.29→0.2.30: applied wording-spec safety-class markers; 0.2.29 shipped wrong on a source-text technicality
+
+Applied Noor's four verbatim strings from `docs/human-surface.md` §4.4
+to `store.py` (`UndoFailed`/`SyncInconsistent` hints, prefixed `Rolled
+back automatically: `), `cli.py`'s generic handler and
+`mcp_server.py`'s `_err_unexpected` (both appended the "Unlike a
+failed sync(_tasks) or undo..." contrast sentence). Two existing
+`test_r08_verbs.py` assertions checked for capital-`N` "Nothing was
+changed"; updated to the new lowercase-after-colon prefix. Full suite:
+166 passed. Shipped as 0.2.29.
+
+0.2.29's own success_test failed against the live wheel: it does
+`flat(inspect.getsource(module))` — i.e. it checks the raw *source
+text*, not the runtime string value. The first pass wrote each hint as
+several adjacent string literals, one per line (normal style
+elsewhere in this file). Python concatenates those at compile time,
+so the runtime value was already correct — but `inspect.getsource`
+returns the literal multi-line source, and flattening it by
+whitespace leaves a stray `"` token at every line break, splitting
+the phrase the checker looks for. Any future hint text that a
+checker or test reads via `inspect.getsource` rather than by calling
+the code needs to be a single-line string literal, not split across
+lines — this is a fresh case of the source-vs-runtime-value gap
+project memory already has one entry for, applied to a new checker
+shape.
+
+Fixed by rewriting all four hints as single-line literals (no
+behavior change, same text) and republished as 0.2.30. Verified with
+the platform's exact success_test command, pinned to `cadence-todo==0.2.30`
+in a fresh venv, outside the repo:
+
+```
+$ pip install --quiet cadence-todo==0.2.30
+$ python - <<'PY'
+import inspect, cadence.store as store, cadence.cli as cli, cadence.mcp_server as mcp
+def flat(s): return " ".join(s.split())
+...
+PY
+OK: all four wording-spec strings present in published cadence-todo wheel
+```
+
+The unpinned form of the same check (`pip install cadence-todo`, no
+version pin) flip-flopped between resolving to 0.2.28 and 0.2.30
+across repeated attempts a few minutes after publish — the familiar
+PyPI CDN edge-propagation lag this log has tracked since 0.2.16.
+Pinned installs are consistent; unpinned ones settle within
+minutes-to-tens-of-minutes, same pattern as every prior release in
+this series.
