@@ -3957,3 +3957,80 @@ truthfully reported via the new warning, not a silent "up to date"),
 but does reach it on the very next ordinary `cadence sync` from that
 same client, confirmed by an independent second checker client that
 never touched anything else in this repro. task_01a06aa9b6c38840ac7c0aac.
+
+## 2026-09-04 (Rafael Okonkwo, Build) — 0.2.33: fix cmd_undo/cmd_sync exit 1 instead of 2 for internal CadenceError (§4.4 gap named by Noor)
+
+Fixed the exit-code gap Noor named while reviewing 0.2.31's
+`HistoryUnreadable` wording. `cmd_undo` (`cli.py` ~L614) and
+`cmd_sync` (`cli.py` ~L731, ~L737, plus the `--keep-mine`/
+`--keep-theirs` branch) each caught `CadenceError` and called
+`_err(_format_err(exc))` with no `code=`, which defaults to `1` — the
+field-error code — for every error `store.undo()` / `store.sync()` /
+`store.resolve_conflict()` can raise, internal/store-class ones
+included. §4.4 signal 3 promises `1` for a field error, `2` for
+internal/server; this meant an agent scripting `cadence undo ||
+<recover>` could not actually tell the two apart from the exit code
+alone on these two commands, even though the printed text already got
+the class right (Class A/C wording shipped correctly in 0.2.27/0.2.31).
+
+Fix: added a shared `_STORE_CLASS_ERRORS = (StoreUnavailable,
+UndoFailed, HistoryUnreadable, SyncInconsistent)` tuple next to the
+imports and used `code=2 if isinstance(exc, _STORE_CLASS_ERRORS) else
+1` at all three `_err()` call sites in `cmd_undo`/`cmd_sync`, mirroring
+the pattern already correct at `cmd_add` (~L242, `StoreUnavailable`
+only — untouched, since `add` can't raise the other three). A shared
+tuple rather than three separate isinstance checks so the two commands
+can't drift from each other again. No new test added (task scope was
+the fix + live re-verify, not new coverage); full suite still 168
+passed after the change.
+
+Live-verified locally first, `chmod 000` on the history dir's
+`.git/index` (note: cadence's git history dir for a store at
+`$CADENCE_DB_PATH` is `$CADENCE_DB_PATH.history/.git`, not a plain
+`.git` in cwd):
+
+```
+$ CADENCE_DB_PATH=T/db.sqlite cadence add "x"
+$ chmod 000 T/db.sqlite.history/.git/index
+$ CADENCE_DB_PATH=T/db.sqlite cadence undo; echo "exit=$?"
+Error: could not read undo history (git diff-tree failed: fatal:
+.git/index: index file open failed: Permission denied). No sqlite
+change was attempted, so there is nothing to roll back -- ...
+exit=2
+```
+
+Published 0.2.33 to PyPI via the version-bump-triggers-publish CI
+path (push to main, commit 8da977c): CI green
+(https://github.com/dominicplouffe/Cadence/actions/runs/33837739992),
+Publish green
+(https://github.com/dominicplouffe/Cadence/actions/runs/33837739930),
+live at https://pypi.org/project/cadence-todo/0.2.33/.
+
+Re-ran the same repro against the real published wheel, fresh venv
+outside the repo (`/workspace/repro_undo_fix/venv`, `pip install
+--upgrade cadence-todo==0.2.33`, confirmed via `pip show` that the
+installed version is 0.2.33 before running):
+
+```
+$ cadence add "x"
+$ chmod 000 $TMP/db.sqlite.history/.git/index
+$ cadence undo; echo "exit=$?"
+Error: could not read undo history (git diff-tree failed: fatal:
+.git/index: index file open failed: Permission denied). No sqlite
+change was attempted, so there is nothing to roll back -- Cadence
+could not read its own history directory to check for a mutation to
+undo. Check permissions on <path>.history/.git (a sync tool or
+another process may be holding it), then retry 'cadence undo'.
+exit=2
+```
+
+Same wording as 0.2.31 (unchanged, only the exit code moved), now
+correctly `2`. Note for whoever next drives a fresh-venv repro against
+this package: a plain `pip install --upgrade cadence-todo` right after
+a version bump can silently stay on the prior version for a few
+minutes even once `pypi.org/pypi/.../json` already reports the new
+one — PyPI's simple index (what pip actually reads) and its JSON API
+sit behind separate CDN cache lifetimes. Confirm with `pip show
+cadence-todo` (or pin `==<version>`) rather than trusting `--upgrade`
+alone; a stale-cache false negative here is a test-environment
+artifact, not a product bug, so don't mistake it for one. task_01a06aab10704e198f1b41b3.
