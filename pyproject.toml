@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cadence-todo"
-version = "0.2.25"
+version = "0.2.26"
 description = "Agentic-first todo app: local CLI + embedded SQLite store + MCP server for agents."
 readme = "README.md"
 license = { text = "MIT" }

@@ -645,9 +645,15 @@ def sync_tasks(remote: Optional[str] = None, all_projects: bool = False) -> dict
 
     Returns (all_projects=false): {"ok": true, "pulled": N, "pushed": N,
         "already_synced": bool, "conflicts": [{"id", "mine", "theirs"}, ...],
-        "renumbered": [{"old_id", "new_id", "kept_at_old_id"}, ...]}.
+        "renumbered": [{"old_id", "new_id", "kept_at_old_id"}, ...],
+        "warnings": [str, ...]}.
         {"ok": false, ...} if no remote is configured or it can't be
         reached.
+
+        `warnings`: non-fatal problems noticed but not fatal to this call
+        -- e.g. an on-disk task file this store could not read to confirm
+        it was safe to clean up, so it was left in place, named here
+        instead of silently dropped.
 
     Returns (all_projects=true): {"ok": true, "projects": M, "results":
         [{"project": name, ...same shape as one non-all_projects sync

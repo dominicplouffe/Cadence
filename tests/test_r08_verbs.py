@@ -1325,3 +1325,54 @@ def test_sync_internal_error_hint_does_not_blame_cadence_db_path(tmp_path, monke
     # cause, unconditionally -- it must not claim that anymore.
     assert "distinct path ending in '.db'" not in hint
     assert "Nothing was changed" in hint
+
+
+def test_sync_self_heal_never_deletes_unreadable_orphan_task_file(tmp_path):
+    """Red Team independent pass on 0.2.25
+    (docs/dogfooding-log.md 2026-09-04): self-heal's rewrite step treated
+    ANY on-disk id absent from sqlite as stale drift to erase, without
+    ever checking whether it could actually READ that file first.
+    `remove_task_file` only needs write permission on the parent
+    directory, not read permission on the file itself, so a file that
+    exists but is unreadable (chmod 000 / restrictive ACL -- never even
+    absorbed, because `_absorb_orphan_task_files` correctly refuses to
+    guess at content it can't read) got silently unlinked the moment
+    self-heal had ANY other genuine pull/push work to do in the same
+    sync call, with zero warning -- and the CLI's own 'Nothing was lost
+    or overwritten' text prints right alongside the loss when a
+    renumber also happens in that same call. The file must survive, and
+    the caller must get a real warning naming it, not silence."""
+    store = Store(db_path=tmp_path / "unreadable_p.db")
+    store_r = Store(db_path=tmp_path / "unreadable_r.db")
+
+    store.add("p's own task")  # id 1
+    orphan = _orphan_task_path(store, 2)
+    orphan.write_text(json.dumps(
+        {"id": 2, "title": "unreadable orphan", "origin": "nobody-knows-this-origin"}
+    ))
+    os.chmod(orphan, 0o000)
+    try:
+        # Sanity: this store's own sqlite genuinely never absorbed it --
+        # otherwise this test would not be exercising the unreadable
+        # case at all.
+        rows = store.list(status="all")
+        assert len(rows) == 1 and rows[0].title == "p's own task"
+
+        # R is a genuinely different, unrelated peer this store has
+        # never synced with -- syncing against it gives this store real
+        # PUSH work to do (its own task, never seen by R), which is
+        # what makes self-heal actually run in the same call.
+        result = store.sync(remote=str(store_r.db_path))
+        assert result["conflicts"] == []
+        assert result["pushed"] == 1
+        assert result["pulled"] == 0
+
+        assert orphan.exists(), (
+            "self-heal deleted an on-disk task file it could not read"
+        )
+        warnings = result.get("warnings", [])
+        assert any("2" in w and "not be read" in w for w in warnings), (
+            f"no warning surfaced for the unreadable orphan file: {warnings}"
+        )
+    finally:
+        os.chmod(orphan, 0o644)  # let tmp_path's own cleanup remove it

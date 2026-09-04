@@ -660,6 +660,8 @@ def _cmd_sync_all_projects(args: argparse.Namespace) -> int:
             )
             any_store_error = True
             continue
+        for w in result.get("warnings", []):
+            print(f"{name:<{name_w}}  Warning: {w}")
         if result["already_synced"]:
             print(f"{name:<{name_w}}  Already in sync with origin. Nothing to pull or push.")
             continue
@@ -716,6 +718,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         result = store.sync(remote=args.remote)
     except CadenceError as exc:
         _err(_format_err(exc))
+    for w in result.get("warnings", []):
+        print(f"Warning: {w}")
     if result["already_synced"]:
         print("Already in sync with origin. Nothing to pull or push.")
         return 0

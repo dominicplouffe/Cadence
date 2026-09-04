@@ -975,7 +975,14 @@ class Store:
 
         Returns {"pulled": N, "pushed": N, "conflicts": [{"id", "mine",
         "theirs"}], "renumbered": [{"old_id", "new_id", "kept_at_old_id"}],
-        "already_synced": bool}.
+        "already_synced": bool, "warnings": [str, ...]}.
+
+        `warnings`: non-fatal problems this sync call noticed but did not
+        let stop it or destroy anything over. Currently the only source is
+        an on-disk task file this store's self-heal step found stale
+        (absent from its own sqlite) but could not read (permission-denied
+        or similar) to confirm that -- such a file is left in place, never
+        deleted, and named here instead of being silently dropped.
         """
         hist = self._history()
         hist.ensure()
@@ -1016,7 +1023,7 @@ class Store:
             n = len(self.list(status="all"))
             return {
                 "pulled": 0, "pushed": n, "conflicts": [], "renumbered": [],
-                "already_synced": n == 0,
+                "already_synced": n == 0, "warnings": [],
             }
 
         try:
@@ -1388,7 +1395,7 @@ class Store:
         if not pulled_ids and not push_plan and not conflicts:
             return {
                 "pulled": 0, "pushed": 0, "conflicts": [], "renumbered": [],
-                "already_synced": True,
+                "already_synced": True, "warnings": [],
             }
 
         local_head = hist.head()
@@ -1416,7 +1423,37 @@ class Store:
                     on_disk_ids.add(int(p.stem))
                 except ValueError:
                     continue
+        # Red Team independent pass on 0.2.25 (docs/dogfooding-log.md
+        # 2026-09-04): an on-disk id absent from sqlite is "stale drift
+        # to erase" ONLY if this store could actually read it and
+        # confirm that -- a file that EXISTS but can't be READ (chmod
+        # 000 / restrictive ACL) is not stale, it's simply unknown, and
+        # `remove_task_file` only checks write permission on the parent
+        # directory, never read permission on the file itself, so it
+        # would unlink it with zero warning. Reading each candidate
+        # first before deleting makes this exactly as safe as the
+        # "nothing pending" sync path, where such a file already
+        # survives untouched -- behaviour must not depend on what else
+        # this sync call had to do.
+        warnings = []
+        unreadable_relpaths = []
         for stale_id in on_disk_ids - set(final):
+            stale_path = hist.task_path(stale_id)
+            try:
+                stale_path.read_text()
+            except OSError as exc:
+                warnings.append(
+                    f"#{stale_id}: on-disk task file '{stale_path}' could "
+                    f"not be read ({exc.strerror or exc}) so it was left in "
+                    f"place instead of being treated as stale drift. It is "
+                    f"NOT tracked by this client -- fix its permissions and "
+                    f"sync again to have it either absorbed or cleaned up."
+                )
+                # Left alone on disk, but `advance_local` below must not
+                # let a blind `git add -A` trip over its own inability to
+                # read this same file -- see the `exclude` arg there.
+                unreadable_relpaths.append(f"tasks/{stale_path.name}")
+                continue
             hist.remove_task_file(stale_id)
         for tid, data in final.items():
             hist.write_task_file(data)
@@ -1442,6 +1479,7 @@ class Store:
             [local_head, theirs_ref],
             f"sync: pulled {len(pulled_ids)}, pushed {len(push_plan)}, "
             f"renumbered {len(renumbered)}",
+            exclude=unreadable_relpaths,
         )
 
         if conflicts:
@@ -1457,6 +1495,7 @@ class Store:
             "conflicts": [{"id": tid, **v} for tid, v in conflicts.items()],
             "renumbered": renumbered,
             "already_synced": False,
+            "warnings": warnings,
         }
 
     def resolve_conflict(self, task_id: int, keep: str) -> Task:

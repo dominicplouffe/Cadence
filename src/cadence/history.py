@@ -340,13 +340,27 @@ class GitHistory:
         r = self._git("push", "-q", "origin", "HEAD:main", check=False)
         return r.returncode == 0
 
-    def advance_local(self, parents: list[str], message: str) -> str:
+    def advance_local(
+        self, parents: list[str], message: str, exclude: Optional[list[str]] = None
+    ) -> str:
         """Commit the CURRENT working tree (already updated with pulled
         writes) as a new commit on local `main`, with the given parent
         commit(s). Used after a sync to fold origin's history into local's
         own, without changing local's file contents (which already reflect
-        mine + pulled, conflicts left as mine)."""
-        self._git("add", "-A")
+        mine + pulled, conflicts left as mine).
+
+        `exclude`: repo-relative paths (e.g. "tasks/2.json") to leave out
+        of this commit even though they sit in the working tree -- for a
+        task file self-heal found unreadable and correctly chose not to
+        touch (docs/dogfooding-log.md 2026-09-04): plain `git add -A`
+        aborts entirely rather than staging anything if it can't even
+        read one file to hash it, which would turn "leave this file
+        alone" into "fail the whole sync" -- excluding it by pathspec
+        lets everything else this commit needs to record proceed."""
+        if exclude:
+            self._git("add", "-A", "--", ".", *(f":!{p}" for p in exclude))
+        else:
+            self._git("add", "-A")
         tree = self._git("write-tree").stdout.strip()
         args = ["commit-tree", tree]
         for p in parents:
