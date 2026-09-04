@@ -159,6 +159,17 @@ class SyncInconsistent(CadenceError):
     code = "sync_inconsistent"
 
 
+class UndoFailed(CadenceError):
+    """`undo` could not record its matching history entry (Red Team 0226
+    finding: an unrelated unreadable file elsewhere in the tree can break
+    the `git add -A` inside `hist.commit`). The sqlite-side revert that
+    normally accompanies this is rolled back before this is raised (see
+    `Store.undo`), so -- unlike the bug this replaces -- "nothing changed"
+    in the hint below is always literally true, never a guess."""
+
+    code = "undo_failed"
+
+
 def default_db_path() -> Path:
     """Resolve the store location, honoring CADENCE_DB_PATH for tests/agents
     that want an isolated scratch store instead of the user's real data."""
@@ -534,7 +545,9 @@ class Store:
         self._snapshot_and_commit([task], f"Added #{task.id}: {task.title}")
         return task
 
-    def list(self, status: Optional[str] = None) -> list[Task]:
+    def list(
+        self, status: Optional[str] = None, _conn: Optional[sqlite3.Connection] = None
+    ) -> list[Task]:
         """status=None or 'all' returns everything; otherwise filters.
 
         Order, per docs/human-surface.md §4.8 (the fix for Red Team pass-1/7
@@ -543,13 +556,20 @@ class Store:
         sort by priority (high -> med -> low -> none) then id ascending
         within a tier; done tasks always sort after open ones, by
         completed_at descending (most recently finished first).
-        """
+
+        `_conn`, like `get`'s, lets a caller already holding an open
+        (possibly uncommitted) connection read its own pending writes --
+        a fresh connection here would only ever see the last COMMITTED
+        state, which is wrong mid-transaction (see the sync commit-order
+        fix in `_sync_diff_and_apply`)."""
         if status not in (None, "all") and status not in VALID_STATUSES:
             raise InvalidTask(
                 f"status must be one of {VALID_STATUSES + ('all',)}, got {status!r}",
                 hint="Use one of: pending, done, all.",
             )
-        with closing(self._connect()) as conn:
+        owns_conn = _conn is None
+        conn = _conn or self._connect()
+        try:
             pending = done = []
             if status in (None, "all", "pending"):
                 rows = conn.execute("SELECT * FROM tasks WHERE status = 'pending'").fetchall()
@@ -565,6 +585,9 @@ class Store:
                 done = sorted((self._row_to_task(r) for r in rows), key=lambda t: t.id)
                 done = sorted(done, key=lambda t: t.completed_at or "", reverse=True)
             return [*pending, *done]
+        finally:
+            if owns_conn:
+                conn.close()
 
     def get(self, task_id: int, _conn: Optional[sqlite3.Connection] = None) -> Task:
         try:
@@ -850,7 +873,18 @@ class Store:
         """Revert the single most recent mutation (any surface), regardless
         of which command made it. Reverting is itself a new commit, so
         undo is naturally symmetric: undoing twice in a row returns to the
-        pre-undo state (docs/human-surface.md §4.9)."""
+        pre-undo state (docs/human-surface.md §4.9).
+
+        The sqlite-side revert below is only committed once the matching
+        history commit (`hist.commit(...)`) has actually succeeded. Red
+        Team's 0226 finding: this used to commit sqlite first and call
+        `hist.commit` after, with no rollback -- so a git-side failure
+        there (e.g. an unrelated unreadable file elsewhere in the tree
+        breaking `git add -A`) left a task permanently deleted from
+        sqlite while the reported error implied nothing had happened.
+        Now any failure anywhere in this method rolls the whole sqlite
+        transaction back before it's ever raised, so sqlite and history
+        can never disagree about what undo did."""
         hist = self._history()
         hist.ensure()
         commits = hist.log(limit=2)
@@ -867,7 +901,8 @@ class Store:
                 hint="Run a command first (add/done/schedule/...).",
             )
         descriptions = []
-        with closing(self._connect()) as conn:
+        conn = self._connect()
+        try:
             for relpath in changed:
                 task_id = int(Path(relpath).stem)
                 before_row = conn.execute(
@@ -909,10 +944,26 @@ class Store:
                     hist.remove_task_file(task_id)
                 if before is not None:
                     descriptions.append(self._describe_revert(task_id, before, after))
-            conn.commit()
-        original_message = hist.message_of(last)
-        summary = "; ".join(descriptions) if descriptions else original_message
-        hist.commit(f"Undo: {original_message}", allow_empty=True)
+            original_message = hist.message_of(last)
+            summary = "; ".join(descriptions) if descriptions else original_message
+            # This must be the LAST thing that can fail before `conn.commit()`
+            # below -- see the docstring above.
+            hist.commit(f"Undo: {original_message}", allow_empty=True)
+        except Exception as exc:
+            conn.rollback()
+            conn.close()
+            if isinstance(exc, CadenceError):
+                raise
+            raise UndoFailed(
+                f"undo's history entry failed to record ({type(exc).__name__}: {exc})",
+                hint=(
+                    "Nothing was changed -- the task list is exactly what "
+                    "it was before this undo. Run 'cadence list' to "
+                    "confirm, or file a bug."
+                ),
+            ) from exc
+        conn.commit()
+        conn.close()
         return f"Undid: {summary}"
 
     # -- export -----------------------------------------------------------
@@ -1399,88 +1450,109 @@ class Store:
             }
 
         local_head = hist.head()
-        with closing(self._connect()) as conn:
+        # This connection is NOT committed until every history (git) write
+        # below has actually succeeded -- see `except Exception` at the
+        # bottom of this block. Red Team's 0226 finding: this used to
+        # commit the pulled rows here, then do the self-heal file rewrite
+        # and `advance_local` afterward with no rollback on failure -- so
+        # a write failure below (e.g. an unreadable file elsewhere in the
+        # tree breaking a plain file write) left sqlite holding a pull
+        # that history never recorded, while `sync()`'s own wrapper told
+        # the caller "Nothing was changed." Now that claim is guaranteed
+        # true: any failure anywhere in this block rolls the whole
+        # transaction back before the exception ever reaches that wrapper.
+        conn = self._connect()
+        try:
             for local_id in pulled_ids:
                 self._apply_remote_task(conn, mine[local_id])
-            conn.commit()
 
-        # Self-heal: rewrite EVERY task file from sqlite truth (not just
-        # the rows this round touched) before committing locally. A
-        # peer's earlier direct push writes straight into this store's
-        # own checked-out history dir
-        # (receive.denyCurrentBranch=updateInstead) without this store's
-        # sqlite or sync bookkeeping ever finding out -- reading that
-        # drifted tree back on a later sync is exactly what reintroduced
-        # the duplicate on a 3rd/4th round. A blind `git add -A` would
-        # launder that drift straight into this store's own next commit;
-        # rewriting every file from `mine` first heals it as soon as this
-        # store next syncs at all.
-        final = {t.id: t.to_full_dict() for t in self.list(status="all")}
-        on_disk_ids = set()
-        if hist.tasks_dir.exists():
-            for p in hist.tasks_dir.glob("*.json"):
+            # Self-heal: rewrite EVERY task file from sqlite truth (not just
+            # the rows this round touched) before committing locally. A
+            # peer's earlier direct push writes straight into this store's
+            # own checked-out history dir
+            # (receive.denyCurrentBranch=updateInstead) without this store's
+            # sqlite or sync bookkeeping ever finding out -- reading that
+            # drifted tree back on a later sync is exactly what reintroduced
+            # the duplicate on a 3rd/4th round. A blind `git add -A` would
+            # launder that drift straight into this store's own next commit;
+            # rewriting every file from `mine` first heals it as soon as this
+            # store next syncs at all.
+            #
+            # Reads on THIS SAME connection (`_conn=conn`), not a fresh
+            # one: the pulled rows applied above are only visible within
+            # this still-open transaction until it commits below.
+            final = {t.id: t.to_full_dict() for t in self.list(status="all", _conn=conn)}
+            on_disk_ids = set()
+            if hist.tasks_dir.exists():
+                for p in hist.tasks_dir.glob("*.json"):
+                    try:
+                        on_disk_ids.add(int(p.stem))
+                    except ValueError:
+                        continue
+            # Red Team independent pass on 0.2.25 (docs/dogfooding-log.md
+            # 2026-09-04): an on-disk id absent from sqlite is "stale drift
+            # to erase" ONLY if this store could actually read it and
+            # confirm that -- a file that EXISTS but can't be READ (chmod
+            # 000 / restrictive ACL) is not stale, it's simply unknown, and
+            # `remove_task_file` only checks write permission on the parent
+            # directory, never read permission on the file itself, so it
+            # would unlink it with zero warning. Reading each candidate
+            # first before deleting makes this exactly as safe as the
+            # "nothing pending" sync path, where such a file already
+            # survives untouched -- behaviour must not depend on what else
+            # this sync call had to do.
+            warnings = []
+            unreadable_relpaths = []
+            for stale_id in on_disk_ids - set(final):
+                stale_path = hist.task_path(stale_id)
                 try:
-                    on_disk_ids.add(int(p.stem))
-                except ValueError:
+                    stale_path.read_text()
+                except OSError as exc:
+                    warnings.append(
+                        f"#{stale_id}: on-disk task file '{stale_path}' could "
+                        f"not be read ({exc.strerror or exc}) so it was left in "
+                        f"place instead of being treated as stale drift. It is "
+                        f"NOT tracked by this client -- fix its permissions and "
+                        f"sync again to have it either absorbed or cleaned up."
+                    )
+                    # Left alone on disk, but `advance_local` below must not
+                    # let a blind `git add -A` trip over its own inability to
+                    # read this same file -- see the `exclude` arg there.
+                    unreadable_relpaths.append(f"tasks/{stale_path.name}")
                     continue
-        # Red Team independent pass on 0.2.25 (docs/dogfooding-log.md
-        # 2026-09-04): an on-disk id absent from sqlite is "stale drift
-        # to erase" ONLY if this store could actually read it and
-        # confirm that -- a file that EXISTS but can't be READ (chmod
-        # 000 / restrictive ACL) is not stale, it's simply unknown, and
-        # `remove_task_file` only checks write permission on the parent
-        # directory, never read permission on the file itself, so it
-        # would unlink it with zero warning. Reading each candidate
-        # first before deleting makes this exactly as safe as the
-        # "nothing pending" sync path, where such a file already
-        # survives untouched -- behaviour must not depend on what else
-        # this sync call had to do.
-        warnings = []
-        unreadable_relpaths = []
-        for stale_id in on_disk_ids - set(final):
-            stale_path = hist.task_path(stale_id)
-            try:
-                stale_path.read_text()
-            except OSError as exc:
-                warnings.append(
-                    f"#{stale_id}: on-disk task file '{stale_path}' could "
-                    f"not be read ({exc.strerror or exc}) so it was left in "
-                    f"place instead of being treated as stale drift. It is "
-                    f"NOT tracked by this client -- fix its permissions and "
-                    f"sync again to have it either absorbed or cleaned up."
-                )
-                # Left alone on disk, but `advance_local` below must not
-                # let a blind `git add -A` trip over its own inability to
-                # read this same file -- see the `exclude` arg there.
-                unreadable_relpaths.append(f"tasks/{stale_path.name}")
-                continue
-            hist.remove_task_file(stale_id)
-        for tid, data in final.items():
-            hist.write_task_file(data)
+                hist.remove_task_file(stale_id)
+            for tid, data in final.items():
+                hist.write_task_file(data)
 
-        # What we're willing to push: only content whose origin is
-        # genuinely mine to assert (new-to-remote or edited-by-me),
-        # each landing at a remote id chosen against the REMOTE's own
-        # id-space -- never a copy of what I just pulled (that would be
-        # re-asserting the other side's own task back at it, exactly the
-        # mechanism that clobbered a peer's own file in the pre-fix
-        # code), and never my own display-id blindly reused if the
-        # remote already uses that number for a different origin.
-        overlay = {remote_id: data for _, remote_id, data in push_plan}
-        pushed_ok = True
-        if overlay:
-            pushed_ok = hist.push_safe_merge(
-                theirs_ref, overlay, _SYNC_PUSH_LANDING_MESSAGE, [theirs_ref, local_head]
+            # What we're willing to push: only content whose origin is
+            # genuinely mine to assert (new-to-remote or edited-by-me),
+            # each landing at a remote id chosen against the REMOTE's own
+            # id-space -- never a copy of what I just pulled (that would be
+            # re-asserting the other side's own task back at it, exactly the
+            # mechanism that clobbered a peer's own file in the pre-fix
+            # code), and never my own display-id blindly reused if the
+            # remote already uses that number for a different origin.
+            overlay = {remote_id: data for _, remote_id, data in push_plan}
+            pushed_ok = True
+            if overlay:
+                pushed_ok = hist.push_safe_merge(
+                    theirs_ref, overlay, _SYNC_PUSH_LANDING_MESSAGE, [theirs_ref, local_head]
+                )
+            # Fold origin's history into local's own timeline too (pulled
+            # writes, and the self-heal rewrite above, are already applied to
+            # the local working tree).
+            hist.advance_local(
+                [local_head, theirs_ref],
+                f"sync: pulled {len(pulled_ids)}, pushed {len(push_plan)}, "
+                f"renumbered {len(renumbered)}",
+                exclude=unreadable_relpaths,
             )
-        # Fold origin's history into local's own timeline too (pulled
-        # writes, and the self-heal rewrite above, are already applied to
-        # the local working tree).
-        hist.advance_local(
-            [local_head, theirs_ref],
-            f"sync: pulled {len(pulled_ids)}, pushed {len(push_plan)}, "
-            f"renumbered {len(renumbered)}",
-            exclude=unreadable_relpaths,
-        )
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
+        conn.commit()
+        conn.close()
 
         if conflicts:
             existing = hist.load_conflicts()

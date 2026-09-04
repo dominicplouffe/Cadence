@@ -1376,3 +1376,76 @@ def test_sync_self_heal_never_deletes_unreadable_orphan_task_file(tmp_path):
         )
     finally:
         os.chmod(orphan, 0o644)  # let tmp_path's own cleanup remove it
+
+
+def test_sync_git_write_failure_leaves_local_sqlite_untouched(tmp_path):
+    """Red Team's 0226 pass (docs/dogfooding-log.md, commit c453ee3,
+    2026-09-04): the worst finding in this whole series. Sync's pull step
+    committed the pulled rows to sqlite BEFORE the matching history
+    (git) write, with no rollback if that write failed -- so a git-side
+    failure left sqlite permanently holding a pull that history never
+    recorded, while `sync()`'s own error told the caller "Nothing was
+    changed." Repro needs no malice: an unreadable (chmod 000) orphan
+    file already sitting at some id, plus a peer whose own next pull
+    happens to land at that same numeric id -- routine once two clients
+    have synced a few times (ids are assigned per-client, not reserved
+    across peers for an id that only exists as an on-disk orphan)."""
+    from cadence.store import SyncInconsistent
+
+    store = Store(db_path=tmp_path / "ry_p.db")
+    peer = Store(db_path=tmp_path / "ry_q.db")
+
+    store.add("ry task1")  # id 1
+    orphan = _orphan_task_path(store, 2)
+    orphan.write_text(json.dumps({"bad": True}))
+    os.chmod(orphan, 0o000)
+    try:
+        peer.add("ry2 taskA")  # id 1 on peer
+        peer.add("ry2 taskB")  # id 2 on peer -- lands at local id 2 on pull,
+        # colliding with the unreadable orphan file already sitting there.
+
+        before = store.list(status="all")
+        assert [t.title for t in before] == ["ry task1"]
+
+        with pytest.raises(SyncInconsistent) as exc_info:
+            store.sync(remote=str(peer.db_path))
+        assert "Nothing was changed" in exc_info.value.hint
+
+        after = store.list(status="all")
+        assert [t.title for t in after] == ["ry task1"], (
+            "sync reported failure but sqlite gained the pulled rows anyway"
+        )
+    finally:
+        os.chmod(orphan, 0o644)
+
+
+def test_undo_git_write_failure_leaves_sqlite_task_intact(tmp_path):
+    """Red Team's 0226 pass (docs/dogfooding-log.md, commit c453ee3,
+    2026-09-04): undo's sqlite-side revert (INSERT/DELETE) used to commit
+    BEFORE the matching history commit, with no rollback if that commit
+    failed -- so a git-side failure (here: an unrelated unreadable file
+    elsewhere in the tree breaking `git add -A`) left a real,
+    pre-existing task permanently deleted from sqlite while the reported
+    error implied nothing had happened."""
+    from cadence.store import CadenceError
+
+    store = Store(db_path=tmp_path / "ry_undo.db")
+    store.add("keep me")  # id 1 -- the only mutation so far; undo would
+    # delete it (its prior state, before this commit, is "doesn't exist").
+
+    orphan = _orphan_task_path(store, 99)
+    orphan.write_text(json.dumps({"bad": True}))
+    os.chmod(orphan, 0o000)
+    try:
+        before = store.list(status="all")
+        assert [t.title for t in before] == ["keep me"]
+
+        with pytest.raises(CadenceError):
+            store.undo()
+
+        after = store.list(status="all")
+        assert [t.title for t in after] == ["keep me"], (
+            "undo reported failure but deleted the task from sqlite anyway"
+        )
+    finally:
+        os.chmod(orphan, 0o644)
