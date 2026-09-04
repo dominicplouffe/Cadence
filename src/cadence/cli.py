@@ -979,9 +979,7 @@ def main(argv=None) -> int:
         # it gets the store/internal exit code (2), not the input one (1).
         _err(
             f"something went wrong on Cadence's end ({type(exc).__name__}: {exc}). "
-            "Unlike a failed sync or undo, this is not guaranteed to have "
-            "rolled back -- run 'cadence list' to check your tasks before "
-            "retrying, or check CADENCE_DB_PATH.",
+            "Unlike a failed sync or undo, this is not guaranteed to have rolled back -- run 'cadence list' to check your tasks before retrying, or check CADENCE_DB_PATH.",
             code=2,
         )
     return 0

@@ -974,9 +974,7 @@ class Store:
             raise UndoFailed(
                 f"undo's history entry failed to record ({type(exc).__name__}: {exc})",
                 hint=(
-                    "Rolled back automatically: nothing was changed -- the "
-                    "task list is exactly what it was before this undo. "
-                    "Run 'cadence list' to confirm, or file a bug."
+                    "Rolled back automatically: nothing was changed -- the task list is exactly what it was before this undo. Run 'cadence list' to confirm, or file a bug."
                 ),
             ) from exc
         conn.commit()
@@ -1109,12 +1107,7 @@ class Store:
             raise SyncInconsistent(
                 f"sync hit an internal inconsistency reading history data ({type(exc).__name__}: {exc})",
                 hint=(
-                    "Rolled back automatically: nothing was changed. This "
-                    "usually means a task file in the history store is "
-                    "corrupted or in an unexpected shape -- inspect "
-                    "<store>.history/tasks/*.json for a bad file, or file a "
-                    "bug. (Distinct clients sharing one CADENCE_DB_PATH is a "
-                    "different, already-guarded case.)"
+                    "Rolled back automatically: nothing was changed. This usually means a task file in the history store is corrupted or in an unexpected shape -- inspect <store>.history/tasks/*.json for a bad file, or file a bug. (Distinct clients sharing one CADENCE_DB_PATH is a different, already-guarded case.)"
                 ),
             ) from exc
 

@@ -283,9 +283,7 @@ def _err_unexpected(exc: Exception) -> dict:
         "error": "internal_error",
         "message": f"{type(exc).__name__}: {exc}",
         "hint": (
-            "Unlike a failed sync_tasks or undo, this is not guaranteed to "
-            "have rolled back -- run list_tasks to check current state "
-            "before retrying, or check CADENCE_DB_PATH."
+            "Unlike a failed sync_tasks or undo, this is not guaranteed to have rolled back -- run list_tasks to check current state before retrying, or check CADENCE_DB_PATH."
         ),
     }
 
