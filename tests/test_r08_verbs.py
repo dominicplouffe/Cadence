@@ -1388,7 +1388,7 @@ def test_sync_internal_error_hint_does_not_blame_cadence_db_path(tmp_path, monke
     # The old wording asserted a shared CADENCE_DB_PATH stem was the
     # cause, unconditionally -- it must not claim that anymore.
     assert "distinct path ending in '.db'" not in hint
-    assert "Nothing was changed" in hint
+    assert "Rolled back automatically: nothing was changed" in hint
 
 
 def test_sync_self_heal_never_deletes_unreadable_orphan_task_file(tmp_path):
@@ -1473,7 +1473,7 @@ def test_sync_git_write_failure_leaves_local_sqlite_untouched(tmp_path):
 
         with pytest.raises(SyncInconsistent) as exc_info:
             store.sync(remote=str(peer.db_path))
-        assert "Nothing was changed" in exc_info.value.hint
+        assert "Rolled back automatically: nothing was changed" in exc_info.value.hint
 
         after = store.list(status="all")
         assert [t.title for t in after] == ["ry task1"], (

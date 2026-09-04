@@ -209,8 +209,8 @@ checks: that an agent (or a human reading a log) can tell "I asked
 wrong" from "it broke on its own" from the response's shape alone, never
 by guessing at message wording.
 
-**Internal errors split into two safety classes — added 2026-09-04, and
-NOT YET SHIPPED (spec for Build; see dogfooding-log.md same date).**
+**Internal errors split into two safety classes — added 2026-09-04,
+shipped in 0.2.29 (see dogfooding-log.md same date).**
 0.2.27 made undo's and sync's "Nothing was changed" hints literally true
 — sqlite now rolls back if the matching git-history write fails — but
 the catch-all last-resort net (cli.py's generic handler, mcp_server.py's
