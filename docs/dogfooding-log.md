@@ -3226,3 +3226,55 @@ Full transcript: /workspace/redteam_0226_indep/findings/2026-09-04-0226-fix-hold
 (workspace-local, not committed — repro commands are all in this entry).
 Not fixed by me. Worst-first if only one gets picked up: Part B — real data
 loss on a plain sync-then-undo sequence, not an edge case needing malice.
+
+## 2026-09-04 (Rafael Okonkwo, Build) — 0.2.27: fix sync/undo committing sqlite before the matching git write, no rollback
+
+Fixed Dov's 0226 Part B finding above: the worst bug in the series. Both
+`sync()`'s pull-apply step and `undo()` called `conn.commit()` on local
+sqlite before the matching git history write, with no rollback if that
+write failed — so a git-side failure (an unrelated unreadable file
+breaking `git add -A`, or a pulled task colliding with an unreadable
+orphan's id) left sqlite permanently out of sync with history while the
+error text claimed "Nothing was changed" / "something went wrong."
+
+Fix: both now hold the sqlite connection open in one transaction across
+the matching history write and only call `conn.commit()` once that write
+has actually succeeded; any exception anywhere in the block rolls sqlite
+back (`conn.rollback()`) before the error is raised, so the claim in the
+hint text is now literally true instead of an assumption. Added a new
+`UndoFailed` error class for undo's history-write failure path. `list()`
+takes an optional `_conn` so a caller mid-transaction (sync's self-heal
+step) reads its own pending writes instead of a fresh connection that
+would only ever see the last *committed* state.
+
+Two regression tests added (`tests/test_r08_verbs.py`,
+`test_sync_git_write_failure_leaves_local_sqlite_untouched` and
+`test_undo_git_write_failure_leaves_sqlite_task_intact`), confirmed to
+fail against pre-fix `store.py` and pass against the fix. Full suite:
+164 passed.
+
+Re-ran Dov's exact repro from his 0226 finding against the fix, both
+locally and against the freshly `pip install`-ed 0.2.27 wheel in a clean
+venv outside the repo:
+
+```
+$ CADENCE_DB_PATH=RY/p.db cadence sync --remote RY2/q.db
+Error: sync hit an internal inconsistency reading history data
+(PermissionError: ... tasks/2.json). Nothing was changed. ...  exit=1
+$ CADENCE_DB_PATH=RY/p.db cadence list
+  [ ]    1   ry task1        <- still here, exactly as before the sync
+
+$ CADENCE_DB_PATH=RY/p.db cadence undo
+Error: undo's history entry failed to record (HistoryError: git add -A
+failed ... tasks/2.json Permission denied ...). Nothing was changed --
+the task list is exactly what it was before this undo. Run 'cadence
+list' to confirm, or file a bug.  exit=1
+$ CADENCE_DB_PATH=RY/p.db cadence list
+  [ ]    1   ry task1        <- still here after undo too
+```
+
+Task #1 survives both the failed sync and the failed undo; sqlite and
+git history stay in agreement; the error text's claim of "nothing
+changed" is now true rather than a guess. Published to PyPI
+(https://pypi.org/project/cadence-todo/0.2.27/), pushed to origin/main
+at 19dab34.
