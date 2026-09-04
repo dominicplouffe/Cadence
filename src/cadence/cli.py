@@ -47,6 +47,7 @@ from cadence.registry import (
 from cadence.store import (
     CadenceError,
     HistoryDegraded,
+    HistoryRewritten,
     HistoryUnreadable,
     MAX_TITLE_LEN,
     Store,
@@ -61,8 +62,14 @@ from cadence.store import (
 # store.undo() / store.sync() / store.resolve_conflict() -- everything
 # else those calls can raise is a user-input error (exit 1). Shared so
 # cmd_undo and cmd_sync can't drift from each other or from cli.py ~L242's
-# original add()-only version of this same rule.
-_STORE_CLASS_ERRORS = (StoreUnavailable, UndoFailed, HistoryUnreadable, SyncInconsistent)
+# original add()-only version of this same rule. HistoryRewritten
+# (task_01a06bf5) belongs here too: an externally rewritten .history repo
+# is store-level tampering, the same family as HistoryUnreadable's
+# permission/corruption failures, not a malformed CLI invocation -- the
+# command typed was correct, the store underneath it wasn't.
+_STORE_CLASS_ERRORS = (
+    StoreUnavailable, UndoFailed, HistoryUnreadable, SyncInconsistent, HistoryRewritten,
+)
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -670,7 +677,7 @@ def _cmd_sync_all_projects(args: argparse.Namespace) -> int:
                 continue
         try:
             store = Store(db_path=Path(path), must_exist=True)
-            result = store.sync(remote=remote_arg)
+            result = store.sync(remote=remote_arg, reset_sync_base=args.reset_sync_base)
         except CadenceError as exc:
             print(f"{name:<{name_w}}  Error: {_format_err(exc)}")
             any_store_error = True
@@ -742,7 +749,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"Resolved #{task.id} (kept {keep}): {task.title}")
         return 0
     try:
-        result = store.sync(remote=args.remote)
+        result = store.sync(remote=args.remote, reset_sync_base=args.reset_sync_base)
     except CadenceError as exc:
         _err(_format_err(exc), code=2 if isinstance(exc, _STORE_CLASS_ERRORS) else 1)
     for w in result.get("warnings", []):
@@ -934,6 +941,18 @@ def build_parser() -> argparse.ArgumentParser:
             "project. --remote then means the path to another client's own "
             "registry file (its ~/.config/cadence/projects.txt), matched to "
             "this client's projects by project name."
+        ),
+    )
+    p_sync.add_argument(
+        "--reset-sync-base",
+        action="store_true",
+        help=(
+            "Recovery only: use after a 'history was rewritten' error confirms "
+            "this store's own hidden .history directory was rewritten outside "
+            "Cadence (a manual rebase, filter-repo, or forced reset). Drops the "
+            "remembered sync-base and syncs fresh, same as this store's very "
+            "first sync -- safe: it can only turn an edit into a conflict for "
+            "you to settle, never silently drop one."
         ),
     )
     p_sync.set_defaults(func=cmd_sync)

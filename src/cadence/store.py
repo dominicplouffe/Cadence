@@ -159,6 +159,25 @@ class SyncInconsistent(CadenceError):
     code = "sync_inconsistent"
 
 
+class HistoryRewritten(CadenceError):
+    """Something outside Cadence rewrote commits in this store's own
+    `.history` git repo (a manual rebase, `git filter-repo`, or a forced
+    reset/push) after Cadence itself last trusted a specific commit there
+    -- either sync's own recorded `refs/cadence/sync-base` marker, or the
+    commit `undo` was about to treat as "the most recent mutation".
+    Cadence's own writes only ever ADD commits on top of what is already
+    there; they never rewrite or drop one. So the only way a commit
+    Cadence previously trusted stops being a real ancestor of this
+    repo's current history is external tampering, and the old
+    behaviour -- `snapshot_at()` silently returning `{}` for a bad ref,
+    read by sync as "no prior sync" -- turned that into a false conflict
+    storm instead of an honest refusal. No sqlite write is attempted
+    before this is raised, in either caller, so there is nothing to roll
+    back."""
+
+    code = "history_rewritten"
+
+
 class UndoFailed(CadenceError):
     """`undo` could not record its matching history entry (Red Team 0226
     finding: an unrelated unreadable file elsewhere in the tree can break
@@ -938,9 +957,43 @@ class Store:
         sqlite while the reported error implied nothing had happened.
         Now any failure anywhere in this method rolls the whole sqlite
         transaction back before it's ever raised, so sqlite and history
-        can never disagree about what undo did."""
+        can never disagree about what undo did.
+
+        Before any of that: if this store has ever synced, its own
+        `refs/cadence/sync-base` marker is a commit Cadence itself once
+        trusted as real history. If it's no longer a real ancestor of
+        this repo's current HEAD, something rewrote commits in this
+        `.history` dir since then (a manual rebase, `git filter-repo`, a
+        forced reset) -- outside Cadence's own control, since Cadence's
+        own writes only ever add commits on top. `hist.log()`'s "most
+        recent commit" is read off whatever HEAD is right now, with no
+        way to tell a genuine last mutation apart from one an external
+        rewrite fabricated, so this refuses rather than reverting
+        something it can no longer vouch for (`HistoryRewritten`, not
+        silently misbehaving). A store that has never synced has no
+        such marker and is unaffected -- this only ever adds a check,
+        never a new failure mode, for that far more common case."""
         hist = self._history()
         hist.ensure()
+        sync_base = hist.sync_base_sha()
+        if sync_base is not None:
+            current_head = hist.head()
+            if current_head is None or hist.is_ancestor(sync_base, current_head) is not True:
+                raise HistoryRewritten(
+                    "history was rewritten since the last sync, cannot safely undo",
+                    hint=(
+                        f"No sqlite change was attempted, so there is nothing to "
+                        f"roll back -- the recorded sync-base commit "
+                        f"({sync_base[:12]}) is no longer part of this store's "
+                        f"own history in {hist.repo_dir} -- something rewrote "
+                        f"commits there (a manual rebase, filter-repo, or a "
+                        f"forced reset) since the last 'cadence sync', so undo "
+                        f"can no longer tell which commit is really the last "
+                        f"mutation. Run 'cadence sync --reset-sync-base' once "
+                        f"you're sure of this store's current state, then retry "
+                        f"'cadence undo'."
+                    ),
+                )
         try:
             commits = hist.log(limit=2)
         except HistoryError as exc:
@@ -1069,12 +1122,21 @@ class Store:
             ),
         )
 
-    def sync(self, remote: Optional[str] = None) -> dict:
+    def sync(self, remote: Optional[str] = None, reset_sync_base: bool = False) -> dict:
         """docs/human-surface.md §4.10: never silently drops data on
         conflict. A task EDITED on both sides since the last clean sync
         (both have a common prior version that then diverged) is left
         untouched on BOTH the local store and the remote, reported by id
         in `conflicts` -- resolve_sync_conflict settles those.
+
+        `reset_sync_base`: drop this store's own `refs/cadence/sync-base`
+        marker before diffing -- the recovery path `HistoryRewritten`'s
+        hint points to, for when this store's `.history` dir really was
+        rewritten outside Cadence (confirmed, not just suspected). This
+        sync then runs exactly like a first-ever sync (no base to
+        compare against), which is always safe: it can only turn a
+        genuine edit into a `conflicts` entry for a human to settle,
+        never silently drop one, same as any other first sync.
 
         An id that never had a common prior version -- both sides
         independently created a task under the same auto-assigned id, with
@@ -1101,6 +1163,8 @@ class Store:
         """
         hist = self._history()
         hist.ensure()
+        if reset_sync_base:
+            hist.clear_sync_base()
         given_remote = remote
         if remote:
             # Resolve (and validate) first: Finding 2 depends on this
@@ -1392,6 +1456,35 @@ class Store:
         identity conflict (two independent rows can never share a UUID).
         """
         base_ref = hist.sync_base_sha()
+        # Guard against an externally rewritten `.history` repo (manual
+        # rebase, `git filter-repo`, a forced reset) BEFORE trusting
+        # `base_ref` for anything: `snapshot_at()` below silently returns
+        # `{}` for a ref that no longer resolves to real content, which
+        # used to read a rewritten sync-base as "no prior sync" -- every
+        # task then looks changed-on-both-sides relative to an empty
+        # base, a false conflict storm instead of a clean merge or an
+        # honest error. `is_ancestor` (unlike `sync_base_sha`'s own
+        # `rev-parse --verify`) actually walks the graph, so a `base_ref`
+        # that still resolves to *some* commit object but is no longer
+        # reachable from this repo's current HEAD is caught here too, not
+        # just an outright-missing ref.
+        if base_ref is not None:
+            current_head = hist.head()
+            if current_head is None or hist.is_ancestor(base_ref, current_head) is not True:
+                raise HistoryRewritten(
+                    "sync history was rewritten since the last sync, cannot "
+                    "safely 3-way merge",
+                    hint=(
+                        f"No sqlite change was attempted, so there is nothing to "
+                        f"roll back -- the recorded sync-base commit "
+                        f"({base_ref[:12]}) is no longer part of this store's "
+                        f"own history in {hist.repo_dir} -- something rewrote "
+                        f"commits there (a manual rebase, filter-repo, or a "
+                        f"forced reset) since the last 'cadence sync'. Re-run "
+                        f"with 'cadence sync --reset-sync-base' to start a "
+                        f"fresh sync from this store's current state."
+                    ),
+                )
         theirs = hist.snapshot_at(theirs_ref)
         base = hist.snapshot_at(base_ref) if base_ref else {}
         # Absorb any task file this store is only passively carrying for

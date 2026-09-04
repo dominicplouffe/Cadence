@@ -338,6 +338,45 @@ class GitHistory:
     def set_sync_base(self, sha: str) -> None:
         self._git("update-ref", "refs/cadence/sync-base", sha)
 
+    def clear_sync_base(self) -> None:
+        """Drop the sync-base marker entirely (`cadence sync
+        --reset-sync-base`, store.py's `HistoryRewritten` recovery path):
+        the next sync then behaves exactly like this store's first-ever
+        sync (`base_ref is None` in `_sync_diff_and_apply`) -- the one
+        state the merge engine already treats as "no prior sync to
+        compare against" on purpose, rather than a bug to work around."""
+        self._git("update-ref", "-d", "refs/cadence/sync-base", check=False)
+
+    # -- ancestry -----------------------------------------------------
+    def is_ancestor(self, ancestor: str, descendant: str) -> Optional[bool]:
+        """True only if `ancestor` is still a real, reachable ancestor of
+        `descendant` in this repo's own commit graph right now (`git
+        merge-base --is-ancestor`) -- NOT merely "does this SHA still
+        resolve to something", which `rev-parse --verify` alone would
+        say yes to even for a commit a manual rebase, `git filter-repo`,
+        or a forced reset just orphaned (git doesn't prune a dangling
+        object immediately, so it can sit there resolvable for a long
+        time after it stopped meaning anything). This is what
+        `sync_base_sha()` (sync's stored marker) and `undo`'s "most
+        recent commit" assumption both need checked before either is
+        trusted -- see store.py's `HistoryRewritten`.
+
+        False means both SHAs are real, valid commits in this repo, just
+        not related that way (the ordinary, unremarkable answer `git
+        merge-base --is-ancestor` itself gives -- exit code 1). None
+        means `ancestor` (or `descendant`) isn't even a commit this repo
+        can find any more at all (exit code >1, e.g. `fatal: Not a
+        valid commit name`) -- kept distinct from False only so a
+        caller logging *why* can tell "diverged" apart from "gone", not
+        because either answer is trusted any differently: both mean
+        "don't trust this as a real ancestor"."""
+        r = self._git("merge-base", "--is-ancestor", ancestor, descendant, check=False)
+        if r.returncode == 0:
+            return True
+        if r.returncode == 1:
+            return False
+        return None
+
     # -- remote -------------------------------------------------------
     def get_remote(self) -> Optional[str]:
         r = self._git("remote", "get-url", "origin", check=False)

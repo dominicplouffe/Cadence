@@ -635,7 +635,9 @@ def undo() -> dict:
 
 
 @mcp.tool()
-def sync_tasks(remote: Optional[str] = None, all_projects: bool = False) -> dict:
+def sync_tasks(
+    remote: Optional[str] = None, all_projects: bool = False, reset_sync_base: bool = False
+) -> dict:
     """Sync this store with a shared remote (another client's history).
 
     Never silently drops data. Two different things can make a task id
@@ -669,6 +671,15 @@ def sync_tasks(remote: Optional[str] = None, all_projects: bool = False) -> dict
         all_projects: If true, loops over every project registered via
             register_project and syncs each one (see the per-project
             result shape below) instead of just this store.
+        reset_sync_base: Recovery only -- use after this call (or CLI
+            'cadence sync') returns error "history_rewritten", which means
+            something outside Cadence rewrote this store's own hidden
+            history directory (a manual rebase, filter-repo, or a forced
+            reset) since the last sync, and Cadence can no longer trust
+            its recorded sync-base. Setting this to true drops that
+            marker and syncs fresh, exactly like this store's very first
+            sync -- safe: it can only turn an edit into a `conflicts`
+            entry for you to settle, never silently drop one.
 
     Returns (all_projects=false): {"ok": true, "pulled": N, "pushed": N,
         "already_synced": bool, "conflicts": [{"id", "mine", "theirs"}, ...],
@@ -692,7 +703,7 @@ def sync_tasks(remote: Optional[str] = None, all_projects: bool = False) -> dict
     """
     if not all_projects:
         try:
-            result = Store().sync(remote=remote)
+            result = Store().sync(remote=remote, reset_sync_base=reset_sync_base)
             return {"ok": True, **result}
         except CadenceError as exc:
             return _err(exc)
@@ -720,7 +731,9 @@ def sync_tasks(remote: Optional[str] = None, all_projects: bool = False) -> dict
                 )
                 continue
         try:
-            result = Store(db_path=path, must_exist=True).sync(remote=remote_arg)
+            result = Store(db_path=path, must_exist=True).sync(
+                remote=remote_arg, reset_sync_base=reset_sync_base
+            )
             results.append({"project": name, "ok": True, **result})
         except CadenceError as exc:
             results.append({"project": name, "ok": False, "error": exc.code, "message": exc.message, "hint": exc.hint})
