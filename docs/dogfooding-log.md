@@ -3663,3 +3663,68 @@ mutation ever made), and `why 1` under the identical `chmod 000
 Publishing 0.2.31 to PyPI via the version-bump-triggers-publish CI
 path (push to main); will verify the live wheel once the workflow
 finishes and record the PyPI URL as evidence.
+
+## 2026-09-04 (Noor Halvorsen, Surface) — review of 0.2.31's `HistoryUnreadable` wording against §4.4: confirmed clean, named as a third safety class, one exit-code bug found and handed to Build
+
+Reviewed Rafael's 0.2.31 `HistoryUnreadable` text (both call sites,
+`store.py`'s shared `_history_unreadable_hint`) against §4.4's own bar
+and against the two-safety-class invariant I wrote in on 2026-09-04
+for 0.2.30. This case is neither Class A ("rolled back") nor Class B
+("unconfirmed") — it's stronger than both: no sqlite write was ever
+attempted, because the failure is in `undo`'s precondition *read*,
+before the surrounding try/except that would wrap a write even opens.
+Reusing either existing marker would misstate it: "Rolled back
+automatically" implies a write happened and was then undone; Class B's
+"not guaranteed to have rolled back" implies uncertainty where there
+is none here.
+
+**Verdict: the shipped string already meets the bar, no wording
+change needed.** Two sentences worth (what failed, quoting the actual
+git error; what to check and the exact retry command), no stack
+trace, no bare code, and its opening clause — "No sqlite change was
+attempted, so there is nothing to roll back --" — already reads as its
+own distinct marker next to Class A's and B's, not a paraphrase of
+either. I gave it a name, "Class C — verified nothing attempted," and
+wrote it into `docs/human-surface.md` §4.4 with the same "before" /
+"after" discipline as the other two classes, so a future read-before-
+write precondition failure elsewhere in the codebase has a phrase to
+match rather than inventing its own.
+
+**Agent surface: already equivalent, nothing to do.** Checked
+`mcp_server.py`'s `undo()` tool specifically, since a wording spec that
+only reads clearly on one surface is half the fix per the project
+goal. It routes every `CadenceError` through the shared `_err(exc)`
+helper, which renders `exc.code`/`exc.message`/`exc.hint` straight
+from `store.py` — CLI and MCP were never two hand-written copies of
+this string, so there was no drift to find and none to fix.
+
+**Found in the course of this, not a wording issue: exit code 1 where
+§4.4 promises 2.** §4.4's own "three signals" list the CLI exit code
+as one of three ways to tell a field error from an internal one
+without reading any text. Checked it live:
+
+```
+$ CADENCE_DB_PATH=/tmp/undo_exit_test/cadence.db cadence add "test task"
+$ CADENCE_DB_PATH=/tmp/undo_exit_test/cadence.db cadence done 1
+$ chmod 000 /tmp/undo_exit_test/cadence.db.history/.git/index
+$ CADENCE_DB_PATH=/tmp/undo_exit_test/cadence.db cadence undo; echo $?
+Error: could not read undo history (git diff-tree failed: fatal:
+.git/index: index file open failed: Permission denied). No sqlite
+change was attempted, so there is nothing to roll back -- ...
+1
+```
+
+`1` is the field-error code; this is an internal/store-class error and
+§4.4 says it should exit `2`. Root cause: `cmd_undo` (`cli.py` ~L614)
+and `cmd_sync` (`cli.py` ~L731, ~L737) catch `CadenceError` and call
+`_err(_format_err(exc))` with no `code=`, which defaults to `1` for
+*every* error either command's store call can raise — `UndoFailed`,
+`HistoryUnreadable`, and `SyncInconsistent` included, not only genuine
+field errors. Pre-existing (not introduced by 0.2.31 — `UndoFailed`
+and `SyncInconsistent` have had this exit code since they shipped);
+0.2.31's new `HistoryUnreadable` just made it visible again while I
+was checking this. `cli.py` ~L242 already has the right pattern
+elsewhere (`code=2 if isinstance(exc, StoreUnavailable) else 1`) —
+`cmd_undo`/`cmd_sync` need the same shape. Named precisely in
+`docs/human-surface.md` §4.4 and posted to the leadership channel for
+Rafael/Mira; not editing `cli.py` myself.

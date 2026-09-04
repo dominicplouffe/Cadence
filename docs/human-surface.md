@@ -286,6 +286,73 @@ the "rolled back automatically" phrase just because it's the same
 exception type. That check belongs to whoever lands the code change,
 same as any other claim in this file.
 
+**Class C — verified nothing attempted. Added 2026-09-04, confirming
+0.2.31 (see dogfooding-log.md same date), reviewed by Noor Halvorsen.**
+Stronger than Class A, not a variant of it: Class A confirms a
+mutation was made and then rolled back — a write happened, then was
+undone. Class C confirms no write was ever attempted at all, because
+the failure sits in a precondition *read* that runs before the
+surrounding try/except (the block that would wrap a write) even
+starts. Neither existing marker fits this case: "Rolled back
+automatically" would claim a rollback that had nothing to roll back
+from, and Class B's "not guaranteed to have rolled back" would
+underclaim — here the guarantee is total, not merely absent. Marker
+phrase, opening the hint the same way Class A's does, so an agent that
+has seen one Class A hint can pattern-match this as a different but
+equally certain class rather than reading it as an unconfirmed one:
+`No sqlite change was attempted, so there is nothing to roll back --`.
+
+Site: `src/cadence/store.py`, `HistoryUnreadable` — `undo`'s
+precondition read of git history (`hist.log`/`hist.changed_task_files`)
+hitting a real git failure (e.g. a permission glitch or a sync tool
+holding `.git/index`), distinct from `NothingToUndo`, where the read
+succeeds and genuinely finds nothing. Shipped 0.2.31, live-verified:
+
+```
+$ cadence undo
+Error: could not read undo history (git diff-tree failed: fatal:
+.git/index: index file open failed: Permission denied). No sqlite
+change was attempted, so there is nothing to roll back -- Cadence
+could not read its own history directory to check for a mutation to
+undo. Check permissions on <path>.history/.git (a sync tool or
+another process may be holding it), then retry 'cadence undo'.
+```
+
+**Confirmed against the §4.4 bar as shipped — no wording change
+needed.** Not a stack trace, not a bare code, no generic "invalid
+input." It names the exact directory to check and the exact command to
+retry, and the marker phrase reads as its own distinct class next to
+Class A's and B's at a glance, not a paraphrase of either. The message
+half also quotes the underlying git failure verbatim (`git diff-tree
+failed: fatal: ...`) rather than summarizing it away — same pattern
+already used in Class A/B's `{type}: {exc}` interpolations, so this
+isn't a new liberty taken with this one string.
+
+**Agent surface already matches, with no separate string to drift.**
+`mcp_server.py`'s `undo()` tool routes every `CadenceError`, this one
+included, through the shared `_err(exc)` helper (~L243), which renders
+`exc.code` / `exc.message` / `exc.hint` verbatim from `store.py` — CLI
+and MCP read from the same source string, not two hand-written copies
+that happen to agree today. `error: "history_unreadable"` is a
+client-fault-free code per this section's signal 1, same as
+`undo_failed` and `sync_inconsistent`.
+
+**Found while checking this, not a wording problem — named for Build,
+not fixed here.** Signal 3 of this section ("CLI exit code... 1 for a
+field error, 2 for internal/server") does not actually hold for
+`undo`/`sync` today. `cmd_undo` (`cli.py` ~L614) and `cmd_sync`
+(`cli.py` ~L731, ~L737) each catch `CadenceError` and call
+`_err(_format_err(exc))` with no `code=` argument, which defaults to
+`1` — the field-error code — for *every* error raised inside
+`store.undo()` / `store.sync()` / `store.resolve_conflict()`, Class A
+and Class C included, not only field errors. Live-verified: `chmod 000
+.git/index` then `cadence undo` prints the Class C text above and
+exits `1`, not `2`. Compare the pattern already used correctly at
+`cli.py` ~L242 (`code=2 if isinstance(exc, StoreUnavailable) else 1`)
+— `cmd_undo`/`cmd_sync` need the same kind of branch, e.g. `code=2 if
+isinstance(exc, (UndoFailed, HistoryUnreadable, SyncInconsistent)) else
+1`. Posted to leadership for Rafael/Mira; not editing `cli.py` myself.
+
 ### 4.5 Loading / in-progress state
 
 None, by default: local operations complete in well under the ~100ms a
