@@ -3055,3 +3055,66 @@ Full transcripts and root-cause notes:
 (workspace-local, not committed — repro commands are all in this entry).
 Not fixed by me. Worst-first if only one gets picked up: this Part B
 finding, since it's the only open item — Part A is closed.
+
+## 2026-09-04 (Rafael Okonkwo, Build) — 0.2.26: fix sync self-heal silently deleting an unreadable orphan task file
+
+Fix, as scoped: `sync()`'s self-heal rewrite step used to treat any
+on-disk task id absent from sqlite as stale drift and unlink it
+unconditionally — `remove_task_file` only needs write permission on
+the parent directory, never read permission on the file itself, so a
+file that exists but can't be read (chmod 000 / restrictive ACL, one
+`_absorb_orphan_task_files` had already correctly left alone) got
+silently erased the moment self-heal had any other genuine pull/push
+work to do in the same sync call. A plain sync with nothing else
+pending already failed honestly and left the file in place; the two
+paths now agree. Self-heal reads each stale candidate first: an
+`OSError` there means "unknown," not "stale" — the file stays on
+disk and a warning naming it and the underlying error is added to
+`sync()`'s result (`warnings: [str, ...]`) instead of silence. CLI and
+MCP both print these warnings. `advance_local()` gained an `exclude`
+param so the self-heal commit's `git add -A` can skip that same
+unreadable path by pathspec instead of the whole commit tripping over
+one file it can't hash.
+
+Added 1 regression test (`test_r08_verbs.py`,
+`test_sync_self_heal_never_deletes_unreadable_orphan_task_file`),
+same Store-API-direct style as the two orphan tests just above it:
+chmod 000 an orphan file, sync against a genuinely different peer
+with real push work pending so self-heal actually runs, assert the
+file survives and a warning names it. Full suite: 162 passed (161
+pre-existing + 1 new), `python -m pytest tests/ -q`.
+
+Published 0.2.26 to PyPI: https://pypi.org/project/cadence-todo/0.2.26/
+Verified against the live published wheel, not local source — fresh
+venv (run from outside the repo, to avoid shadowing by the local
+`cadence/` source dir), `pip install -U cadence-todo` (one
+propagation-delay retry, same CDN-lag pattern noted since 0.2.19).
+Re-ran Dov's exact repro against the installed CLI with two real,
+separate `CADENCE_DB_PATH` clients: client A gets its own task plus a
+`chmod 000` orphan file at id 2 (never absorbed, matching the
+finding), client B is a genuinely empty peer so A's sync has real push
+work and self-heal actually runs. Result: `Warning: #2: on-disk task
+file '.../tasks/2.json' could not be read (Permission denied) so it
+was left in place instead of being treated as stale drift. ... fix its
+permissions and sync again ...` printed, then `Synced with origin:
+pulled 0, pushed 1. Up to date.` — no more silent "Nothing was lost or
+overwritten" alongside a real loss. `ls` on the file afterward: still
+present, still `----------` permissions, untouched.
+
+One thing worth a note for whoever picks up sync work next, not itself
+a bug in this fix: while building this repro I first tried a peer that
+also had its own task, which let a genuinely *new pulled* task get
+allocated the exact same numeric id as the pre-existing unreadable
+file (id space is client-local and reused, not reserved for on-disk
+orphans regardless of readability) — self-heal correctly tried to
+*write* the newly pulled task to that filename, hit the same
+`PermissionError` writing this time rather than reading, and surfaced
+it honestly via the existing catch-all (`sync hit an internal
+inconsistency ... Nothing was changed`), no data lost either way. Not
+the shape Dov reported or this fix's success test, and not a
+regression — flagging only because it's the same underlying fact
+(chmod 000 files aren't fully invisible to id allocation) surfacing a
+second way; not filing a task for it absent a concrete failure mode
+that loses something.
+
+Not independently re-verified by Red Team yet.
