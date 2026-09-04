@@ -199,6 +199,83 @@ checks: that an agent (or a human reading a log) can tell "I asked
 wrong" from "it broke on its own" from the response's shape alone, never
 by guessing at message wording.
 
+**Internal errors split into two safety classes — added 2026-09-04, and
+NOT YET SHIPPED (spec for Build; see dogfooding-log.md same date).**
+0.2.27 made undo's and sync's "Nothing was changed" hints literally true
+— sqlite now rolls back if the matching git-history write fails — but
+the catch-all last-resort net (cli.py's generic handler, mcp_server.py's
+`_err_unexpected`) sits behind every command, not just undo/sync, and
+cannot make the same promise: it has no idea which command failed or at
+what point, so it must not claim safety it cannot guarantee. Reading
+any one of the three hints alone, today, gives no way to tell which
+class you're in without opening the source. The fix is not new
+information — the code already knows the difference — it's saying the
+difference in the hint itself, with a marker phrase repeated verbatim
+wherever it applies so an agent can pattern-match it across all four
+sites instead of inferring it per-message.
+
+**Class A — guaranteed rolled back.** Hint opens with `Rolled back
+automatically:` every time, no exceptions, because both sites in this
+class already wrap the failure in an explicit sqlite `rollback()`
+before raising:
+
+`src/cadence/store.py` ~L960, `UndoFailed` hint:
+```
+Rolled back automatically: nothing was changed -- the task list is
+exactly what it was before this undo. Run 'cadence list' to confirm,
+or file a bug.
+```
+(was: `"Nothing was changed -- the task list is exactly what it was
+before this undo. Run 'cadence list' to confirm, or file a bug."`)
+
+`src/cadence/store.py` ~L1095, `SyncInconsistent` hint:
+```
+Rolled back automatically: nothing was changed. This usually means a
+task file in the history store is corrupted or in an unexpected shape
+-- inspect <store>.history/tasks/*.json for a bad file, or file a bug.
+(Distinct clients sharing one CADENCE_DB_PATH is a different,
+already-guarded case.)
+```
+(was: `"Nothing was changed. This usually means a task file in the
+history store is corrupted or in an unexpected shape -- inspect
+<store>.history/tasks/*.json for a bad file, or file a bug. (Distinct
+clients sharing one CADENCE_DB_PATH is a different, already-guarded
+case.)"`)
+
+**Class B — unconfirmed.** The two last-resort nets catch anything from
+any command, at any point, so they can never promise a rollback
+happened — the honest move is to say so explicitly, by name, rather
+than stay silent about it and let the reader assume either way:
+
+`src/cadence/cli.py` ~L964, the last-resort generic handler:
+```
+something went wrong on Cadence's end ({type}: {exc}). Unlike a
+failed sync or undo, this is not guaranteed to have rolled back -- run
+'cadence list' to check your tasks before retrying, or check
+CADENCE_DB_PATH.
+```
+(was: `f"something went wrong on Cadence's end ({type(exc).__name__}:
+{exc}). Run 'cadence list' to check your tasks, or check
+CADENCE_DB_PATH."`)
+
+`src/cadence/mcp_server.py` ~L272, `_err_unexpected`'s hint (the agent
+surface's equivalent net, same shape problem, same fix):
+```
+Unlike a failed sync_tasks or undo, this is not guaranteed to have
+rolled back -- run list_tasks to check current state before retrying,
+or check CADENCE_DB_PATH.
+```
+(was: `"Run list_tasks to check current state, or check
+CADENCE_DB_PATH."`)
+
+Nothing here re-promises safety the code doesn't already deliver: Class
+A's marker only ever wraps a hint whose sqlite call site already has an
+explicit `rollback()` on that exact path (`store.py` L953 and L1554); a
+new failure mode added later that skips the rollback must not borrow
+the "rolled back automatically" phrase just because it's the same
+exception type. That check belongs to whoever lands the code change,
+same as any other claim in this file.
+
 ### 4.5 Loading / in-progress state
 
 None, by default: local operations complete in well under the ~100ms a

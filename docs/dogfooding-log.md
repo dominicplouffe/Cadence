@@ -3348,3 +3348,58 @@ before this undo. Run 'cadence list' to confirm, or file a bug," which
 already states what happened rather than reassuring — that part may
 already be done as a side effect of the transactional fix, worth a
 quick diff read rather than assuming the old wording is still there.
+
+## 2026-09-04: sync/undo/internal-error wording — spec for the safety-class marker (human-surface.md §4.4)
+
+Rafael's re-verify note above was right that undo's and sync's hints
+already read "Nothing was changed" truthfully, not just reassuringly —
+that part didn't need touching. What still needed touching: a reader
+seeing only the third message in this family, cli.py's last-resort
+`except Exception` net (or its MCP twin, `_err_unexpected`), has no way
+to tell whether they're looking at the same guaranteed-safe class as
+undo/sync or something worse — the text is silent on it either way. I
+checked, and the answer is genuinely different for the third message:
+it catches an uncaught exception from *any* command at *any* point, not
+just undo/sync's git-history step, so unlike the other two it cannot
+promise a rollback happened. That's not a wording gap that invents new
+behavior — it's a gap where the code already knows something the
+message doesn't say.
+
+**Before → after, the four sites:**
+
+Guaranteed-safe class (`store.py`'s `UndoFailed`/`SyncInconsistent`
+hints, both already wrapped in an explicit `rollback()` before they're
+raised): prefixed with `Rolled back automatically:` — a marker phrase,
+not new content, so it reads the same as a category label the moment an
+agent has seen it once.
+
+Unconfirmed class (`cli.py`'s generic handler, `mcp_server.py`'s
+`_err_unexpected`): now says outright `Unlike a failed sync or undo,
+this is not guaranteed to have rolled back` — naming the contrast
+instead of leaving it to be inferred (or missed) by a reader who has
+only ever seen one of the four messages.
+
+Full before/after text for all four sites is in
+`docs/human-surface.md` §4.4 ("Internal errors split into two safety
+classes"), written verbatim against the current shipped strings in
+`store.py` (~L960, ~L1095) and `cli.py` (~L964)/`mcp_server.py` (~L272).
+
+**Why this reads more clearly:** before, "nothing changed" (undo/sync)
+and "run list to check" (the generic net) looked like two different
+registers of the same uncertainty — softer versus vaguer wording for
+what could have been the identical situation. An agent that has only
+ever seen the generic net's message has no textual signal that it is in
+a *worse-known* state than an agent that just saw undo's. After, the
+marker phrase is the signal: `Rolled back automatically` means checking
+is a formality; its absence means checking is the only way to know.
+Nothing here reassures beyond what the code guarantees — the "unlike a
+failed sync or undo" framing on the unconfirmed class is a fact about
+what the catch-all cannot promise, not a claim about what it can.
+
+**Status: doc-only, not yet shipped.** I did not touch `cli.py` or
+`store.py` — per the task, wording that requires a code change is
+named precisely and handed to Build, not self-applied. Posted the four
+exact strings to the leadership channel for Rafael/Mira to pick up as a
+follow-on task; `docs/human-surface.md` §4.4 is marked "NOT YET SHIPPED"
+until that lands, so the doc doesn't silently drift ahead of the CLI
+the way earlier specs occasionally have.
