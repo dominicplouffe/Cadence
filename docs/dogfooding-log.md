@@ -3118,3 +3118,111 @@ second way; not filing a task for it absent a concrete failure mode
 that loses something.
 
 Not independently re-verified by Red Team yet.
+
+## 2026-09-04 (Dov Ferreira, Red Team) — independent pass on 0.2.26: targeted fix holds; new CRITICAL finding on sync-then-undo
+
+Fresh venv, `pip install cadence-todo==0.2.26`, run from outside the repo, no
+local source on path. Fix commit: a750283.
+
+**Part A — the reported fix (self-heal warn-and-leave-in-place): holds.** Re-ran
+the exact 0.2.25 repro (two real `CADENCE_DB_PATH` clients, one carrying a
+`chmod 000` orphan task file, peer with genuine push work so self-heal actually
+runs, not the early-return-nothing-pending path). CLI:
+
+```
+Warning: #2: on-disk task file 'P4/p.db.history/tasks/2.json' could not be read
+(Permission denied) so it was left in place instead of being treated as stale
+drift. It is NOT tracked by this client -- fix its permissions and sync again
+to have it either absorbed or cleaned up.
+Note: #1 was independently created on both clients ... Nothing was lost or
+overwritten.
+Synced with origin: pulled 1, pushed 3. Up to date.
+exit=0
+```
+File survived on disk afterward. The "Nothing was lost or overwritten" note is
+now scoped to a genuinely different, correctly-resolved event (an independent
+#1-vs-#1 id collision) and makes no claim about the unreadable file, which gets
+its own separate honest warning. Confirmed same warning shape via `decompose`
++ sync, and via the MCP path (`Store().sync()`'s returned `warnings: [...]`
+list carries the identical text). Regression check: plain sync with nothing
+else pending still aborts honestly (`Nothing was changed`, exit=1) and leaves
+the file untouched, same as before. Part A is a clean pass, closed.
+
+**Part B — NEW finding, CRITICAL, not one of the shapes I was asked to check:**
+sync's honest-looking abort silently mutates local sqlite state, and the
+single most natural recovery step (`undo`) then destroys a real task while
+itself claiming failure. Trigger: an ordinary case where a peer's own task
+lands, on pull, at the same numeric id as the local unreadable orphan file (ids
+are assigned per-client and are not reserved across peers for an id that only
+exists as an on-disk, unabsorbed orphan — routine once two clients have synced
+a few times).
+
+Clean, single-attempt repro, every command run exactly once:
+```
+$ CADENCE_DB_PATH=RY/p.db cadence add "ry task1"        # Added #1
+$ echo '{"bad":true}' > RY/p.db.history/tasks/2.json && chmod 000 RY/p.db.history/tasks/2.json
+$ CADENCE_DB_PATH=RY2/q.db cadence add "ry2 taskA"       # Added #1 (own client)
+$ CADENCE_DB_PATH=RY2/q.db cadence add "ry2 taskB"       # Added #2 (own client)
+$ CADENCE_DB_PATH=RY/p.db cadence list
+  [ ]    1   ry task1
+
+$ CADENCE_DB_PATH=RY/p.db cadence sync --remote RY2/q.db
+Error: sync hit an internal inconsistency reading history data (PermissionError:
+... 'RY/p.db.history/tasks/2.json'). Nothing was changed. ...
+exit=1
+
+$ CADENCE_DB_PATH=RY/p.db cadence list
+  [ ]    1   ry task1
+  [ ]    2   ry2 taskB
+  [ ]    3   ry2 taskA
+```
+"Nothing was changed" is false: two peer tasks were pulled straight into local
+sqlite on a call that reported failure. Then the natural next move:
+```
+$ CADENCE_DB_PATH=RY/p.db cadence undo
+Error: something went wrong on Cadence's end (HistoryError: git add -A failed:
+... open("tasks/2.json"): Permission denied ...). Run 'cadence list' to check
+your tasks, or check CADENCE_DB_PATH.
+exit=2
+
+$ CADENCE_DB_PATH=RY/p.db cadence list
+  [ ]    2   ry2 taskB
+  [ ]    3   ry2 taskA
+```
+Task #1 ("ry task1") — the one real task this client had before any of this,
+created cleanly with no warning — is gone (`cadence why 1` → "no task with id
+1"; sqlite table only has ids 2, 3; `1.json` removed from disk). `undo`
+reported an error implying nothing happened; the actual effect was to delete
+the client's own real task, while the two erroneously-pulled, never-committed
+tasks (2, 3) stay behind, permanently disconnected from git history (`git log`
+on the history repo still shows only `Added #1: ry task1` — it doesn't even
+match sqlite anymore).
+
+Root cause: `sync()`'s pull step commits to local sqlite (`conn.commit()`)
+*before* the self-heal file-rewrite step runs; when self-heal's write phase
+hits the unreadable path (a genuinely new id landing on that filename, not the
+read-first check Part A's fix added), the `OSError` is caught by the generic
+handler at the bottom of `sync()` and reported as "Nothing was changed" with no
+rollback of the sqlite commit that already happened. `undo` has the same
+shape: it mutates sqlite first, then tries to record the reversion via
+`git add -A`, and when that fails on the same unreadable file, the sqlite
+mutation isn't rolled back and the command surfaces a generic error while
+having already done something. Same root defect as the one 0.2.26 fixed
+(an unreadable on-disk file breaking the assumption that "no file error" ==
+"safe to touch sqlite"), on two paths the fix didn't touch.
+
+Severity: highest in this series. Trigger conditions are ordinary — no
+malice, no exotic timing, just one unreadable file plus a peer whose next task
+happens to land at that id. The exact sequence a person or agent would take in
+good faith (see an error, run `undo` to get back to safety) is the one that
+causes real, silent, permanent data loss, and both error messages actively
+mislead about what already happened. Ranked fix: (1) make `sync`'s sqlite
+commit conditional on self-heal succeeding, or wrap both in one transaction;
+(2) same for `undo` — don't commit the sqlite-side reversion until the
+matching history write succeeds; (3) until then, stop the two error paths from
+claiming "nothing changed" when a rollback isn't actually guaranteed.
+
+Full transcript: /workspace/redteam_0226_indep/findings/2026-09-04-0226-fix-holds-plus-sync-then-undo-dataloss.md
+(workspace-local, not committed — repro commands are all in this entry).
+Not fixed by me. Worst-first if only one gets picked up: Part B — real data
+loss on a plain sync-then-undo sequence, not an edge case needing malice.
