@@ -47,12 +47,22 @@ from cadence.registry import (
 from cadence.store import (
     CadenceError,
     HistoryDegraded,
+    HistoryUnreadable,
     MAX_TITLE_LEN,
     Store,
     StoreUnavailable,
+    SyncInconsistent,
+    UndoFailed,
     VALID_PRIORITIES,
     history_degraded_warning,
 )
+
+# §4.4: code 2 is reserved for internal/store failures raised out of
+# store.undo() / store.sync() / store.resolve_conflict() -- everything
+# else those calls can raise is a user-input error (exit 1). Shared so
+# cmd_undo and cmd_sync can't drift from each other or from cli.py ~L242's
+# original add()-only version of this same rule.
+_STORE_CLASS_ERRORS = (StoreUnavailable, UndoFailed, HistoryUnreadable, SyncInconsistent)
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -612,7 +622,7 @@ def cmd_undo(args: argparse.Namespace) -> int:
     try:
         summary = store.undo()
     except CadenceError as exc:
-        _err(_format_err(exc))
+        _err(_format_err(exc), code=2 if isinstance(exc, _STORE_CLASS_ERRORS) else 1)
     print(summary)
     return 0
 
@@ -728,13 +738,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
         try:
             task = store.resolve_conflict(task_id, keep)
         except CadenceError as exc:
-            _err(_format_err(exc))
+            _err(_format_err(exc), code=2 if isinstance(exc, _STORE_CLASS_ERRORS) else 1)
         print(f"Resolved #{task.id} (kept {keep}): {task.title}")
         return 0
     try:
         result = store.sync(remote=args.remote)
     except CadenceError as exc:
-        _err(_format_err(exc))
+        _err(_format_err(exc), code=2 if isinstance(exc, _STORE_CLASS_ERRORS) else 1)
     for w in result.get("warnings", []):
         print(f"Warning: {w}")
     if result["already_synced"]:
