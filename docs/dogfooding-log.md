@@ -4034,3 +4034,125 @@ sit behind separate CDN cache lifetimes. Confirm with `pip show
 cadence-todo` (or pin `==<version>`) rather than trusting `--upgrade`
 alone; a stale-cache false negative here is a test-environment
 artifact, not a product bug, so don't mistake it for one. task_01a06aab10704e198f1b41b3.
+
+## 2026-09-04 (Rafael Okonkwo, Build) — 0.2.34: guard sync/undo against externally rewritten git history (the chairman's rebase question)
+
+Fixed the gap the chairman named himself in the boardroom (2026-09-04
+10:26): what happens if the hidden `.history` git repo underneath a
+store gets rewritten by something other than Cadence — a hand-run
+rebase, `git filter-repo`, a forced reset or push — so sqlite and git
+stop agreeing on what "last" means? Before this fix, nothing checked.
+`sync`'s stored `refs/cadence/sync-base` marker and `undo`'s "most
+recent commit" (`hist.log()`'s HEAD) were both trusted as-is.
+`snapshot_at()` silently returns `{}` for a ref that no longer
+resolves to real content, so a rewritten sync-base used to be read as
+"no prior sync at all" — every task would look changed on both sides
+relative to an empty base, a false conflict storm instead of a clean
+merge. `undo` was worse: it would have reverted whatever the tampered
+HEAD claimed was the last mutation, with no way to tell a genuine edit
+from a fabricated one, and no error at all.
+
+Fix: `GitHistory.is_ancestor()` (`history.py`) runs `git merge-base
+--is-ancestor`, which walks the actual commit graph — not `rev-parse
+--verify`, which only checks a SHA still resolves to *some* object.
+Git doesn't prune a dangling commit immediately, so a rebased-away or
+force-pushed-over commit can sit there resolvable for a long time
+after it stopped being real history; `is_ancestor` is what tells the
+difference. `sync` (`store.py` `_sync_diff_and_apply`) now checks the
+stored sync-base against current HEAD before trusting it for anything,
+and `undo` checks its own sync-base marker the same way before
+touching sqlite. Either check failing raises `HistoryRewritten` — a
+new Class C "verified nothing attempted" error, same family as
+`HistoryUnreadable`, exit 2 via the existing `_STORE_CLASS_ERRORS`
+tuple in `cli.py` — naming what happened and the one way out:
+`cadence sync --reset-sync-base`. That flag (new on `cadence sync`,
+and a matching `reset_sync_base` param on the `sync_tasks` MCP tool)
+drops the store's own sync-base marker via `GitHistory.clear_sync_base()`
+and lets the next sync run exactly like this store's first-ever sync —
+no base to compare against, which the merge engine already treats as
+safe on purpose: it can only turn a real edit into a `conflicts` entry
+for a human to settle, never silently drop one.
+
+`tests/test_0904_history_rewrite_guard.py` rewrites a client's real
+`.history` repo by hand (`git commit --amend` — same tree, new SHA,
+old tip orphaned, exactly what a rebase or `filter-repo` run does to
+the commit at HEAD) and confirms: `sync` raises `HistoryRewritten`
+instead of a false conflict storm, `undo` raises it instead of
+reverting the wrong thing, sqlite is byte-identical before and after
+both failed calls (checked via a raw `SELECT * FROM tasks`, not
+through Store's own view of itself), a second client whose history was
+never touched is unaffected and syncs clean against the same remote,
+and `--reset-sync-base` actually recovers a working sync afterward
+with the original row intact. 170/170 tests pass (168 pre-existing + 2
+new).
+
+Published 0.2.34 to PyPI via the version-bump-triggers-publish CI path
+(push to main, commit a4253ce): CI green
+(https://github.com/dominicplouffe/Cadence/actions/runs/33864605479),
+Publish green
+(https://github.com/dominicplouffe/Cadence/actions/runs/33864605518),
+live at https://pypi.org/project/cadence-todo/0.2.34/.
+
+Re-ran the rewrite against the real published wheel, fresh venv
+outside the repo (`/workspace/verify_0234/venv`, `pip install
+cadence-todo==0.2.34`, confirmed via `pip show` the installed version
+is 0.2.34 before running), against the live CLI, not pytest:
+
+```
+$ cadence add "shared task"
+Added #1: shared task
+$ cadence sync --remote /workspace/verify_0234/remote.git
+Synced with origin: pulled 0, pushed 1. Up to date.
+$ cadence schedule 1 2026-09-10
+Scheduled #1 for 2026-09-10: shared task
+$ cadence sync --remote /workspace/verify_0234/remote.git
+Synced with origin: pulled 0, pushed 1. Up to date.
+
+# sqlite before rewrite: [{'id': 1, 'title': 'shared task', 'status':
+# 'pending', 'due': '2026-09-10', ...}]
+
+$ git -C db.sqlite.history commit --amend -q -m "externally rewritten (simulated rebase)"
+
+$ cadence sync --remote /workspace/verify_0234/remote.git; echo "exit=$?"
+Error: sync history was rewritten since the last sync, cannot safely
+3-way merge. No sqlite change was attempted, so there is nothing to
+roll back -- the recorded sync-base commit (5113f164beed) is no longer
+part of this store's own history in db.sqlite.history -- something
+rewrote commits there (a manual rebase, filter-repo, or a forced
+reset) since the last 'cadence sync'. Re-run with 'cadence sync
+--reset-sync-base' to start a fresh sync from this store's current
+state.
+exit=2
+
+$ cadence undo; echo "exit=$?"
+Error: history was rewritten since the last sync, cannot safely undo.
+No sqlite change was attempted, so there is nothing to roll back --
+the recorded sync-base commit (5113f164beed) is no longer part of this
+store's own history in db.sqlite.history -- something rewrote commits
+there (a manual rebase, filter-repo, or a forced reset) since the last
+'cadence sync', so undo can no longer tell which commit is really the
+last mutation. Run 'cadence sync --reset-sync-base' once you're sure
+of this store's current state, then retry 'cadence undo'.
+exit=2
+
+# sqlite after both failed calls: identical row, byte for byte —
+# confirmed via a fresh `SELECT * FROM tasks` against the .db file,
+# not through cadence's own view of it.
+
+$ cadence sync --remote /workspace/verify_0234/remote.git --reset-sync-base
+Already in sync with origin. Nothing to pull or push.
+$ cadence sync --remote /workspace/verify_0234/remote.git
+Already in sync with origin. Nothing to pull or push.
+$ cadence schedule 1 2026-09-11
+Scheduled #1 for 2026-09-11: shared task
+$ cadence undo
+Undid: Scheduled #1 undone (due 2026-09-11 → 2026-09-10): shared task
+```
+
+Final sqlite row after the whole episode: `{'id': 1, 'title': 'shared
+task', 'status': 'pending', 'due': '2026-09-10', ...}` — same task,
+same due date it had before the rewrite, nothing lost across the
+failed sync, the failed undo, or the recovery. Both commands fail
+loud with the documented Class C wording and exit 2 on the real
+installed CLI, not just under pytest, and `--reset-sync-base` is a
+promise the package actually keeps. task_01a06bf5.
