@@ -3842,3 +3842,86 @@ unreadable-orphan-file case) instead of folding it into a silent `pushed:
 Filed for Rafael — not fixed by me. Script and full run log kept at
 `/workspace/redteam_0231_pushrace/race.py` for re-run against any future
 fix.
+
+## 2026-09-04 (Rafael Okonkwo, Build) — 0.2.32: fix push-race silently dropping an un-pushed task's sync base advance
+
+Fixed Dov's finding above. Root cause was exactly what he named:
+`Store._sync_diff_and_apply` (`store.py` ~L1628-1633) advanced
+`refs/cadence/sync-base` to the new local head whenever there were no
+*conflicts* — never checking `pushed_ok`, the boolean that already
+existed and already correctly said whether `push_safe_merge` actually
+landed on origin. So a clean non-fast-forward push failure (someone
+else pushed first, no error, no exception) still got treated as
+"reconciled": the un-pushed content was folded into the client's own
+notion of "what the remote and I agree on," so the very next sync's
+diff saw `mine` matching that (wrongly-advanced) base and never
+re-offered it to `push_plan`. Forever, silently, `pushed: 0` reading
+identical to "nothing needed pushing."
+
+Fix, in `_sync_diff_and_apply`:
+- When `push_safe_merge` returns `False`, append a `warnings` entry
+  naming the real cause ("remote changed since this sync started
+  (another client pushed first)"), the count of un-pushed tasks, and
+  that nothing was lost and to sync again. Both CLI paths
+  (`cmd_sync`, `_cmd_sync_all_projects`) already print every
+  `warnings` entry ahead of the summary line — no CLI/MCP change
+  needed there, the plumbing already existed for the unreadable-
+  orphan-file case.
+- `hist.set_sync_base(hist.head())` now only runs in the no-conflicts
+  branch when `pushed_ok` is also true (it stays `True` by default
+  when `overlay` was empty, i.e. nothing needed pushing, so the pure-
+  pull case is unaffected). On a push failure, the sync base is left
+  exactly where it was — the next sync's diff re-derives `mine_changed`
+  against that same unmoved base, finds the local edit still diverged
+  from origin, and retries the push. The early `m_fp == t_fp` "already
+  same content, skip" check elsewhere in the same loop is what keeps
+  this safe for everything that *did* pull/reconcile correctly in the
+  same failed sync round — it never depends on what the base says once
+  both sides already hold identical content.
+
+`advance_local` itself is unchanged and still runs unconditionally:
+it only ever writes to this client's own local `main`, never to
+origin, so it still needs to fold in whatever was pulled/self-healed
+this round regardless of push outcome — the bug was exclusively in
+treating that local fold as proof the push also succeeded.
+
+No new regression test added under `tests/` (this needs two `Store`
+instances racing a real `git push` against a shared bare-style
+remote, which the existing suite has no fixture for); instead re-ran
+Dov's own deterministic repro, extended with a second, independent
+fresh-checker verification pass *after* the retry (previously the
+script only checked ground truth once, before any retry, which could
+never observe the fix actually working — see the `race.py` diff).
+Full suite: 168 passed, 0 failed
+(`/tmp/relvenv` editable install, `pytest -q`).
+
+Repro against the fix (local editable install, pre-publish sanity
+check — `/workspace/redteam_0231_pushrace/race.py`, same deterministic
+two-client forcing Dov used):
+
+```
+X3 sync result: {'pulled': 1, 'pushed': 0, ... 'warnings': ["push
+failed: remote changed since this sync started (another client pushed
+first). 1 task(s) not pushed. Nothing was lost -- run 'cadence sync'
+again to retry."]}
+
+Titles A truly has after a fresh pull: ['X1-task', 'X2-task']
+X3-task present on remote A before retry? False
+
+X3's SECOND, completely normal sync() call result: {'pulled': 1,
+'pushed': 1, ...}
+X3 own list() after second sync: ['X1-task', 'X2-task', 'X3-task']
+
+Titles A truly has after retry: ['X1-task', 'X2-task', 'X3-task']
+X3-task present on remote A? True
+```
+
+The un-pushed task now reaches the remote on X3's very next, entirely
+ordinary `cadence sync` — no manual intervention, no lost data, and a
+second independent fresh checker client (never touched by anything
+else in the repro) confirms it by pulling from the real shared remote
+itself, not by trusting X3's own report of itself.
+
+Publishing 0.2.32 to PyPI via the version-bump-triggers-publish CI
+path (push to main); will verify the live wheel once the workflow
+finishes and record the PyPI URL as evidence.

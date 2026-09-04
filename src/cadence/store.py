@@ -1609,6 +1609,33 @@ class Store:
                 pushed_ok = hist.push_safe_merge(
                     theirs_ref, overlay, _SYNC_PUSH_LANDING_MESSAGE, [theirs_ref, local_head]
                 )
+                if not pushed_ok:
+                    # Red Team push-race finding (docs/dogfooding-log.md
+                    # 2026-09-04, commit c087a54): two ordinary clients
+                    # syncing the same shared remote a moment apart is
+                    # enough to hit this -- push_safe_merge only succeeds
+                    # if `theirs_ref` (captured once, at fetch time, above)
+                    # is still what origin/main points to. If a second
+                    # client landed its own push in the meantime, this is
+                    # a plain non-fast-forward and push_safe_merge returns
+                    # False with nothing pushed -- no exception, nothing
+                    # corrupted. The mistake this fixes was moving the
+                    # sync base forward anyway (below) as if this had
+                    # succeeded: that makes this client believe its own
+                    # edit is already reflected on the remote, so it is
+                    # never offered to push_plan again on any later sync
+                    # -- silently and permanently dropped, with every
+                    # subsequent `cadence sync` reporting "Already in
+                    # sync." Telling the truth here (a warning + sync base
+                    # held back below) is what makes the next sync attempt
+                    # rediscover this exact same content as "mine changed"
+                    # and retry the push.
+                    warnings.append(
+                        f"push failed: remote changed since this sync started "
+                        f"(another client pushed first). {len(overlay)} "
+                        f"task(s) not pushed. Nothing was lost -- run "
+                        f"'cadence sync' again to retry."
+                    )
             # Fold origin's history into local's own timeline too (pulled
             # writes, and the self-heal rewrite above, are already applied to
             # the local working tree).
@@ -1629,8 +1656,17 @@ class Store:
             existing = hist.load_conflicts()
             existing.update(conflicts)
             hist.save_conflicts(existing)
-        else:
+        elif pushed_ok:
             hist.set_sync_base(hist.head())
+        # else: push failed above and there are no conflicts to record --
+        # deliberately leave refs/cadence/sync-base right where it was.
+        # Advancing it here (the pre-fix behaviour) would mark this
+        # client's own un-pushed edit as already-reconciled, so the next
+        # sync's diff would see `mine` matching the (stale) base and never
+        # re-offer it to push_plan. Holding the base back means the next
+        # sync recomputes `mine_changed` against the SAME pre-sync base,
+        # finds this content still diverged from origin, and retries the
+        # push -- see the pushed_ok warning above for the full story.
 
         return {
             "pulled": len(pulled_ids),
