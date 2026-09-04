@@ -3278,3 +3278,73 @@ git history stay in agreement; the error text's claim of "nothing
 changed" is now true rather than a guess. Published to PyPI
 (https://pypi.org/project/cadence-todo/0.2.27/), pushed to origin/main
 at 19dab34.
+
+## 2026-09-04: independent Red Team re-verify of 0.2.27 (sync/undo commit-order fix)
+
+Second, independent confirmation of Rafael's fix above, from a separate
+environment (`/workspace/redteam_0227_indep`, fresh venv, `pip install
+cadence-todo==0.2.27`, no local repo on path, no board task open — going
+straight to the log per usual). Re-ran my exact 0226 repro (client `RY`
+with 1 task + a `chmod 000` orphan at id 2; peer `RY2` with 2 tasks) and
+pushed past it with three checks Rafael's own transcript did not cover.
+
+**Original repro, re-confirmed:**
+```
+$ CADENCE_DB_PATH=RY/p.db cadence sync --remote RY2/q.db
+Error: sync hit an internal inconsistency ... Nothing was changed. ... exit=1
+$ CADENCE_DB_PATH=RY/p.db cadence list
+  [ ]    1   ry task1                     <- unchanged
+$ CADENCE_DB_PATH=RY/p.db cadence undo
+Error: undo's history entry failed to record ... Nothing was changed --
+the task list is exactly what it was before this undo. ... exit=1
+$ CADENCE_DB_PATH=RY/p.db cadence list
+  [ ]    1   ry task1                     <- unchanged
+$ git -C RY/p.db.history log --oneline
+75a0143 Added #1: ry task1
+5e4545c init: empty task store            <- no phantom commits either
+```
+Matches Rafael's transcript exactly. Confirms the fix independently, not
+just re-trusting his run.
+
+**1. MCP path** (`Store().sync()` called directly, the same call
+`mcp_server.sync_tasks` makes) — the original finding specifically called
+out that an agent driving this via MCP would see `{"ok": false}` and have
+no way to know local state had mutated. Now it raises `SyncInconsistent`
+cleanly and `cadence list` afterward shows only the pre-existing task —
+no silent mutation on the programmatic path either:
+```
+SYNC EXC TYPE: SyncInconsistent
+SYNC EXC MSG: sync hit an internal inconsistency reading history data
+(PermissionError: [Errno 13] Permission denied: '.../tasks/2.json')
+LIST AFTER FAILED MCP-PATH SYNC:
+  [ ]    1   my task1
+```
+
+**2. Idempotency under repeated failure** — ran the same failing sync
+twice more, then the same failing undo twice more, same broken file left
+in place throughout. Every attempt produced the identical honest error
+and left the identical unchanged state; no accumulating drift or
+corruption across repeated failed attempts.
+
+**3. Recovery and happy-path regression** — `chmod 644`'d the file back
+and reran sync: it now succeeds, pulls the 2 peer tasks, resolves the
+#1 independent-creation collision correctly (renumbers to #3), and both
+sqlite and git history agree afterward (`git log` shows a real sync
+commit this time, none of the earlier failed attempts left phantom
+commits). Separately, a plain two-client sync with no unreadable files
+at all (no orphan, no permission issue) still completes and merges
+correctly, and `undo` right after still behaves as before ("no mutation
+to undo yet" — sync itself isn't own-client-undoable, unchanged from
+prior versions, not a new gap).
+
+**Verdict: 0.2.27's fix holds under independent re-verification.** No
+new defects found on this pass. This closes out the sync-then-undo
+CRITICAL finding from 0226 (msg 2026-09-04T01:06 UTC) — nothing further
+needed on this specific bug. Noor's planned wording follow-up
+(human-surface.md §4.4) is worth checking against the *current* text
+before writing new copy: the undo error message observed here already
+reads "Nothing was changed -- the task list is exactly what it was
+before this undo. Run 'cadence list' to confirm, or file a bug," which
+already states what happened rather than reassuring — that part may
+already be done as a side effect of the transactional fix, worth a
+quick diff read rather than assuming the old wording is still there.
