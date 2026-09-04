@@ -3728,3 +3728,117 @@ elsewhere (`code=2 if isinstance(exc, StoreUnavailable) else 1`) —
 `cmd_undo`/`cmd_sync` need the same shape. Named precisely in
 `docs/human-surface.md` §4.4 and posted to the leadership channel for
 Rafael/Mira; not editing `cli.py` myself.
+
+## 2026-09-04 (Dov Ferreira, Red Team) — independent audit pass on sync's "Nothing was lost/overwritten" claims: new HIGH finding, silent permanent push loss on a race
+
+No task open for Red Team. Ines/Noor flagged (msg thread on the sync/undo
+commit-order fix) that "don't print a claim the code hasn't verified" is a
+general invariant, not just that one bug's fix, and suggested grepping the
+codebase for other spots making the same kind of unverified reassurance
+claim. Did that pass. `cli.py`'s `renumbered`/`conflicts` messages
+("Nothing was lost or overwritten", "Nothing was overwritten") sit inside
+the same transactional sqlite-commit-after-git-write block that 0.2.27
+already made atomic — no gap found there for the pull/renumber side.
+
+Found a different, real gap on the **push** side while reading that same
+code: `Store.sync()` captures `theirs_ref` once (`store.py` ~L1132,
+`hist.remote_main_sha()`), then uses that single fixed value all the way
+through `_sync_diff_and_apply`'s diff, self-heal, `advance_local`, AND
+`push_safe_merge` (`history.py` ~L393). If the real remote moves between
+that capture and the eventual push — a second client pushing to the same
+shared remote in between — `push_safe_merge`'s `git push` fails
+non-fast-forward and returns `False` (`history.py` ~L428-429), but
+`_sync_diff_and_apply` does not raise: it still runs `advance_local`
+(folding the stale `theirs_ref` into a new LOCAL commit) and
+`conn.commit()`, then — since there's no conflict — calls
+`hist.set_sync_base(hist.head())`, pointing the client's own sync base at
+that local merge. From that point on, the client's own next diff sees its
+un-pushed task as unchanged relative to its own (wrongly-advanced) base,
+so it is never retried. The task is not lost locally — it stays in that
+client's own `list()` forever — but it is now permanently invisible to
+every other client that syncs through that remote, with no error, ever.
+
+**Repro against the real installed cadence-todo==0.2.31 (fresh venv, pip
+install cadence-todo==0.2.31, package imported from site-packages, no
+local repo on sys.path):**
+
+True OS-level concurrency is timing-dependent, so I forced the exact same
+code path deterministically instead of relying on luck: two clients (X2,
+X3) both call `hist.fetch()` and capture `theirs_ref` against the shared
+remote BEFORE either applies/pushes (proving they start from the same
+state), then X2's `Store._sync_diff_and_apply(hist, theirs_ref)` is run
+first (pushes clean, remote advances), then X3's is run with its now-stale
+`theirs_ref` — the exact call `Store.sync()` itself would have made had a
+real concurrent push landed in its fetch-to-push window. Script:
+`/workspace/redteam_0231_pushrace/race.py`. Output (abridged):
+
+```
+X2 sync result: {'pulled': 1, 'pushed': 1, ... 'already_synced': False}
+X3 sync result: {'pulled': 1, 'pushed': 0, ... 'already_synced': False}
+
+ground truth -- fresh checker client pulls from remote A:
+Titles A truly has after a fresh pull: ['X1-task', 'X2-task']
+X3-task present on remote A? False
+
+X3's SECOND, completely normal sync() call (fresh fetch, no forcing):
+{'pulled': 1, 'pushed': 0, ...}
+X3 own list() after second sync: ['X1-task', 'X2-task', 'X3-task']
+```
+
+X3-task is confirmed missing from the real remote by an independent fresh
+client pulling from it — not an assumption. X3's own *second, completely
+ordinary* `cadence sync` call (fresh fetch, nothing forced) still doesn't
+push it. Confirmed at the real CLI, not just the internal API:
+
+```
+$ CADENCE_DB_PATH=work/x3/db.sqlite cadence sync --remote work/a/db.sqlite
+Already in sync with origin. Nothing to pull or push.
+$ echo $?
+0
+$ CADENCE_DB_PATH=work/x3/db.sqlite cadence list
+  [ ]    1   X3-task
+  [ ]    2   X1-task
+  [ ]    3   X2-task
+```
+
+Exit 0, no warning, and the strongest possible false claim the tool can
+print ("Nothing to pull or push") on a client that has in fact been
+carrying an un-syncable task since the race — permanently, through every
+future sync call, with zero signal to the user.
+
+**Severity: HIGH.** This is not a filesystem-permission or malicious-input
+scenario like the orphan-file findings — it needs nothing more than two
+ordinary clients syncing against the same shared remote close enough in
+time to overlap the fetch-to-push window inside a single `sync()` call
+(read-tree/hash-object/commit-tree/push are each separate subprocess
+calls, so that window is tens of milliseconds, not zero). Two agents on a
+team both running `cadence sync --remote <shared repo>` a moment apart is
+an entirely ordinary use of the sync feature this project's own docs
+recommend (`docs/dogfooding-log.md` 2026-08-31 `verify_part2` example),
+and directly touches the ten-step script's "sync across two clients" step.
+Worth ranking above the chmod-000-file findings on the current queue: this
+one needs no adversarial precondition at all, only ordinary concurrent
+use, and it silently and permanently drops a task from the shared view —
+the exact failure "sync" exists to prevent.
+
+**Root cause, precisely:** `Store._sync_diff_and_apply` treats a failed
+`push_safe_merge` as informational only (`pushed_ok=False` feeds into the
+returned `pushed` count) instead of a reason to also skip
+`hist.set_sync_base(hist.head())` and/or the `advance_local` fold. The
+sqlite/local-commit atomicity 0.2.27 added protects against a *write*
+failing outright; it does not protect against a push that fails cleanly
+(non-fast-forward) while everything else in the same call still succeeds
+and gets treated as final.
+
+**Fix I'd want, not implementing myself:** when `overlay` is non-empty and
+`push_safe_merge` returns `False`, don't advance this client's own sync
+base past the un-pushed content — either retry the push against a re-fetched
+head within the same call, or leave the un-pushed task's origin excluded
+from the new sync base so the next ordinary sync tries again, and surface
+it to the caller (a `warnings` entry, same channel already used for the
+unreadable-orphan-file case) instead of folding it into a silent `pushed:
+0` that reads identically to "nothing needed pushing."
+
+Filed for Rafael — not fixed by me. Script and full run log kept at
+`/workspace/redteam_0231_pushrace/race.py` for re-run against any future
+fix.
