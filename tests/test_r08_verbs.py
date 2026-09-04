@@ -1513,3 +1513,48 @@ def test_undo_git_write_failure_leaves_sqlite_task_intact(tmp_path):
         )
     finally:
         os.chmod(orphan, 0o644)
+
+
+@pytest.mark.parametrize("target", ["index", "objects"])
+def test_undo_precondition_read_failure_raises_distinct_error(tmp_path, target):
+    """Dov's 2026-09-04 finding (docs/dogfooding-log.md same date):
+    `undo`'s precondition check (`hist.log`/`hist.changed_task_files`)
+    used to swallow ANY git failure into a plain `[]`, so a git-read
+    failure (e.g. `.git/index` or `.git/objects` made unreadable by a
+    permission glitch or a sync tool's lock) was reported as the exact
+    same "no mutation to undo yet" as a genuinely empty history -- a
+    false claim, since the mutation is real and untouched. This must now
+    raise `HistoryUnreadable`, never `NothingToUndo`, and must never
+    touch sqlite (no rollback needed -- nothing was attempted)."""
+    from cadence.store import HistoryUnreadable
+
+    store = Store(db_path=tmp_path / f"ru_{target}.db")
+    store.add("real mutation")  # id 1 -- genuinely undoable once readable
+    store.complete(1)
+
+    git_path = store._history().repo_dir / ".git" / target
+    os.chmod(git_path, 0o000)
+    try:
+        before = store.list(status="all")
+        assert before[0].status == "done"
+
+        with pytest.raises(HistoryUnreadable) as exc_info:
+            store.undo()
+        assert "could not" in exc_info.value.message.lower()
+        # The precise false claim this replaces -- must never say this:
+        assert "no mutation to undo yet" not in exc_info.value.message
+
+        after = store.list(status="all")
+        assert after[0].status == "done", (
+            "precondition-read failure must never touch sqlite"
+        )
+    finally:
+        os.chmod(git_path, 0o755 if target == "objects" else 0o644)
+
+    # Permissions restored: the real mutation is still there, and undo
+    # now succeeds for real instead of the earlier false "nothing to
+    # undo" -- proof the finding's own repro (chmod, undo, un-chmod,
+    # undo again) is fixed end to end, not just that an error changed
+    # shape.
+    summary = store.undo()
+    assert "reopened" in summary.lower()

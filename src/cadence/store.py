@@ -170,6 +170,25 @@ class UndoFailed(CadenceError):
     code = "undo_failed"
 
 
+class HistoryUnreadable(CadenceError):
+    """`undo`'s precondition check (`hist.log`/`hist.changed_task_files`,
+    both in `Store.undo` below) could not read the git history state at
+    all -- distinct from `NothingToUndo`, which means the read succeeded
+    and genuinely found fewer than one real mutation. Dov's 2026-09-04
+    finding (docs/dogfooding-log.md, same date): both git calls used to
+    swallow ANY failure -- a real one included, e.g. `.git/index` made
+    unreadable by a permission glitch or a sync tool's transient lock --
+    into a plain `[]`, which `undo` then read as "nothing to undo,"
+    actively telling the caller the opposite of the truth. This raises
+    *before* `undo`'s own try/except begins (that block only wraps the
+    sqlite mutation that follows a successful precondition read), so no
+    sqlite write has been attempted yet here -- there is nothing to roll
+    back, a stronger guarantee than `UndoFailed`'s "rolled back", not a
+    weaker one."""
+
+    code = "history_unreadable"
+
+
 def default_db_path() -> Path:
     """Resolve the store location, honoring CADENCE_DB_PATH for tests/agents
     that want an isolated scratch store instead of the user's real data."""
@@ -886,6 +905,24 @@ class Store:
             )
         return f'#{task_id} reverted: {before["title"]}'
 
+    @staticmethod
+    def _history_unreadable_hint(hist: GitHistory) -> str:
+        """Shared wording for `HistoryUnreadable` (both `undo` precondition
+        reads raise it the same way): says plainly that this is a read
+        failure, not an empty history, names the actual directory to
+        check, and does not borrow either safety-class marker from
+        docs/human-surface.md §4.4 -- "Rolled back automatically" would
+        overclaim a rollback that never started, and the Class B "not
+        guaranteed to have rolled back" wording would underclaim, since no
+        sqlite write was ever attempted here."""
+        return (
+            f"No sqlite change was attempted, so there is nothing to roll back -- "
+            f"Cadence could not read its own history directory to check for a "
+            f"mutation to undo. Check permissions on {hist.repo_dir}/.git "
+            f"(a sync tool or another process may be holding it), then retry "
+            f"'cadence undo'."
+        )
+
     def undo(self) -> str:
         """Revert the single most recent mutation (any surface), regardless
         of which command made it. Reverting is itself a new commit, so
@@ -904,14 +941,26 @@ class Store:
         can never disagree about what undo did."""
         hist = self._history()
         hist.ensure()
-        commits = hist.log(limit=2)
+        try:
+            commits = hist.log(limit=2)
+        except HistoryError as exc:
+            raise HistoryUnreadable(
+                f"could not read undo history ({exc})",
+                hint=self._history_unreadable_hint(hist),
+            ) from exc
         if len(commits) < 2:
             raise NothingToUndo(
                 "no mutation to undo yet",
                 hint="Run a command first (add/done/schedule/...).",
             )
         last, prev = commits[0], commits[1]
-        changed = hist.changed_task_files(last)
+        try:
+            changed = hist.changed_task_files(last)
+        except HistoryError as exc:
+            raise HistoryUnreadable(
+                f"could not read undo history ({exc})",
+                hint=self._history_unreadable_hint(hist),
+            ) from exc
         if not changed:
             raise NothingToUndo(
                 "no mutation to undo yet",

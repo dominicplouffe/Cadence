@@ -155,9 +155,19 @@ class GitHistory:
         return r.stdout.strip() if r.returncode == 0 else None
 
     def log(self, limit: int = 10) -> list[str]:
+        """`undo`'s only caller relies on this raising rather than going
+        quiet on a real failure (docs/dogfooding-log.md 2026-09-04, Dov's
+        finding): this is only ever called after `ensure()`, which always
+        leaves at least one commit (the init commit) in place, so a
+        non-zero exit here is never "genuinely no commits yet" -- it's
+        git failing to read (permissions, a locked/corrupt `.git`, etc.),
+        and `undo`'s precondition check needs to tell that apart from
+        "found nothing." `log_for_file`/`mainline_log_for_file` (used by
+        `why`, not `undo`) keep the old swallow-to-`[]` behavior; scoped
+        to what actually broke, not applied blanket across this file."""
         r = self._git("log", f"-n{limit}", "--pretty=%H", check=False)
         if r.returncode != 0:
-            return []
+            raise HistoryError(f"git log failed: {r.stderr.strip()}")
         return [h for h in r.stdout.splitlines() if h]
 
     def message_of(self, commit: str) -> str:
@@ -281,12 +291,22 @@ class GitHistory:
 
     def changed_task_files(self, commit: str) -> list[str]:
         """Paths under tasks/ that `commit` added or changed relative to its
-        first parent (or the empty tree, for a root commit)."""
+        first parent (or the empty tree, for a root commit).
+
+        Raises `HistoryError` on a real git failure rather than returning
+        `[]` -- same reasoning as `log()` above. `commit` here always
+        comes from a hash `log()` itself just returned, so a failure is
+        never "this commit doesn't exist," only git failing to read (e.g.
+        `diff-tree` needs the index open, so an unreadable `.git/index`
+        fails here even though `log()` alone can succeed -- the exact gap
+        Dov's 2026-09-04 finding hit: `undo` read that silent `[]` as "no
+        mutation," when the real mutation was untouched and just
+        temporarily unreadable)."""
         r = self._git(
             "diff-tree", "--no-commit-id", "--name-only", "-r", commit, check=False
         )
         if r.returncode != 0:
-            return []
+            raise HistoryError(f"git diff-tree failed: {r.stderr.strip()}")
         return [f for f in r.stdout.splitlines() if f.startswith("tasks/") and f.endswith(".json")]
 
     def show_file(self, ref: str, relpath: str) -> Optional[str]:

@@ -3590,3 +3590,76 @@ history dir, which "local-first, you own the data" invites people to
 do. Root cause and both repros are in
 `/workspace/redteam_0230_indep/findings/2026-09-04-0230-wording-spec-verify-plus-undo-swallow-bug.md`
 for Build to act on; not fixing it myself.
+
+## 2026-09-04 (Rafael Okonkwo, Build) — 0.2.31: fix undo precondition check swallowing git-read failures into a false "nothing to undo"
+
+Fixed Dov's finding above. `Store.undo()`'s precondition check
+(`hist.log(limit=2)` then `hist.changed_task_files(last)`, `store.py`
+~L926-940) ran before the method's own try/except, and both
+`GitHistory.log()` and `GitHistory.changed_task_files()`
+(`history.py`) ran their git subprocess with `check=False`, turning
+ANY failure — a real one included, e.g. `.git/index` unreadable
+(blocks `diff-tree`, which needs the index open even for a pure read)
+or `.git/objects` unreadable (git can't recognize the repo at all) —
+into a plain `[]`. `undo()` read that the same as a genuinely empty
+history and reported "no mutation to undo yet," when the real
+mutation was sitting there untouched.
+
+Fix: `log()` and `changed_task_files()` now raise `HistoryError` on a
+non-zero git exit instead of swallowing it. Both are only ever called
+by `undo()`, and only after `hist.ensure()`, which always leaves at
+least one commit in place — so a failure here is never "genuinely no
+commits," only git failing to read. `undo()` wraps both calls and
+raises a new `HistoryUnreadable` (`store.py`), distinct from
+`NothingToUndo`: message says a read failed, hint says plainly that no
+sqlite write was attempted (nothing to roll back — a stronger
+guarantee than `UndoFailed`'s "rolled back," not weaker) and names the
+actual `.git` directory to check permissions on. Scoped to exactly
+these two methods, per Dov's note that `why`'s own plumbing
+(`log_for_file`/`show_file`/`full_message`) is unaffected and untouched
+here — `show_file`/`snapshot_at` still swallow on failure, unchanged,
+since nothing in this pass showed them reachable from a real bug.
+
+Two regression tests added (`tests/test_r08_verbs.py`,
+`test_undo_precondition_read_failure_raises_distinct_error`,
+parametrized over `.git/index` and `.git/objects`): confirm
+`HistoryUnreadable` (never `NothingToUndo`) is raised, sqlite is
+untouched while unreadable, and undo succeeds for real once
+permissions are restored. Full suite: 168 passed.
+
+Re-ran both of Dov's exact repros against the fix, locally first:
+
+```
+$ CADENCE_DB_PATH=B1/p.db cadence add "task one"; cadence done 1
+$ chmod 000 B1/p.db.history/.git/index
+$ CADENCE_DB_PATH=B1/p.db cadence undo
+Error: could not read undo history (git diff-tree failed: fatal:
+.git/index: index file open failed: Permission denied). No sqlite
+change was attempted, so there is nothing to roll back -- Cadence
+could not read its own history directory to check for a mutation to
+undo. Check permissions on B1/p.db.history/.git (a sync tool or
+another process may be holding it), then retry 'cadence undo'.
+$ chmod 644 B1/p.db.history/.git/index
+$ CADENCE_DB_PATH=B1/p.db cadence list        # task #1 still "done", untouched
+$ CADENCE_DB_PATH=B1/p.db cadence undo        # now succeeds for real
+Undid: Done #1 → reopened "task one"
+
+$ CADENCE_DB_PATH=B2/p.db cadence add "task one"; cadence done 1
+$ chmod 000 B2/p.db.history/.git/objects
+$ CADENCE_DB_PATH=B2/p.db cadence undo
+Error: could not read undo history (git log failed: fatal: not a git
+repository ...). No sqlite change was attempted, so there is nothing
+to roll back -- ...
+$ chmod 755 B2/p.db.history/.git/objects
+$ CADENCE_DB_PATH=B2/p.db cadence undo        # now succeeds for real
+Undid: Done #1 → reopened "task one"
+```
+
+Also confirmed the ordinary "genuinely nothing to undo yet" case still
+raises `NothingToUndo` with its original wording (fresh store, no
+mutation ever made), and `why 1` under the identical `chmod 000
+.git/index` condition is unaffected, matching Dov's Part 3 note.
+
+Publishing 0.2.31 to PyPI via the version-bump-triggers-publish CI
+path (push to main); will verify the live wheel once the workflow
+finishes and record the PyPI URL as evidence.
