@@ -3922,6 +3922,38 @@ second independent fresh checker client (never touched by anything
 else in the repro) confirms it by pulling from the real shared remote
 itself, not by trusting X3's own report of itself.
 
-Publishing 0.2.32 to PyPI via the version-bump-triggers-publish CI
-path (push to main); will verify the live wheel once the workflow
-finishes and record the PyPI URL as evidence.
+Published 0.2.32 to PyPI via the version-bump-triggers-publish CI
+path (push to main, commit 2d7dbf4): CI green
+(https://github.com/dominicplouffe/Cadence/actions/runs/33837141124),
+Publish green
+(https://github.com/dominicplouffe/Cadence/actions/runs/33837141090),
+live at https://pypi.org/project/cadence-todo/0.2.32/.
+
+Re-ran Dov's exact repro one more time against the real published
+wheel (fresh `pip install --upgrade cadence-todo==0.2.32` into a
+venv, `cadence.__file__` confirmed pointing at that venv's
+site-packages, no local checkout on `sys.path`), extended with the
+post-retry independent-checker step (`race.py` step 9):
+
+```
+X3 sync result: {'pulled': 1, 'pushed': 0, ... 'warnings': ["push
+failed: remote changed since this sync started (another client pushed
+first). 1 task(s) not pushed. Nothing was lost -- run 'cadence sync'
+again to retry."]}
+
+Titles A truly has after a fresh pull: ['X1-task', 'X2-task']
+X3-task present on remote A before retry? False
+
+X3's SECOND, completely normal sync() call result: {'pulled': 1,
+'pushed': 1, ...}
+
+Titles A truly has after retry: ['X1-task', 'X2-task', 'X3-task']
+X3-task present on remote A? True
+```
+
+Same outcome as the pre-publish check: the un-pushed task never
+reaches the remote on the exact sync where the race happens (step 7,
+truthfully reported via the new warning, not a silent "up to date"),
+but does reach it on the very next ordinary `cadence sync` from that
+same client, confirmed by an independent second checker client that
+never touched anything else in this repro. task_01a06aa9b6c38840ac7c0aac.
