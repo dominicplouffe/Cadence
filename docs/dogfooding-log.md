@@ -2995,3 +2995,63 @@ the non-object-JSON store survived two `add`s in a row (`Added #3`,
 Not independently re-verified by Red Team yet — flagging for a pass
 per Dov's own note ("worth an independent re-pass on
 `_absorb_orphan_task_files` specifically once fixed").
+
+## 2026-09-04 (Dov Ferreira, Red Team) — independent pass on 0.2.25: 3 orphan-absorb shapes confirmed fixed; new unreadable-file finding
+
+Fresh venv, `pip install cadence-todo==0.2.25` from real PyPI, no local repo
+on path. Fix commit 6a1cd8a.
+
+**Part A — the 3 reported shapes, re-verified fixed.** Re-ran each exact
+repro: truncated/unparseable JSON orphan, valid-JSON-no-`origin` orphan, and
+valid-JSON-non-object orphan. All three now correctly reserve their on-disk
+id — next `add`/`decompose` skips past it instead of overwriting or
+crashing, files on disk left untouched. Pushed further than the original
+repro: 4 simultaneous bad-shape orphans (ids 2/3/4/5) in one store all
+reserved correctly in one pass, next two adds land on 6 and 7 in order; a
+0-byte orphan file reserved correctly; the happy-path real passive-relay
+absorb (genuine `origin`-tagged file) still works, unbroken by the
+id-reservation change. Clean pass, no regressions.
+
+**Part B — new finding, not one of the 3 reported shapes.** A 4th orphan
+shape — a file that *exists but can't be read* (`chmod 000`, e.g. a
+restrictive shared volume or ACL mismatch, not an ordinary crash) — is
+handled two different, inconsistent ways depending on incidental prior
+operation history, and one of those ways is silently destructive:
+
+- Sync alone, nothing else pending: fails honestly (`Error: sync hit an
+  internal inconsistency reading history data (PermissionError...).
+  Nothing was changed.`), file survives on disk. Good.
+- Sync after one or more local `add`/`decompose` calls already warned about
+  the same file (`Warning: ... its history entry failed to record (git
+  add -A failed: ... Permission denied ...)`): the next `sync` call
+  succeeds cleanly (`Synced with origin: pulled 1, pushed 3. Up to date.`)
+  and the unreadable file is silently gone afterward — `ls` on it returns
+  "No such file or directory," nothing in the CLI output or the git commit
+  log ever mentions a file was removed, and "Nothing was lost or
+  overwritten" (printed on an unrelated independently-created-task note the
+  same call) is not true of what just happened to tasks/2.json.
+
+Confirmed on both `add` and `decompose` (identical warning shape). Reading,
+not fixing: the id-reservation fix (glob for existing ids, don't require
+reading them) correctly stops `add`/`decompose` from overwriting this file
+— that holds. It doesn't stop `sync`'s self-heal rewrite step from later
+unlinking the same file once self-heal has other pending writes to do
+anyway (unlink only needs write permission on the parent directory, not
+read permission on the file).
+
+Severity: lower than the 3 original shapes — this needs a file to become
+unreadable, not just malformed, which is hostile-but-plausible rather than
+"any process that dies mid-write." Real consequence: a file an operator
+could have recovered by fixing its permissions is instead gone with zero
+trace, the moment any sync happens to have other work pending. Fix I'd
+want, ranked: (1) make self-heal treat an unreadable file the same safe way
+plain sync-with-nothing-else-pending does — skip and leave in place, or
+abort honestly, never silently unlink; (2) if discarding an unreadable file
+is ever intentional, say so in the sync output instead of under a message
+that says the opposite.
+
+Full transcripts and root-cause notes:
+/workspace/redteam_0225_indep/findings/2026-09-04-0225-orphan-absorb-3-shapes-verified-plus-unreadable-file.md
+(workspace-local, not committed — repro commands are all in this entry).
+Not fixed by me. Worst-first if only one gets picked up: this Part B
+finding, since it's the only open item — Part A is closed.
