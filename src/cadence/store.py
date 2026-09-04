@@ -533,7 +533,17 @@ class Store:
         # absorbed row's id is inserted into sqlite explicitly, which
         # advances sqlite's own AUTOINCREMENT high-water mark past it,
         # so the plain INSERT just below can never pick that id again.
-        self._absorb_orphan_task_files(hist, set())
+        #
+        # docs/dogfooding-log.md 2026-09-04: absorbing is safe, but it used
+        # to be silent -- a caller had no way to tell "I made 1 task" from
+        # "I made 1 task and this call also recovered a stray one" without
+        # diffing `list` before/after. `recovered` carries that distinctly;
+        # it's attached to the returned Task (not a dataclass field --
+        # never written to disk or into `to_dict()`/`to_full_dict()`,
+        # since it describes this CALL, not the task itself) so CLI/MCP
+        # can report it without changing `add`'s return type for every
+        # existing caller.
+        recovered = self._absorb_orphan_task_files(hist, set())
         with closing(self._connect()) as conn:
             cur = conn.execute(
                 "INSERT INTO tasks (title, status, priority, due, created_at, origin) "
@@ -542,6 +552,7 @@ class Store:
             )
             conn.commit()
             task = self.get(cur.lastrowid, _conn=conn)
+        task.recovered = recovered
         self._snapshot_and_commit([task], f"Added #{task.id}: {task.title}")
         return task
 
@@ -722,7 +733,12 @@ class Store:
         # absorb any orphan task file into real sqlite rows first, before
         # opening the connection that allocates the new ids, so it can
         # never collide with (and silently overwrite) one.
-        self._absorb_orphan_task_files(self._history(), set())
+        #
+        # Same legibility fix as `add()` too (docs/dogfooding-log.md
+        # 2026-09-04): `recovered` is attached to the returned `parent`
+        # below so CLI/MCP can report it distinctly from the subtasks the
+        # caller actually asked for.
+        recovered = self._absorb_orphan_task_files(self._history(), set())
         with closing(self._connect()) as conn:
             parent = self.get(parent_id, _conn=conn)  # raises TaskNotFound
             depth = self._depth(conn, parent_id)
@@ -757,6 +773,7 @@ class Store:
                 children.append(self.get(cur.lastrowid, _conn=conn))
             conn.commit()
             parent = self.get(parent_id, _conn=conn)
+        parent.recovered = recovered
         ids = ", ".join(f"#{c.id}" for c in children)
         self._snapshot_and_commit(
             [parent, *children],
@@ -1224,13 +1241,22 @@ class Store:
         closes all three shapes with one change: it can only reserve
         MORE ids than the old code did, never fewer, so it changes
         nothing about which files get genuinely absorbed as rows.
+
+        Returns the list of `Task`s actually absorbed this call (empty if
+        none) -- docs/dogfooding-log.md 2026-09-04 legibility finding:
+        `add`/`decompose` used to swallow this silently, so a caller
+        (human or agent) had no way to tell "I made 1 task" from "I made
+        1 task and this call also recovered a stray one" short of diffing
+        `list` before and after. Every caller of this method now surfaces
+        that list distinctly instead of folding it into its own result.
         """
         if not hist.tasks_dir.exists():
-            return
+            return []
         self._reserve_orphan_ids(hist)
         known = self.list(status="all")
         known_ids = {t.id for t in known}
         known_origins = {t.origin for t in known if t.origin}
+        recovered: list[Task] = []
         for p in sorted(hist.tasks_dir.glob("*.json")):
             try:
                 file_id = int(p.stem)
@@ -1256,8 +1282,10 @@ class Store:
             with closing(self._connect()) as conn:
                 self._apply_remote_task(conn, row)
                 conn.commit()
+                recovered.append(self.get(file_id, _conn=conn))
             known_ids.add(file_id)
             known_origins.add(origin)
+        return recovered
 
     def _reserve_orphan_ids(self, hist: GitHistory) -> None:
         """Bump sqlite's own AUTOINCREMENT high-water mark (the

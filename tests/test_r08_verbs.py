@@ -1209,6 +1209,70 @@ def test_decompose_on_passive_relay_does_not_overwrite_orphan_task_file(tmp_path
     assert len(x_titles) == 4  # A's task + X's parent + 2 subtasks
 
 
+def test_add_reports_recovered_orphan_distinctly_from_requested_task(tmp_path):
+    """docs/dogfooding-log.md 2026-09-04 legibility finding: absorbing an
+    orphan (tested above) is safe, but silent -- a caller could not tell
+    "I made 1 task" from "I made 1 task and this call also recovered a
+    stray one" without diffing `list` before/after. The `Task` `add`
+    returns must carry that distinctly, never folded into the requested
+    task itself."""
+    store_a = Store(db_path=tmp_path / "recovered_add_a.db")
+    store_x = Store(db_path=tmp_path / "recovered_add_x.db")
+
+    store_a.add("A's task")
+    store_a.sync(remote=str(store_x.db_path))
+    assert store_x.list(status="all") == []  # still an orphan file, not a row
+
+    task_x = store_x.add("new native on X")
+
+    # The requested task is unaffected: it's still exactly what was asked
+    # for, at its own id.
+    assert task_x.title == "new native on X"
+    # The recovered orphan is reported separately, by id and title -- not
+    # merged into task_x, not silently dropped.
+    assert [r.title for r in task_x.recovered] == ["A's task"]
+    assert task_x.recovered[0].id != task_x.id
+
+    # A second add on the same store, with nothing left to recover, reports
+    # an empty list -- this is a signal about THIS call, not a sticky flag.
+    task_x2 = store_x.add("another native on X")
+    assert task_x2.recovered == []
+
+
+def test_decompose_reports_recovered_orphan_distinctly_from_requested_subtasks(tmp_path):
+    """Same legibility fix, the other allocation site -- see `add`'s
+    version above for the full rationale."""
+    store_b = Store(db_path=tmp_path / "recovered_decomp_b.db")
+    store_x = Store(db_path=tmp_path / "recovered_decomp_x.db")
+
+    # X gets a parent to decompose from a genuine local add first (its own
+    # first-ever local write, so nothing to recover yet -- matches `add`'s
+    # own test above).
+    parent = store_x.add("X's parent task")
+    assert parent.recovered == []
+
+    # A second, distinct orphan (a THIRD party to the a<->x pair, so
+    # `decompose`'s own absorb call -- not the ordinary sync pull path --
+    # is what has to pick it up) lands in X's tree as a passive relay,
+    # exactly like the `add` case above but happening between the parent
+    # add and the decompose call.
+    store_b.add("B's task")
+    store_b.sync(remote=str(store_x.db_path))
+    assert store_x.list(status="all") == [parent], "still an orphan file, not a row"
+
+    parent2, children = store_x.decompose(parent.id, ["sub one", "sub two"])
+
+    # The requested subtasks are unaffected: exactly the two titles asked
+    # for, linked to the right parent.
+    assert [c.title for c in children] == ["sub one", "sub two"]
+    assert all(c.parent_id == parent.id for c in children)
+    # The recovered orphan rides on the returned parent, distinct from the
+    # subtasks list.
+    assert [r.title for r in parent2.recovered] == ["B's task"]
+    assert parent2.recovered[0].id not in {c.id for c in children}
+    assert parent2.recovered[0].id != parent2.id
+
+
 # --- Dov's independent 0.2.24 pass: three orphan shapes the absorb loop --
 # --- couldn't parse/understand still lost or wedged data -----------------
 

@@ -124,6 +124,16 @@ Done #4: Buy milk
 Scheduled #4 for 2026-09-01: Buy milk
 ```
 
+`add` and `decompose` can, as a side effect, absorb a stray task file this
+store was silently carrying on disk for another client (sync's passive-
+relay case — see docs/dogfooding-log.md 2026-09-04). When that happens the
+recovered task gets its own line, first, never folded into or confused
+with the confirmation for the task actually asked for:
+```
+Recovered #2 (was orphaned on disk): task from X
+Added #3: new native on A
+```
+
 ### 4.4 Field error (malformed input)
 
 Exactly two sentences, always: **(1)** what was wrong, quoting the user's

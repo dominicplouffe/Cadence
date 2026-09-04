@@ -3403,3 +3403,66 @@ exact strings to the leadership channel for Rafael/Mira to pick up as a
 follow-on task; `docs/human-surface.md` §4.4 is marked "NOT YET SHIPPED"
 until that lands, so the doc doesn't silently drift ahead of the CLI
 the way earlier specs occasionally have.
+
+## 2026-09-04 (Rafael Okonkwo, Build) — 0.2.28: CLI/MCP feedback when add/decompose silently recover an orphan
+
+Noor flagged (2026-09-03) a legibility gap left over from the whole
+orphan-absorb series (0.2.24-0.2.27): `_absorb_orphan_task_files` has
+been safe since 0.2.27 — it never overwrites or drops an orphan task
+file it finds sitting on disk from another client's passive sync relay
+— but it was silent. `cadence add "x"` printed only `Added #N: x` even
+on a call that also pulled a stray task into sqlite; an agent (or
+person) had no way to tell the two apart without diffing `cadence list`
+before/after.
+
+Fix: `_absorb_orphan_task_files` now returns the list of `Task`s it
+actually absorbed that call (empty list normally). `add()`/`decompose()`
+attach it to the `Task` they return as `.recovered` — not a dataclass
+field, so it never rides into `to_dict()`/`to_full_dict()` or the
+on-disk task file; it describes the call, not the task. Every existing
+caller of `store.add()`/`store.decompose()` (five surfaces, ~70 test
+call sites) is unaffected, since neither method's return *type*
+changed.
+
+CLI (`cmd_add`/`cmd_decompose` in cli.py): a new `Recovered #M (was
+orphaned on disk): title` line prints before the normal
+`Added #N: ...` / `Decomposed #N into ...` line whenever `.recovered`
+is non-empty — including on the `HistoryDegraded` (degraded-history)
+path, which carries the same task object. MCP (`add_task`/
+`decompose_task` in mcp_server.py): a new `"recovered": [task, ...]`
+key on the result dict, always present (empty list when nothing was
+recovered), documented in both tools' docstrings. `docs/human-surface.md`
+§4.3 shows the new line.
+
+Two regression tests added to `tests/test_r08_verbs.py`:
+`test_add_reports_recovered_orphan_distinctly_from_requested_task` and
+`test_decompose_reports_recovered_orphan_distinctly_from_requested_subtasks`
+— both confirm the recovered orphan is reported by id/title, distinct
+from (never merged into) the task/subtasks the caller actually asked
+for, and that a call with nothing to recover reports an empty list.
+Full suite: 166 passed.
+
+Manually re-ran the task's own repro (passive-relay absorption via
+`add`, then via `decompose`) against the local CLI and the MCP tool
+function directly:
+
+```
+$ CADENCE_DB_PATH=A/a.db cadence add "new native on A"
+Recovered #2 (was orphaned on disk): task from X
+Added #3: new native on A
+$ CADENCE_DB_PATH=A/a.db cadence add "another native on A"
+Added #4: another native on A
+
+$ CADENCE_DB_PATH=X/x.db cadence decompose 1 --into "sub one" "sub two"
+Recovered #2 (was orphaned on disk): task from A
+Decomposed #1 into 2 subtasks: #3, #4
+
+>>> add_task("new native on A")   # MCP, same fixture
+{'ok': True, 'task': {'id': 3, 'title': 'new native on A', ...},
+ 'recovered': [{'id': 2, 'title': 'task from X', ...}]}
+```
+
+Published to PyPI (https://pypi.org/project/cadence-todo/0.2.28/) via
+the version-bump CI path, verified against the freshly `pip install`-ed
+0.2.28 wheel in a clean venv outside the repo (same repro, same output
+shown above, run against the installed `cadence` binary).

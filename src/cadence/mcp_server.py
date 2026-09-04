@@ -244,6 +244,18 @@ def _err(exc: CadenceError) -> dict:
     return {"ok": False, "error": exc.code, "message": exc.message, "hint": exc.hint}
 
 
+def _recovered_list(task) -> list:
+    """docs/dogfooding-log.md 2026-09-04: `add_task`/`decompose_task` can
+    silently absorb an on-disk orphan task file into sqlite (safe since
+    0.2.27, but reported nowhere -- the same legibility gap cli.py's
+    `_print_recovered` fixes on the human surface). `task.recovered`
+    (set by Store.add/Store.decompose, never persisted -- it describes
+    this call, not the task) lists what got absorbed, distinct from the
+    task/subtasks the caller actually asked for. `[]` for every other
+    verb, which never sets it."""
+    return [t.to_dict() for t in (getattr(task, "recovered", None) or [])]
+
+
 def _degraded(task, verb: str, reason: str) -> dict:
     """0.2.12 Red Team finding #1: `task` was already durably written --
     this is SUCCESS with a degraded audit trail, never `ok: false`. An
@@ -254,6 +266,7 @@ def _degraded(task, verb: str, reason: str) -> dict:
     return {
         "ok": True,
         "task": task.to_dict(),
+        "recovered": _recovered_list(task),
         "history_recorded": False,
         "warning": history_degraded_warning(task.id, verb, reason),
     }
@@ -286,9 +299,14 @@ def add_task(
 
     Returns:
         {"ok": true, "task": {id, title, status, priority, due,
-        created_at, completed_at}} on success, or {"ok": false, "error",
-        "message", "hint"} if title is empty, over 200 characters, or
-        priority is invalid.
+        created_at, completed_at}, "recovered": [task, ...]} on success,
+        or {"ok": false, "error", "message", "hint"} if title is empty,
+        over 200 characters, or priority is invalid. `recovered` is
+        normally empty; if this call happened to find a stray task file
+        already on disk (this store having been used as a passive sync
+        relay for another client), it was absorbed into your task list
+        as a side effect and is listed here -- it is NOT the task you
+        just asked for, that's still `task` above.
     """
     try:
         if len(title or "") > MAX_TITLE_LEN:
@@ -300,7 +318,7 @@ def add_task(
                 hint="Try a shorter one.",
             )
         task = Store().add(title, due=due, priority=priority)
-        return {"ok": True, "task": task.to_dict()}
+        return {"ok": True, "task": task.to_dict(), "recovered": _recovered_list(task)}
     except HistoryDegraded as exc:
         return _degraded(exc.tasks[0], "created", exc.reason)
     except CadenceError as exc:
@@ -484,10 +502,15 @@ def decompose_task(id: int, into: list[str], reason: Optional[str] = None) -> di
             or any subtask) and see it. Omit if you don't have one.
 
     Returns:
-        {"ok": true, "parent": {...}, "subtasks": [task, ...]} on success,
-        or {"ok": false, "error", "message", "hint"} if `into` is empty, the
-        parent is already at max depth, or the count would exceed the
-        20-per-parent cap.
+        {"ok": true, "parent": {...}, "subtasks": [task, ...], "recovered":
+        [task, ...]} on success, or {"ok": false, "error", "message",
+        "hint"} if `into` is empty, the parent is already at max depth, or
+        the count would exceed the 20-per-parent cap. `recovered` is
+        normally empty; if this call happened to find a stray task file
+        already on disk (this store having been used as a passive sync
+        relay for another client), it was absorbed into your task list as
+        a side effect and is listed here -- it is NOT one of `subtasks`,
+        those are still exactly the titles you passed in `into`.
     """
     try:
         parent, children = Store().decompose(id, into, reason=reason, source="mcp")
@@ -495,6 +518,7 @@ def decompose_task(id: int, into: list[str], reason: Optional[str] = None) -> di
             "ok": True,
             "parent": parent.to_dict(),
             "subtasks": [c.to_dict() for c in children],
+            "recovered": _recovered_list(parent),
         }
     except HistoryDegraded as exc:
         parent, children = exc.tasks[0], exc.tasks[1:]
@@ -502,6 +526,7 @@ def decompose_task(id: int, into: list[str], reason: Optional[str] = None) -> di
             "ok": True,
             "parent": parent.to_dict(),
             "subtasks": [c.to_dict() for c in children],
+            "recovered": _recovered_list(parent),
             "history_recorded": False,
             "warning": history_degraded_warning(parent.id, "decomposed", exc.reason),
         }

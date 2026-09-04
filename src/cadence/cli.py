@@ -230,6 +230,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         # failure it used to look like (which invited a caller to retry
         # into a silent duplicate).
         task = exc.tasks[0]
+        _print_recovered(task)
         print(f"Added #{task.id}: {task.title}")
         print(f"Warning: {history_degraded_warning(task.id, 'created', exc.reason)}")
         return 0
@@ -239,8 +240,22 @@ def cmd_add(args: argparse.Namespace) -> int:
         # past the fast-path pre-checks above, e.g. an empty --priority "")
         # is a user-input error and must exit 1, matching cmd_done/cmd_schedule.
         _err(_format_err(exc), code=2 if isinstance(exc, StoreUnavailable) else 1)
+    _print_recovered(task)
     print(f"Added #{task.id}: {task.title}")
     return 0
+
+
+def _print_recovered(task) -> None:
+    """docs/dogfooding-log.md 2026-09-04: `add`/`decompose` can silently
+    absorb an on-disk orphan task file into sqlite (store.py's
+    `_absorb_orphan_task_files` -- safe since 0.2.27, but reported
+    nowhere). `task.recovered` (set by `Store.add`/`Store.decompose`,
+    never persisted -- see store.py's Task docstring note) is that list;
+    printed here BEFORE the "Added"/"Decomposed" line for the task the
+    caller actually asked for, so the two are never folded together or
+    mistaken for one another."""
+    for r in getattr(task, "recovered", None) or []:
+        print(f"Recovered #{r.id} (was orphaned on disk): {r.title}")
 
 
 def _render_tree(tasks, by_parent, width, level=0):
@@ -442,12 +457,14 @@ def cmd_decompose(args: argparse.Namespace) -> int:
         parent, children = store.decompose(task_id, args.into or [], reason=args.reason, source="cli")
     except HistoryDegraded as exc:
         parent, children = exc.tasks[0], exc.tasks[1:]
+        _print_recovered(parent)
         ids = ", ".join(f"#{c.id}" for c in children)
         print(f"Decomposed #{parent.id} into {len(children)} subtasks: {ids}")
         print(f"Warning: {history_degraded_warning(parent.id, 'decomposed', exc.reason)}")
         return 0
     except CadenceError as exc:
         _err(_format_err(exc))
+    _print_recovered(parent)
     ids = ", ".join(f"#{c.id}" for c in children)
     print(f"Decomposed #{parent.id} into {len(children)} subtasks: {ids}")
     return 0
