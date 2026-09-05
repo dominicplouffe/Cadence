@@ -677,10 +677,12 @@ def sync_tasks(
             history directory (a manual rebase, filter-repo, or a forced
             reset) since the last sync, and Cadence can no longer trust
             its recorded sync-base. Setting this to true drops that
-            marker and syncs fresh -- safe: any row this store and the
-            remote both know that isn't already identical becomes a
-            `conflicts` entry for you to settle, it can never silently
-            drop or overwrite an edit.
+            marker, but still compares against its last known content
+            where that's still readable -- safe either way: a row only
+            the remote changed since then still applies cleanly, a row
+            this store also changed since then becomes a `conflicts`
+            entry for you to settle, and it can never silently drop or
+            overwrite an edit.
 
     Returns (all_projects=false): {"ok": true, "pulled": N, "pushed": N,
         "already_synced": bool, "conflicts": [{"id", "mine", "theirs"}, ...],

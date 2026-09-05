@@ -950,10 +950,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Recovery only: use after a 'history was rewritten' error confirms "
             "this store's own hidden .history directory was rewritten outside "
             "Cadence (a manual rebase, filter-repo, or forced reset). Drops the "
-            "remembered sync-base and syncs fresh -- safe: any row this store "
-            "and the remote both know that isn't already identical becomes a "
-            "conflict for you to settle, it can never silently drop or "
-            "overwrite an edit."
+            "remembered sync-base marker, but still compares against its last "
+            "known content where that's still readable -- safe either way: a "
+            "row only the remote changed since then still applies cleanly, a "
+            "row this store also changed since then becomes a conflict for "
+            "you to settle, and it can never silently drop or overwrite an "
+            "edit."
         ),
     )
     p_sync.set_defaults(func=cmd_sync)
