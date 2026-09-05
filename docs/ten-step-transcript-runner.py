@@ -177,6 +177,10 @@ async def main():
         log("Client B creates a task of its own, before ever syncing")
         _, sb = await call(b, "step8-b-create", "add_task", {"title": "Draft offsite agenda", "priority": "low"})
         b_task_id = sb["task"]["id"]
+        b_task_title = sb["task"]["title"]
+        log(f"Client B's own first task got local id={b_task_id}, same as Client A's task 1 "
+            f"id={task1_id} -- a genuine id collision between two independently-created, "
+            f"unrelated tasks, neither client having ever synced")
 
         log("Reading the shipped, documented interface only (published 0.2.1): sync_tasks's "
             "MCP docstring now says 'remote: The OTHER client's own CADENCE_DB_PATH value (its "
@@ -198,99 +202,56 @@ async def main():
         _, listB = await call(b, "step8-verify-b", "list_tasks", {"status": "all"})
         titles_a = {t["title"] for t in listA.get("tasks", [])}
         titles_b = {t["title"] for t in listB.get("tasks", [])}
-        b_task_title = sb["task"]["title"]
         sync_ok = syncA1.get("ok") is True and syncB1.get("ok") is True
         converged = (b_task_title in titles_a) and ("Prep the Q4 client offsite" in titles_b)
-        no_conflicts = not syncA1.get("conflicts") and not syncB1.get("conflicts")
         log(f"Client A sees Client B's task ({b_task_title!r} in A's list): "
             f"{b_task_title in titles_a}; Client B sees Client A's parent task "
             f"('Prep the Q4 client offsite' in B's list): "
             f"{'Prep the Q4 client offsite' in titles_b}")
 
-        log(f"sync_tasks reported a conflict on id=1 (expected: both stores independently "
-            f"assigned id=1 to their own first task before ever syncing -- Client A's "
-            f"'Prep the Q4 client offsite' vs Client B's 'Draft offsite agenda'). The tool's "
-            f"own Returns doc names the documented recovery: 'call resolve_sync_conflict(id, "
-            f"keep=\"mine\"|\"theirs\") for each one, then call sync_tasks again.' Following "
-            f"that documented path to completion, deciding to keep Client A's version as "
-            f"authoritative on both sides:")
-        _, resA = await call(a, "step8-resolve-a", "resolve_sync_conflict", {"id": 1, "keep": "mine"})
-        _, syncA2 = await call(a, "step8-a-resync-after-resolve", "sync_tasks", {})
-        _, resB = await call(b, "step8-resolve-b", "resolve_sync_conflict", {"id": 1, "keep": "theirs"})
-        _, syncB2 = await call(b, "step8-b-resync-after-resolve", "sync_tasks", {})
-
-        log("Re-verify convergence after the documented resolve+resync recovery, and check "
-            "whether the LOSING side's task content survived under a different id or was "
-            "silently discarded")
-        _, listA2 = await call(a, "step8-verify-a-2", "list_tasks", {"status": "all"})
-        _, listB2 = await call(b, "step8-verify-b-2", "list_tasks", {"status": "all"})
-        titles_a2 = [t["title"] for t in listA2.get("tasks", [])]
-        titles_b2 = [t["title"] for t in listB2.get("tasks", [])]
-        both_id1_match = (
-            listA2["ok"] and listB2["ok"]
-            and next((t for t in listA2["tasks"] if t["id"] == 1), {}).get("title")
-            == next((t for t in listB2["tasks"] if t["id"] == 1), {}).get("title")
+        log("Current documented behaviour (as of the renumbered/conflicts split, 0.2.3x): an "
+            "id collision between two independently-created, unrelated tasks is never reported "
+            "in `conflicts` at all -- there is nothing for resolve_sync_conflict to act on. It "
+            "is auto-resolved within the same sync_tasks call: whichever task is new to the "
+            "receiving client gets a fresh, non-colliding local id there, reported by id in "
+            "`renumbered`, and BOTH tasks' content survives under distinct ids. No manual "
+            "recovery step is needed or possible here -- checking that against what the two "
+            "syncs above actually returned:")
+        no_conflicts = not syncA1.get("conflicts") and not syncB1.get("conflicts")
+        got_renumbered = bool(syncA1.get("renumbered")) or bool(syncB1.get("renumbered"))
+        a_id1_unchanged = (
+            next((t for t in listA["tasks"] if t["id"] == task1_id), {}).get("title")
             == "Prep the Q4 client offsite"
         )
-        b_task_survived = b_task_title in titles_a2 or b_task_title in titles_b2
-        log(f"After resolve+resync: A's tasks={titles_a2}")
-        log(f"After resolve+resync: B's tasks={titles_b2}")
-        log(f"id=1 now identical on both sides ('Prep the Q4 client offsite'): {both_id1_match}")
-        log(f"Client B's original task ({b_task_title!r}) survived ANYWHERE under any id, on "
-            f"either side, after resolving the collision: {b_task_survived}")
-        if not b_task_survived:
-            log("FINDING: resolve_sync_conflict(keep=\"mine\"/\"theirs\") resolves an id "
-                "COLLISION (two independently-created, unrelated tasks that happen to share an "
-                "id) the same way it resolves an id EDIT conflict (one task edited on both "
-                "sides): it keeps exactly one side's row and permanently discards the other's "
-                "row's content. For a genuine edit-conflict this is correct (there's truly one "
-                "task). For an id-collision between two DIFFERENT tasks (the documented, named "
-                "scenario per the sync_tasks docstring itself: 'independently created with the "
-                "same id') this silently deletes a real, unrelated task with no renumbering "
-                "and no warning that data (not just an edit) will be lost.")
+        b_id1_unchanged = (
+            next((t for t in listB["tasks"] if t["id"] == b_task_id), {}).get("title")
+            == b_task_title
+        )
+        log(f"syncA1['conflicts']={syncA1.get('conflicts')}, "
+            f"syncA1['renumbered']={syncA1.get('renumbered')}")
+        log(f"syncB1['conflicts']={syncB1.get('conflicts')}, "
+            f"syncB1['renumbered']={syncB1.get('renumbered')}")
+        log(f"no `conflicts` entry on either sync: {no_conflicts}; at least one `renumbered` "
+            f"entry recording the auto-resolved collision: {got_renumbered}")
+        log(f"Client A's own id (task1_id={task1_id}) still names its own task "
+            f"('Prep the Q4 client offsite'), unmoved by the sync: {a_id1_unchanged}; Client "
+            f"B's own id (b_task_id={b_task_id}) still names its own task ({b_task_title!r}), "
+            f"unmoved by the sync: {b_id1_unchanged}")
 
-        results[8] = bool(sync_ok and both_id1_match)
-        log(f"STEP 8 VERDICT (documented interface + documented recovery path): "
-            f"{'PASS' if results[8] else 'FAIL'} -- sync itself (plain CADENCE_DB_PATH as "
-            f"remote) now works and is discoverable from --help/MCP docstring alone "
-            f"(sync_ok={sync_ok}); the initial conflict on id=1 was resolved to a consistent "
-            f"state on both clients via the documented resolve_sync_conflict()+re-sync path "
-            f"(both_id1_match={both_id1_match}). NOTE (does not flip this verdict, but is a "
-            f"real data-loss risk on the same documented path): the losing side's actual task "
-            f"content was NOT preserved (b_task_survived={b_task_survived}) -- see FINDING "
-            f"above and docs/ten-step-transcript.md.")
-
-        log("### STEP 8b -- id-collision handling check (superseded 2026-09-05, see "
-            "docs/human-surface.md §4.10 and dogfooding-log.md): as of the shipped "
-            "renumbered/conflicts split, an id collision between two independently-created, "
-            "unrelated tasks is no longer reported as a `conflicts` entry at all (the old "
-            "'edited on both sides, or independently created with the same id' hedge this "
-            "step used to check for described a message that no longer exists). It is now "
-            "auto-resolved within the same sync_tasks call and reported by id in "
-            "`renumbered`, with BOTH tasks' content preserved under distinct ids. Two fresh, "
-            "never-synced clients each independently create a task with the same "
-            "auto-assigned id 1, then sync:")
-        c_db = DB_A + "_collide_c"
-        d_db = DB_A + "_collide_d"
-        c = await open_session(stack, c_db, "Client C (fresh)")
-        d = await open_session(stack, d_db, "Client D (fresh)")
-        _, sc = await call(c, "step8b-c-create", "add_task", {"title": "Client C's own id-1 task", "priority": "med"})
-        _, sd = await call(d, "step8b-d-create", "add_task", {"title": "Client D's own id-1 task", "priority": "med"})
-        log(f"Both fresh clients independently created id={sc['task']['id']} and id={sd['task']['id']} "
-            "(both 1, as expected -- neither has ever synced)")
-        _, syncC = await call(c, "step8b-c-sync", "sync_tasks", {"remote": d_db})
-        no_conflict_entry = not syncC.get("conflicts")
-        got_renumbered = bool(syncC.get("renumbered"))
-        _, listC = await call(c, "step8b-c-list", "list_tasks", {"status": "all"})
-        titles_c = {t["title"] for t in listC.get("tasks", [])}
-        both_preserved = sc["task"]["title"] in titles_c and sd["task"]["title"] in titles_c
-        log(f"conflicts entry present: {bool(syncC.get('conflicts'))} (expected False); "
-            f"renumbered entry present: {got_renumbered} (expected True); Client C's tasks "
-            f"after sync: {sorted(titles_c)}; both original titles preserved under some id: "
-            f"{both_preserved}")
-        results_8b = no_conflict_entry and got_renumbered and both_preserved
-        log(f"STEP 8b VERDICT (id-collision handling, informational -- not required for the "
-            f"ten-step script itself): {'PASS' if results_8b else 'FAIL'}")
+        results[8] = bool(sync_ok and converged and no_conflicts and got_renumbered
+                           and a_id1_unchanged and b_id1_unchanged)
+        log(f"STEP 8 VERDICT: {'PASS' if results[8] else 'FAIL'} -- sync itself (plain "
+            f"CADENCE_DB_PATH as remote) works and is discoverable from --help/MCP docstring "
+            f"alone (sync_ok={sync_ok}); both clients converge on each other's tasks "
+            f"(converged={converged}); the id collision between Client A's and Client B's "
+            f"independently-created, unrelated id-1 tasks was auto-resolved via renumbering "
+            f"inside the same sync, never routed through `conflicts` or "
+            f"resolve_sync_conflict (no_conflicts={no_conflicts}, "
+            f"got_renumbered={got_renumbered}); each client's own numbering of its own task is "
+            f"unmoved by the sync (a_id1_unchanged={a_id1_unchanged}, "
+            f"b_id1_unchanged={b_id1_unchanged}). No data loss and no manual resolve step is "
+            f"needed for this scenario as of 0.2.36 -- see docs/ten-step-transcript.md for the "
+            f"prior, now-retired resolve_sync_conflict-based recovery this replaces.")
 
         # ---- Step 9: export ----
         log("### STEP 9 -- export")

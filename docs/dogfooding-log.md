@@ -4567,3 +4567,61 @@ above. `docs/ten-step-transcript-runner.py` step 8's own logic needs
 updating to the current renumbered-first contract; leaving that to
 whoever owns the ten-step script's step 1-10 logic since it's outside a
 wording fix.
+
+## 2026-09-05 (Rafael Okonkwo, Build) — ten-step-transcript-runner.py Step 8 was stale against 0.2.36; fixed, and docs/ten-step-transcript.md regenerated from a live re-run
+
+Noor flagged (leadership, 2026-09-05) that `docs/ten-step-transcript-runner.py`
+Step 8 — the one that actually sits on the finish line's ten-step
+script, not the informational Step 8b — still scripted the retired
+recovery path: it called `resolve_sync_conflict(id=1, keep=...)`
+expecting a `conflicts` entry on an id collision between two
+independently-created tasks. Since the `renumbered`/`conflicts` split
+landed in the 0.2.3x series (see the two entries above and the
+0.2.34/0.2.35/0.2.36 fixes), that code path no longer exists: an id
+collision between two unrelated tasks auto-resolves inside the same
+`sync_tasks` call and is reported via `renumbered`, with both tasks'
+content kept under distinct ids. Running the old Step 8 against live
+0.2.36 failed for exactly that reason — 8b (which already tested the
+current behaviour with two throwaway scratch clients) passed while 8
+itself failed.
+
+**Fix.** Rewrote Step 8 itself to exercise and assert the current
+behaviour directly, using Client A and Client B's own already-scripted
+first tasks (both land on local id 1 before either has ever synced —
+a real collision, no extra clients needed): after both directions of
+`sync_tasks`, assert `conflicts` is empty on both syncs, at least one
+`renumbered` entry is present, both clients converge on seeing each
+other's tasks by title, and each client's own id for its own
+originally-created task is left unmoved. The old
+`resolve_sync_conflict`-driven recovery block is gone from Step 8 —
+that tool is for a genuinely edited-on-both-sides task, a different
+scenario Step 8 doesn't exercise. Step 8b, which only ever existed to
+test this same auto-resolve behaviour with two extra scratch clients,
+is now redundant and was removed rather than kept as a duplicate.
+
+**Live re-run.** Fresh venv outside this repository (`/tmp`-style
+throwaway dir, no clone of this repo on the machine, no `PYTHONPATH`),
+`pip install cadence-todo` (resolved to `0.2.36`, the current published
+version), ran `docs/ten-step-transcript-runner.py` against two never-
+synced client stores:
+
+```
+$ venv/bin/python docs/ten-step-transcript-runner.py venv/bin/cadence a.db b.db remote
+...
+STEP 8 VERDICT: PASS -- ... no_conflicts=True, got_renumbered=True,
+a_id1_unchanged=True, b_id1_unchanged=True ...
+ALL PASS: True
+```
+
+All 10 steps pass. `docs/ten-step-transcript.md` has been regenerated
+from this exact run (real timestamps, exact prompts, full discovery
+section re-captured against the live 0.2.36 `--help`/README/MCP
+`list_tools()` output) and replaces the prior 0.2.1-era version.
+
+**Lesson for next time:** a committed transcript tied to a specific
+shipped version goes stale silently every time the underlying behavior
+changes for a good reason (here, a real bug fix). Nothing caught this
+until someone happened to cross-check it against a different spec
+document. Worth a standing check whenever a sync/conflict-shaped fix
+ships: re-run the ten-step transcript before calling the fix done, not
+after something else notices the doc disagrees with the code.
