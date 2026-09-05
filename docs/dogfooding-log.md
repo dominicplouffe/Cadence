@@ -4353,3 +4353,73 @@ A now has B's `due 2026-09-20` too — the edit that used to vanish on
 0.2.34 not only survived on B, it propagated correctly once resolved.
 Dov's reported repro, re-run to the letter against the live installed
 package, no longer loses the edit. task_01a06efb.
+
+---
+
+## 2026-09-05 (Dov Ferreira, Red Team) — independent pass on 0.2.35's
+## `--reset-sync-base` fix: silent loss is fixed, but it now falsely
+## claims the local client edited rows only the remote touched
+
+Fresh venv, real PyPI `cadence-todo==0.2.35`, no repo on path. No task
+open, going straight to the log per usual for this series.
+
+**Confirmed holding**: re-ran the exact 0.2.34 repro (A edits+pushes, B's
+history externally rewritten, B makes an unsynced edit, guard fires, B
+runs `--reset-sync-base`). Now returns `"1 conflict needs you"` / exit 1,
+not `"Up to date"` / exit 0, and B's edit survives `cadence list` and the
+full round trip after `--keep-mine`. Matches Rafael's transcript exactly.
+
+**New finding, MEDIUM-HIGH**: Rafael's note claims a row untouched since
+the rewrite still reports clean, "so the fix doesn't turn every reset
+into a conflict storm." True only for a row *nobody* touched. False for
+a row *only the remote* changed — the common case, not the edge case.
+Repro: A creates two tasks, pushes both. B pulls both, never touches
+either one, ever. A edits task 2 only, pushes again. B's history is
+externally rewritten (B still hasn't touched anything). B syncs, guard
+fires. B runs `--reset-sync-base`:
+
+```
+Synced with origin: pulled 0, pushed 0. 1 conflict needs you.
+Error: #2 was edited on both this client and the remote since the last
+sync. Nothing was overwritten. Run 'cadence sync --keep-mine 2' or
+'cadence sync --keep-theirs 2', then sync again.
+```
+
+B's own git history, first-parent, in full — three commits ever, none of
+which touch `tasks/2.json` after its initial creation:
+
+```
+0553d0c init: empty task store
+8442cd5 externally rewritten, no B edits at all
+3ca60f3 sync: pulled 0, pushed 0, renumbered 0
+```
+
+"#2 was edited on ... this client" is stated as fact and is false — B
+never edited it. Root cause (`store.py` `_sync_diff_and_apply`,
+~L1622-1633): the fix gates the real-base fallback on
+`not reset_from_real_base`, so on any reset the per-row base `b` is
+forced to `None` for every row, making `mine_changed` true for any row
+whose content isn't the empty sentinel — whether or not this client ever
+touched it. Only rows byte-identical on both sides skip this (an earlier,
+unrelated shortcut). No data is lost — this matches the honest
+`--reset-sync-base --help` text ("any row ... that isn't already
+identical becomes a conflict for you to settle") — but the per-row
+message reused from the ordinary conflict path asserts a specific,
+checkable, false claim about what "this client" did, the exact invariant
+this whole series has been chasing, now inside the fix meant to stop it
+on this same path. Practical cost: any store with real concurrent use
+turns one history rewrite into one manual `--keep-mine`/`--keep-theirs`
+call per row the remote moved since the last real sync, not per row
+genuinely in dispute.
+
+Full repro, root cause, and suggested fix direction:
+`/workspace/redteam_0235_indep/findings/2026-09-05-0235-reset-sync-base-conflict-storm.md`.
+Confirmed by inspection that `mcp_server.py`'s `sync_tasks` calls the
+same `Store.sync(reset_sync_base=...)` — same bug on the MCP surface,
+not re-demonstrated separately since it's provably the same function.
+Not fixed by me. Ranked below the 0.2.34 finding it replaces (that one
+lost data silently; this one only over-flags, nothing is lost) — this is
+the one I'd fix first among anything currently open (nothing else is
+open). Filed for Build; Surface will want the per-row conflict message
+reworded once the fix direction is picked, same pattern as the last
+several rounds.
