@@ -1132,11 +1132,31 @@ class Store:
         `reset_sync_base`: drop this store's own `refs/cadence/sync-base`
         marker before diffing -- the recovery path `HistoryRewritten`'s
         hint points to, for when this store's `.history` dir really was
-        rewritten outside Cadence (confirmed, not just suspected). This
-        sync then runs exactly like a first-ever sync (no base to
-        compare against), which is always safe: it can only turn a
-        genuine edit into a `conflicts` entry for a human to settle,
-        never silently drop one, same as any other first sync.
+        rewritten outside Cadence (confirmed, not just suspected).
+
+        This is deliberately NOT treated as identical to a genuine
+        first-ever sync (Dov's independent 0.2.34 pass,
+        docs/dogfooding-log.md 2026-09-05, HIGH): on a real first sync,
+        `_first_sync_task_base` reading this client's own most-recent
+        commit for a row as "content as of last sync" is safe, because
+        nothing has synced yet so there is nothing that commit could
+        be except pre-sync content. After a reset, that is false --
+        this client HAS synced before, and its most-recent commit for a
+        row can be a real local edit made after that last sync and
+        never yet pushed, which `_first_sync_task_base` cannot tell
+        apart from pre-sync content. Reading it as a safe base there
+        made `mine_changed` come back False for that edit, so an
+        unrelated remote change silently overwrote it with no conflict
+        raised and a printed "Up to date" -- exactly the silent-loss
+        this whole sync design exists to refuse. So: whether a real
+        prior sync-base existed before this call cleared it is recorded
+        below and threaded into `_sync_diff_and_apply` as
+        `reset_from_real_base`; for any row on such a reset where this
+        store's own true prior-sync content can't be established, that
+        row is now always a `conflicts` entry, never an assumed-safe
+        pull -- less convenient than silently guessing, but it can only
+        turn an edit into something a human/agent resolves explicitly,
+        never lose one.
 
         An id that never had a common prior version -- both sides
         independently created a task under the same auto-assigned id, with
@@ -1163,7 +1183,15 @@ class Store:
         """
         hist = self._history()
         hist.ensure()
+        reset_from_real_base = False
         if reset_sync_base:
+            # Must read this BEFORE clearing it -- afterwards there is no
+            # way to tell "this store had real prior sync history that
+            # got discarded" from "this store never synced at all", and
+            # that distinction is exactly what keeps this reset from
+            # silently overwriting a real unsynced edit below (see the
+            # docstring above and `_sync_diff_and_apply`).
+            reset_from_real_base = hist.sync_base_sha() is not None
             hist.clear_sync_base()
         given_remote = remote
         if remote:
@@ -1206,7 +1234,9 @@ class Store:
             }
 
         try:
-            return self._sync_diff_and_apply(hist, theirs_ref)
+            return self._sync_diff_and_apply(
+                hist, theirs_ref, reset_from_real_base=reset_from_real_base
+            )
         except CadenceError:
             raise
         except Exception as exc:
@@ -1433,7 +1463,9 @@ class Store:
                 )
             conn.commit()
 
-    def _sync_diff_and_apply(self, hist: GitHistory, theirs_ref: str) -> dict:
+    def _sync_diff_and_apply(
+        self, hist: GitHistory, theirs_ref: str, reset_from_real_base: bool = False
+    ) -> dict:
         """Structural sync-identity fix (task
         task_01a04b9b39057fc952517775, spec
         concept_notes/r08-sync-finding-c-duplicate-fix-spec.md, finding
@@ -1445,6 +1477,19 @@ class Store:
         moment a row has been through one sync round and becomes
         "based", which is exactly what let a 3rd ordinary re-sync of an
         already-converged pair reintroduce the duplicate 0.2.3 shipped).
+
+        `reset_from_real_base`: True only when this call's `base_ref is
+        None` because `sync()` just ran `--reset-sync-base` on a store
+        that DID have a real, now-discarded, `refs/cadence/sync-base`
+        (never true on a genuine first-ever sync -- see `sync()`'s
+        docstring and Dov's independent 0.2.34 finding,
+        docs/dogfooding-log.md 2026-09-05). Gates the
+        `_first_sync_task_base` fallback below: that heuristic reads
+        this client's own most-recent commit for a row as safe pre-sync
+        content, which is only true when nothing has ever synced --
+        after a real reset it can BE an unsynced post-sync edit, and
+        reading it as the base makes that edit invisible to
+        `mine_changed`, letting the remote's side silently win.
 
         A client's own display-id numbering for a given origin, once
         assigned, never changes again on that client -- clients are never
@@ -1556,7 +1601,31 @@ class Store:
             # itself, so that row's own creation content -- read back
             # from this client's own git log -- is the real base to
             # diff against, not an empty one.
-            if b is None and base_ref is None and m is not None and t is not None:
+            #
+            # `not reset_from_real_base` is the fix for Dov's independent
+            # 0.2.34 finding (docs/dogfooding-log.md 2026-09-05, HIGH):
+            # this same `base_ref is None` shape also happens right after
+            # `--reset-sync-base` on a store that HAS synced before, and
+            # there `_first_sync_task_base`'s own most-recent-commit
+            # heuristic is unsafe -- that commit can be a real edit made
+            # after the real last sync and never pushed, which is
+            # indistinguishable, by this heuristic, from genuine pre-sync
+            # content. Refusing the fallback there leaves `b` as None,
+            # so `mine_changed`/`theirs_changed` below both come back
+            # True for any row whose content actually differs -- routing
+            # it to the `conflicts` branch a few lines down instead of
+            # letting the `elif theirs_changed:` branch silently adopt
+            # the remote's side over an edit this client never got to
+            # push. A row already identical on both sides never reaches
+            # this line at all (the `m_fp == t_fp` shortcut above), so an
+            # untouched-since-rewrite row still reports clean.
+            if (
+                b is None
+                and base_ref is None
+                and not reset_from_real_base
+                and m is not None
+                and t is not None
+            ):
                 b = self._first_sync_task_base(hist, m["id"])
 
             b_fp = self._content_fingerprint(b) if b is not None else None
