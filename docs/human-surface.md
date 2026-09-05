@@ -495,11 +495,82 @@ not overwritten, everything else in the same sync still lands:
 ```
 $ cadence sync
 Synced with origin: pulled 3, pushed 2. 1 conflict needs you.
-Error: #4 differs between this client and the remote since the last sync (edited on both sides, or independently created with the same id). Nothing was overwritten. Run 'cadence sync --keep-mine 4' or 'cadence sync --keep-theirs 4', then sync again.
+Error: #4 was edited on both this client and the remote since the last sync. Nothing was overwritten. Run 'cadence sync --keep-mine 4' or 'cadence sync --keep-theirs 4', then sync again.
 ```
 Exit code `1` while any conflict is unresolved (a script can tell "sync is
 done" from "sync needs a human" apart, same contract as §4.4), `0` once
 clean.
+
+**Reworded 2026-09-05 — the hedge is gone because the case it hedged
+against no longer reaches this message.** This section used to read
+"differs ... (edited on both sides, or independently created with the
+same id)", because early builds funnelled both causes — a genuine edit
+conflict and two unrelated tasks that happened to get the same
+auto-assigned id — into the same `conflicts` list and the same
+message. That was already fixed in code (id collisions are now split
+into their own `renumbered` list — see the `Note:` line below — and
+resolved automatically, never asking for `--keep-mine`/`--keep-theirs`);
+this doc just hadn't been reworded to match, so it still showed the old
+hedge as if it could still happen here. It can't: reaching `conflicts`
+today means one specific thing, a real edit on both sides of the same
+task, so the message says exactly that and nothing else. Live-verified
+against shipped 0.2.36 (`cadence sync` between two clients that each
+scheduled the same shared-origin task to a different date):
+```
+$ cadence sync
+Synced with origin: pulled 0, pushed 0. 1 conflict needs you.
+Error: #2 was edited on both this client and the remote since the last sync. Nothing was overwritten. Run 'cadence sync --keep-mine 2' or 'cadence sync --keep-theirs 2', then sync again.
+```
+
+**`cadence sync --reset-sync-base`'s conflict message — checked
+2026-09-05 per Dov's request, no separate wording needed.** After
+0.2.35/0.2.36 (dogfooding-log.md, same dates), `--reset-sync-base` drops
+the stale sync-base marker and then runs the exact same remote-vs-local
+diff as a plain `cadence sync` — it is not a different code path past
+that point, so a genuine conflict it turns up is reported through the
+same `conflicts` list and rendered by the same message above, word for
+word. Live-verified against shipped 0.2.36:
+```
+$ cadence sync --reset-sync-base
+Synced with origin: pulled 0, pushed 0. 1 conflict needs you.
+Error: #2 was edited on both this client and the remote since the last sync. Nothing was overwritten. Run 'cadence sync --keep-mine 2' or 'cadence sync --keep-theirs 2', then sync again.
+```
+**Why this reword was owed at all, and why it's closed by the fix
+instead of the wording.** Dov's 2026-09-05 finding on 0.2.35 showed this
+exact message on a row *only the remote* had touched — "#2 was edited
+on both this client and the remote" stated as fact while B's own git
+history proved B never touched it. That is a wording problem only in
+the sense that any false statement is: the honest fix was not to soften
+the claim (e.g. "may differ" instead of "was edited on both") but to
+stop the message from firing on rows it doesn't apply to, which 0.2.36
+did by fixing `mine_changed`'s computation at the source instead of
+hedging the sentence built on top of it. A hedge would have made the
+message true more often at the cost of being useful — "may have been
+edited" tells an agent nothing actionable. Live-verified the specific
+repro from Dov's finding (A edits+pushes task 2 only; B pulls, never
+touches either task; B's history externally rewritten; B runs `sync
+--reset-sync-base`) against shipped 0.2.36: task 2 pulls clean, exit 0,
+no conflict message at all — see dogfooding-log.md 2026-09-05. So the
+message text stands as written above: it is only ever shown on a row
+this store's own diff has verified both sides actually changed, and
+says exactly that, no more.
+
+This meets the §4.4 bar as-is: it names what happened and the exact
+recovery command, never a stack trace or a bare code, exit `1` like any
+other unresolved conflict. Nothing to land — the `--reset-sync-base`
+flag only changes which rows get compared, never how a conflict, once
+found, is described.
+
+The id-collision case gets its own, separate message — never a
+`--keep-mine`/`--keep-theirs` prompt, because there is truly one row on
+each side and nothing to choose between, only a number to renumber:
+```
+$ cadence sync
+Note: #1 was independently created on both clients (not an edit of the
+same task) -- kept #1 as this client's version and gave the other
+client's task a new id, #2. Nothing was lost or overwritten.
+Synced with origin: pulled 1, pushed 1. Up to date.
+```
 
 ### 4.11 Export
 

@@ -4505,3 +4505,65 @@ for the genuine-conflict path that remains (flagged by Dov, ack'd by
 Noor 2026-08-28). No new instance of the false claim itself is left
 after this fix; the reword is about wording robustness on the path that
 still legitimately conflicts, not a new bug.
+
+## 2026-09-05 (Noor Halvorsen, Surface) — closed: genuine-conflict message reword, human-surface.md §4.10 synced to shipped 0.2.36
+
+Owed since 0.2.35/0.2.36 (see the two entries above): the per-row
+conflict message on the genuine-conflict path, and whether
+`--reset-sync-base` needed its own wording.
+
+**Two separate things were tangled under "reword," now split:**
+
+1. **§4.10's written spec was stale, not the shipped message.** The doc
+   still showed the pre-renumbering hedge, "differs ... (edited on both
+   sides, or independently created with the same id)." Shipped code
+   (verified live against 0.2.36) has read "#N was edited on both this
+   client and the remote since the last sync" — unhedged — since id
+   collisions were split into their own `renumbered` list and stopped
+   reaching `conflicts` at all. Doc updated to match; no code change.
+
+2. **Dov's false-claim finding (0.2.35, remote-only-edit case) is closed
+   by the 0.2.36 fix, not by a wording change.** Re-ran the exact repro
+   from Dov's finding against live 0.2.36: task A edits+pushes only,
+   B never touches it, B's history externally rewritten, B runs `sync
+   --reset-sync-base` — pulls clean, exit 0, no conflict message at all.
+   The false "this client edited" claim is gone because `mine_changed`
+   is computed correctly now, not because the sentence was softened.
+   Considered and rejected hedging the message (e.g. "may have been
+   edited") — it would be true more often at the cost of being
+   actionable, and the source-level fix already makes the strong claim
+   true whenever it's shown.
+
+**`--reset-sync-base`'s conflict message needs no separate wording.**
+Confirmed by reading `cmd_sync`/`_cmd_sync_all_projects` (cli.py) and
+`store.sync()`: past the sync-base reset itself, `--reset-sync-base`
+runs the identical remote-vs-local diff as a plain `cadence sync`, so a
+genuine conflict it finds is rendered by the exact same message. Live
+double-checked with a fresh two-client genuine edit conflict (both
+scheduled the same shared-origin task to different dates), diffed
+`cadence sync` against `cadence sync --reset-sync-base` byte for byte —
+identical output.
+
+Full spec, live transcripts, and the closed thread: docs/human-surface.md
+§4.10 ("Reworded 2026-09-05", "no separate wording needed", "Why this
+reword was owed at all"). No code change needed — filing this as a doc
+fix only. Also fixed a stale check in docs/ten-step-transcript-runner.py
+(step 8b) that still asserted the pre-renumbering hedge text should
+appear; it never can now, so the check was rewritten to assert the
+current, correct behavior instead (no `conflicts` entry on an id
+collision, a `renumbered` entry instead, both tasks' content preserved)
+— re-ran against live 0.2.36, step 8b now PASSes.
+
+**Found while re-running the full transcript, unrelated to this reword,
+named for Build/Red Team, not fixed here:** Step 8 itself (not 8b) now
+FAILs on live 0.2.36. Its scripted recovery still assumes an id
+collision reaches `conflicts` and calls `resolve_sync_conflict` on it —
+that path no longer exists (collisions auto-resolve via `renumbered`),
+so the assertion built on the old recovery sequence no longer holds.
+This is a test-script/doc mismatch against current shipped behavior,
+not a new product regression — the underlying sync behavior (both
+tasks preserved, no data loss) is confirmed working under 8b's rewrite
+above. `docs/ten-step-transcript-runner.py` step 8's own logic needs
+updating to the current renumbered-first contract; leaving that to
+whoever owns the ten-step script's step 1-10 logic since it's outside a
+wording fix.

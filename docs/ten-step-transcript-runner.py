@@ -260,11 +260,16 @@ async def main():
             f"content was NOT preserved (b_task_survived={b_task_survived}) -- see FINDING "
             f"above and docs/ten-step-transcript.md.")
 
-        log("### STEP 8b -- id-collision wording check (Finding 2 reword verification): "
-            "two fresh, never-synced clients that each independently created a task with the "
-            "same auto-assigned id 1, then sync -- confirm the conflict message now reads "
-            "'differs between this client and the remote ... (edited on both sides, or "
-            "independently created with the same id)' instead of only 'edited on both sides'")
+        log("### STEP 8b -- id-collision handling check (superseded 2026-09-05, see "
+            "docs/human-surface.md §4.10 and dogfooding-log.md): as of the shipped "
+            "renumbered/conflicts split, an id collision between two independently-created, "
+            "unrelated tasks is no longer reported as a `conflicts` entry at all (the old "
+            "'edited on both sides, or independently created with the same id' hedge this "
+            "step used to check for described a message that no longer exists). It is now "
+            "auto-resolved within the same sync_tasks call and reported by id in "
+            "`renumbered`, with BOTH tasks' content preserved under distinct ids. Two fresh, "
+            "never-synced clients each independently create a task with the same "
+            "auto-assigned id 1, then sync:")
         c_db = DB_A + "_collide_c"
         d_db = DB_A + "_collide_d"
         c = await open_session(stack, c_db, "Client C (fresh)")
@@ -274,12 +279,18 @@ async def main():
         log(f"Both fresh clients independently created id={sc['task']['id']} and id={sd['task']['id']} "
             "(both 1, as expected -- neither has ever synced)")
         _, syncC = await call(c, "step8b-c-sync", "sync_tasks", {"remote": d_db})
-        conflict_msgs = [conf.get("message", "") for conf in syncC.get("conflicts", [])] if syncC.get("conflicts") else []
-        reworded = any("independently created with the same id" in m for m in conflict_msgs)
-        log(f"Conflict reported: {bool(syncC.get('conflicts'))}; message(s): {conflict_msgs}; "
-            f"Finding-2 reword present: {reworded}")
-        log(f"STEP 8b VERDICT (Finding 2 wording, informational -- not required for the "
-            f"ten-step script itself): {'PASS' if reworded else 'FAIL'}")
+        no_conflict_entry = not syncC.get("conflicts")
+        got_renumbered = bool(syncC.get("renumbered"))
+        _, listC = await call(c, "step8b-c-list", "list_tasks", {"status": "all"})
+        titles_c = {t["title"] for t in listC.get("tasks", [])}
+        both_preserved = sc["task"]["title"] in titles_c and sd["task"]["title"] in titles_c
+        log(f"conflicts entry present: {bool(syncC.get('conflicts'))} (expected False); "
+            f"renumbered entry present: {got_renumbered} (expected True); Client C's tasks "
+            f"after sync: {sorted(titles_c)}; both original titles preserved under some id: "
+            f"{both_preserved}")
+        results_8b = no_conflict_entry and got_renumbered and both_preserved
+        log(f"STEP 8b VERDICT (id-collision handling, informational -- not required for the "
+            f"ten-step script itself): {'PASS' if results_8b else 'FAIL'}")
 
         # ---- Step 9: export ----
         log("### STEP 9 -- export")
