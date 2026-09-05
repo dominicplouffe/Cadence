@@ -1144,19 +1144,37 @@ class Store:
         this client HAS synced before, and its most-recent commit for a
         row can be a real local edit made after that last sync and
         never yet pushed, which `_first_sync_task_base` cannot tell
-        apart from pre-sync content. Reading it as a safe base there
-        made `mine_changed` come back False for that edit, so an
-        unrelated remote change silently overwrote it with no conflict
-        raised and a printed "Up to date" -- exactly the silent-loss
-        this whole sync design exists to refuse. So: whether a real
-        prior sync-base existed before this call cleared it is recorded
-        below and threaded into `_sync_diff_and_apply` as
-        `reset_from_real_base`; for any row on such a reset where this
-        store's own true prior-sync content can't be established, that
-        row is now always a `conflicts` entry, never an assumed-safe
-        pull -- less convenient than silently guessing, but it can only
-        turn an edit into something a human/agent resolves explicitly,
-        never lose one.
+        apart from pre-sync content. So that heuristic stays refused on
+        a reset (`reset_from_real_base`, below) no matter what.
+
+        But refusing that ONE heuristic is not the same as having no
+        real base at all. The sha this store's `refs/cadence/sync-base`
+        pointed at before this call cleared it is the actual, honest
+        record of "content as of the last confirmed sync" -- exactly
+        what a non-reset sync already trusts. The ONLY reason it is
+        being reset is that `is_ancestor(base_ref, head)` can no longer
+        prove it is reachable from this store's current HEAD (some
+        external tool rewrote commits on top of it); that says nothing
+        about whether the commit OBJECT itself, and the tree it points
+        at, are still readable -- git does not prune a dangling object
+        immediately, so `git show`/`git ls-tree` at that exact sha
+        still work for as long as it survives (Dov's independent 0.2.35
+        pass, docs/dogfooding-log.md 2026-09-05, MEDIUM-HIGH: forcing
+        `base=None` for every row instead of trying this sha first made
+        every row the remote alone touched since the rewrite look like
+        "both sides changed it"). So the sha is captured BELOW, before
+        `clear_sync_base()` runs, and threaded into
+        `_sync_diff_and_apply` as `reset_stale_base_sha` -- tried FIRST
+        as the base snapshot for the whole diff, falling back to
+        today's fully-conservative "no base, no fallback" treatment
+        only for a row it genuinely can't answer for (the sha itself no
+        longer resolves at all -- e.g. a real history-rewriting tool
+        that also pruned, not just a rebase/amend/reset). A row this
+        client never touched since that real sync compares equal to it
+        and pulls cleanly with no conflict; a row this client DID edit
+        since then still differs from it and is still routed to
+        `conflicts` exactly as before -- nothing here makes a reset
+        less safe than a normal sync, only as safe as one.
 
         An id that never had a common prior version -- both sides
         independently created a task under the same auto-assigned id, with
@@ -1183,15 +1201,19 @@ class Store:
         """
         hist = self._history()
         hist.ensure()
-        reset_from_real_base = False
+        reset_stale_base_sha: Optional[str] = None
         if reset_sync_base:
             # Must read this BEFORE clearing it -- afterwards there is no
             # way to tell "this store had real prior sync history that
             # got discarded" from "this store never synced at all", and
             # that distinction is exactly what keeps this reset from
             # silently overwriting a real unsynced edit below (see the
-            # docstring above and `_sync_diff_and_apply`).
-            reset_from_real_base = hist.sync_base_sha() is not None
+            # docstring above and `_sync_diff_and_apply`). Captured as
+            # the sha itself, not just a bool: `_sync_diff_and_apply`
+            # tries reading real per-row content back from it before
+            # falling back to "no base" (Dov's independent 0.2.35 pass,
+            # docs/dogfooding-log.md 2026-09-05).
+            reset_stale_base_sha = hist.sync_base_sha()
             hist.clear_sync_base()
         given_remote = remote
         if remote:
@@ -1235,7 +1257,7 @@ class Store:
 
         try:
             return self._sync_diff_and_apply(
-                hist, theirs_ref, reset_from_real_base=reset_from_real_base
+                hist, theirs_ref, reset_stale_base_sha=reset_stale_base_sha
             )
         except CadenceError:
             raise
@@ -1464,7 +1486,7 @@ class Store:
             conn.commit()
 
     def _sync_diff_and_apply(
-        self, hist: GitHistory, theirs_ref: str, reset_from_real_base: bool = False
+        self, hist: GitHistory, theirs_ref: str, reset_stale_base_sha: Optional[str] = None
     ) -> dict:
         """Structural sync-identity fix (task
         task_01a04b9b39057fc952517775, spec
@@ -1478,18 +1500,35 @@ class Store:
         "based", which is exactly what let a 3rd ordinary re-sync of an
         already-converged pair reintroduce the duplicate 0.2.3 shipped).
 
-        `reset_from_real_base`: True only when this call's `base_ref is
-        None` because `sync()` just ran `--reset-sync-base` on a store
-        that DID have a real, now-discarded, `refs/cadence/sync-base`
-        (never true on a genuine first-ever sync -- see `sync()`'s
-        docstring and Dov's independent 0.2.34 finding,
-        docs/dogfooding-log.md 2026-09-05). Gates the
-        `_first_sync_task_base` fallback below: that heuristic reads
+        `reset_stale_base_sha`: not None only when this call's `base_ref
+        is None` because `sync()` just ran `--reset-sync-base` on a
+        store that DID have a real, now-discarded,
+        `refs/cadence/sync-base` -- the sha that ref pointed at, read
+        by `sync()` before it cleared the ref (never set on a genuine
+        first-ever sync -- see `sync()`'s docstring and Dov's
+        independent 0.2.34 finding, docs/dogfooding-log.md 2026-09-05).
+
+        Used two ways below. First, as `reset_from_real_base` (`is not
+        None`): gates the `_first_sync_task_base` fallback, which reads
         this client's own most-recent commit for a row as safe pre-sync
-        content, which is only true when nothing has ever synced --
-        after a real reset it can BE an unsynced post-sync edit, and
-        reading it as the base makes that edit invisible to
-        `mine_changed`, letting the remote's side silently win.
+        content -- only true when nothing has ever synced. After a real
+        reset that can BE an unsynced post-sync edit, and reading it as
+        the base makes that edit invisible to `mine_changed`, letting
+        the remote's side silently win; this fallback stays refused on
+        any reset, full stop. Second, as `effective_base_ref` below: the
+        sha itself is tried as the base snapshot for the WHOLE diff
+        (Dov's independent 0.2.35 finding, docs/dogfooding-log.md
+        2026-09-05, MEDIUM-HIGH) -- unlike the first-ever-sync case, a
+        reset already had a real recorded sync-base; only the
+        ancestry PROOF that it is still reachable from HEAD was lost
+        (some external tool rewrote commits on top of it), not the
+        commit object or the tree it points at. `git show`/`git
+        ls-tree` at that exact sha still work as long as it has not
+        actually been pruned, so reading real per-row content back from
+        it -- instead of assuming `base=None` for every row -- lets a
+        row this client never touched compare equal and pull cleanly,
+        while a row this client DID edit since that real sync still
+        differs and still correctly routes to `conflicts`.
 
         A client's own display-id numbering for a given origin, once
         assigned, never changes again on that client -- clients are never
@@ -1531,7 +1570,21 @@ class Store:
                     ),
                 )
         theirs = hist.snapshot_at(theirs_ref)
-        base = hist.snapshot_at(base_ref) if base_ref else {}
+        # `base_ref` is None here whenever `sync()` just ran
+        # `--reset-sync-base` (it already cleared the real ref before
+        # calling in). `reset_stale_base_sha` is that ref's OLD value,
+        # read before it was cleared -- try it first for real per-row
+        # content instead of assuming no base at all (see this method's
+        # docstring, Dov's independent 0.2.35 finding). `snapshot_at`
+        # silently returns `{}` for a sha that no longer resolves at
+        # all (e.g. an external tool that also pruned, not just
+        # rewrote), which correctly falls all the way back to today's
+        # fully-conservative "no base" treatment for every row -- never
+        # worse than before this fix, only better when the object is
+        # still readable.
+        effective_base_ref = base_ref if base_ref is not None else reset_stale_base_sha
+        base = hist.snapshot_at(effective_base_ref) if effective_base_ref else {}
+        reset_from_real_base = reset_stale_base_sha is not None
         # Absorb any task file this store is only passively carrying for
         # a THIRD party (see _absorb_orphan_task_files) into real sqlite
         # rows BEFORE `mine`/`local_used` are built below, so the diff
