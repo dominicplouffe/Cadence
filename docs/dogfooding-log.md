@@ -4218,3 +4218,138 @@ Red Team):
 Ranked above every other currently-open finding (there are none) — this is
 the one I'd fix first: it defeats, silently, the safety promise of the
 recovery path 0.2.34 shipped specifically for the chairman's own question.
+
+## 2026-09-05 (Rafael Okonkwo, Build) — 0.2.35: fixed --reset-sync-base silently discarding a real unsynced edit (Dov's HIGH finding)
+
+Fixed the hole Dov found in the recovery path 0.2.34 shipped for the
+chairman's own rebase question. `--reset-sync-base` clears
+`refs/cadence/sync-base`, so the same call's diff ran through the
+`base_ref is None` branch `_sync_diff_and_apply` also uses on a genuine
+first-ever sync — which, for a row both sides already know, calls
+`_first_sync_task_base` to read this client's own most-recent commit for
+that row as a safe stand-in for "content as of last sync." True on an
+actual first sync (nothing has synced yet, so that commit can only be
+pre-sync content). False after a reset: this client HAS synced before,
+so that same most-recent commit can be a real edit made after the real
+last sync and never pushed — exactly the shape of the row under
+evaluation. Read as "unchanged," `mine_changed` came back `False`, and
+the `elif theirs_changed:` branch silently pulled the remote's version
+over it — a real edit gone, "Up to date," exit 0.
+
+Fix (`store.py`): `sync()` now reads `hist.sync_base_sha()` *before*
+`clear_sync_base()` and remembers whether a real marker existed
+(`reset_from_real_base`), then threads that into `_sync_diff_and_apply`.
+The `_first_sync_task_base` fallback now only fires when
+`reset_from_real_base` is false — a genuine first sync. On an actual
+reset, `b` stays `None` for a row that isn't already byte-identical on
+both sides, so `mine_changed`/`theirs_changed` both come back `True` and
+the row lands in `conflicts` — a human/agent resolves it explicitly via
+`--keep-mine`/`--keep-theirs`, same as any other real conflict, never an
+assumed-safe pull. A row nobody touched since the rewrite still reports
+clean: the existing `m_fp == t_fp` shortcut (unchanged by this fix) skips
+the base lookup entirely before this new gate is ever reached. Same fix
+covers the MCP surface for free — both `cli.py`'s `cmd_sync` and
+`mcp_server.py`'s `sync_tasks` call the same `Store.sync()`, no
+per-surface duplication to fix twice. Also reworded the CLI help text,
+the MCP tool docstring, and `sync()`'s own docstring, which all
+previously claimed a reset "runs exactly like a first-ever sync" — no
+longer true by design, and that exact claim is what let the bug ship
+unnoticed.
+
+`tests/test_0904b_reset_sync_base_silent_overwrite.py` reproduces Dov's
+exact scenario (two synced clients, external rewrite, one unsynced local
+edit on the shared row, `--reset-sync-base`) and confirms the edit is
+never silently discarded — it surfaces as a `conflicts` entry, and
+resolving it via `--keep-mine` actually recovers it. Confirmed the same
+test fails on the pre-fix code with `due=None, conflicts=[]` — i.e. it
+really exercises the reported bug, not a coincidence. Also confirms a
+row untouched since the rewrite still reports clean (`conflicts == []`)
+after a reset, so the fix doesn't turn every reset into a conflict storm.
+171/171 tests pass (170 pre-existing + 1 new).
+
+Published 0.2.35 to PyPI via the version-bump-triggers-publish CI path
+(push to main, commit 7960812): CI green
+(https://github.com/dominicplouffe/Cadence/actions/runs/33933759695),
+Publish green
+(https://github.com/dominicplouffe/Cadence/actions/runs/33933759718),
+live at https://pypi.org/project/cadence-todo/0.2.35/.
+
+Re-ran Dov's exact repro against the real published wheel, fresh venv
+outside the repo (`/workspace/verify_0235/venv`, `pip install
+cadence-todo==0.2.35`, confirmed via `pip show` the installed version is
+0.2.35 before running — first attempt hit the known PyPI CDN propagation
+lag, `pip index versions` polled until 0.2.35 appeared, then the install
+succeeded), against the live CLI, not pytest:
+
+```
+$ BIN=venv/bin/cadence
+$ git init -q --bare remote.git
+
+# A creates and pushes T
+$ CADENCE_DB_PATH=A/db.sqlite $BIN add "Shared task T"
+Added #1: Shared task T
+$ CADENCE_DB_PATH=A/db.sqlite $BIN sync --remote remote.git
+Synced with origin: pulled 0, pushed 1. Up to date.
+
+# B pulls T
+$ CADENCE_DB_PATH=B/db.sqlite $BIN sync --remote remote.git
+Synced with origin: pulled 1, pushed 0. Up to date.
+
+# A independently edits T and pushes
+$ CADENCE_DB_PATH=A/db.sqlite $BIN reprioritise 1 high
+Reprioritised #1 (none → high): Shared task T
+$ CADENCE_DB_PATH=A/db.sqlite $BIN sync --remote remote.git
+Synced with origin: pulled 0, pushed 1. Up to date.
+
+# Externally rewrite B's history (simulated rebase)
+$ git -C B/db.sqlite.history commit --amend -q -m "externally rewritten (simulated rebase)"
+
+# B edits its own copy of T, never yet synced
+$ CADENCE_DB_PATH=B/db.sqlite $BIN schedule 1 2026-09-20
+Scheduled #1 for 2026-09-20: Shared task T
+
+# B syncs -- guard fires, as it did on 0.2.34
+$ CADENCE_DB_PATH=B/db.sqlite $BIN sync --remote remote.git; echo exit=$?
+Error: sync history was rewritten since the last sync, cannot safely
+3-way merge. ... Re-run with 'cadence sync --reset-sync-base' ...
+exit=2
+
+# B follows the documented recovery -- this is the exact call that used
+# to silently discard the schedule edit on 0.2.34
+$ CADENCE_DB_PATH=B/db.sqlite $BIN sync --remote remote.git --reset-sync-base; echo exit=$?
+Synced with origin: pulled 0, pushed 0. 1 conflict needs you.
+Error: #1 was edited on both this client and the remote since the last
+sync. Nothing was overwritten. Run 'cadence sync --keep-mine 1' or
+'cadence sync --keep-theirs 1', then sync again.
+exit=1
+
+$ CADENCE_DB_PATH=B/db.sqlite $BIN list
+  [ ]    1   Shared task T                              |  due 2026-09-20
+```
+
+B's schedule edit is still there — `due 2026-09-20` — not silently
+overwritten by A's `priority: high`. Instead of the old "Up to date" /
+exit 0 with the edit gone, this is now an honest conflict, exit 1,
+"Nothing was overwritten" printed plainly. Resolved it the documented
+way and confirmed the edit survives the whole round trip, both
+directions:
+
+```
+$ CADENCE_DB_PATH=B/db.sqlite $BIN sync --remote remote.git --keep-mine 1
+Resolved #1 (kept mine): Shared task T
+$ CADENCE_DB_PATH=B/db.sqlite $BIN sync --remote remote.git; echo exit=$?
+Already in sync with origin. Nothing to pull or push.
+exit=0
+$ CADENCE_DB_PATH=B/db.sqlite $BIN list
+  [ ]    1   Shared task T                              |  due 2026-09-20
+
+$ CADENCE_DB_PATH=A/db.sqlite $BIN sync --remote remote.git
+Synced with origin: pulled 1, pushed 0. Up to date.
+$ CADENCE_DB_PATH=A/db.sqlite $BIN list
+  [ ]    1   Shared task T                              |  due 2026-09-20
+```
+
+A now has B's `due 2026-09-20` too — the edit that used to vanish on
+0.2.34 not only survived on B, it propagated correctly once resolved.
+Dov's reported repro, re-run to the letter against the live installed
+package, no longer loses the edit. task_01a06efb.
