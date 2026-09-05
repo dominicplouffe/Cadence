@@ -4423,3 +4423,85 @@ the one I'd fix first among anything currently open (nothing else is
 open). Filed for Build; Surface will want the per-row conflict message
 reworded once the fix direction is picked, same pattern as the last
 several rounds.
+
+## 2026-09-05 — 0.2.36: `--reset-sync-base` false "edited on both" conflict fixed + live-wheel re-verify
+
+Fixes Dov's independent 0.2.35 finding above (MEDIUM-HIGH): the 0.2.35
+fix forced `base=None` for every row on `--reset-sync-base`, so any row
+the remote alone changed since the rewrite looked identical to a row
+both sides changed — a real conflict per row nobody actually disputed,
+with a message stating "this client" edited a row it never touched.
+
+**Root cause**: `sync()` already reads the OLD `refs/cadence/sync-base`
+sha before clearing it, to gate the unsafe `_first_sync_task_base`
+heuristic. That sha is an honest record of "content as of the last
+confirmed sync" — a history rewrite only breaks the *proof* that it's
+still an ancestor of HEAD, not the commit object or tree it points at.
+`git show`/`git ls-tree` at that sha still resolve as long as it hasn't
+been pruned.
+
+**Fix**: thread the sha itself down as `reset_stale_base_sha` and try it
+as the base snapshot for the whole diff before falling back to
+`base={}`. A row this client never touched compares equal to it and
+pulls cleanly; a row it DID edit since the real sync still differs and
+still correctly conflicts. The `_first_sync_task_base` heuristic stays
+refused on every reset, unchanged — this only replaces "no base at all"
+with "the real base, if it's still readable." Falls back to today's
+fully-conservative behaviour if the sha no longer resolves at all (e.g.
+a rewrite that also pruned).
+
+Added `tests/test_0905_reset_sync_base_false_conflict.py`: reproduces
+Dov's exact scenario (two tasks, remote edits only one, B never touches
+either, external rewrite, `--reset-sync-base`) and confirms it applies
+cleanly with no false conflict; confirmed failing on pre-fix code. Also
+re-confirms the genuine both-sides-conflict case (test_0904b) still
+conflicts correctly. Full suite: 173/173 pass.
+
+Published: commit 183addb bumped `pyproject.toml` to 0.2.36 on push to
+main; the repo's `Publish` GitHub Actions workflow built, checked, and
+published it automatically (run 33936517057, completed success). PyPI
+confirms: `https://pypi.org/pypi/cadence-todo/0.2.36/json` returns 200.
+
+**Live-wheel re-verify**, fresh venv, no repo on path:
+
+```
+$ python3 -m venv venv && venv/bin/pip install cadence-todo==0.2.36
+$ venv/bin/pip show cadence-todo | head -3
+Name: cadence-todo
+Version: 0.2.36
+...
+```
+
+Ran Dov's exact repro against the real installed wheel — two tasks, A
+edits+pushes only task 2, B pulls neither task 2's edit yet, B's history
+externally rewritten, B syncs (guard fires, exit 2), B runs
+`--reset-sync-base`:
+
+```
+$ CADENCE_DB_PATH=B3/db.sqlite venv/bin/cadence sync --remote remote3.git; echo exit=$?
+Error: sync history was rewritten since the last sync, cannot safely 3-way merge. ...
+exit=2
+
+$ CADENCE_DB_PATH=B3/db.sqlite venv/bin/cadence sync --remote remote3.git --reset-sync-base; echo exit=$?
+Synced with origin: pulled 1, pushed 0. Up to date.
+exit=0
+
+$ CADENCE_DB_PATH=B3/db.sqlite venv/bin/cadence list
+  [ ]    2   Task Q (A will edit)                       |  low
+  [ ]    1   Task R (stays untouched)
+```
+
+No "1 conflict needs you", no false "#2 was edited on both this client
+and the remote" — the remote-only edit to task 2 lands as a plain,
+clean pull, exit 0, task 1 untouched. B's own git history confirms B
+never committed to task 2 at any point (`init`, `externally rewritten`,
+`sync: pulled 1, pushed 0` — three commits, none of them an edit).
+Matches Dov's repro to the letter, this time clean. Full transcript:
+`/workspace/verify_0236_live/transcript.txt`.
+
+Not yet done: Noor still owes the per-row conflict message a reword so
+it never asserts "this client edited" a row it can't show a commit for,
+for the genuine-conflict path that remains (flagged by Dov, ack'd by
+Noor 2026-08-28). No new instance of the false claim itself is left
+after this fix; the reword is about wording robustness on the path that
+still legitimately conflicts, not a new bug.
