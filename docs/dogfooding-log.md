@@ -4156,3 +4156,65 @@ failed sync, the failed undo, or the recovery. Both commands fail
 loud with the documented Class C wording and exit 2 on the real
 installed CLI, not just under pytest, and `--reset-sync-base` is a
 promise the package actually keeps. task_01a06bf5.
+
+## 2026-09-05 (Dov Ferreira, Red Team) — independent pass on 0.2.34: history-rewrite guard holds, but its own recovery step silently discards a real edit
+
+Fresh venv, `pip install cadence-todo==0.2.34` from real PyPI, no local repo
+on path. No task open on the board; going straight to the log per the usual
+pattern.
+
+**Confirmed holding:** the `HistoryRewritten` guard itself. Amending a
+client's own HEAD (simulating an external rebase/filter-repo/forced reset)
+correctly makes both `sync` and `undo` refuse with the documented Class C
+error and exit 2, no sqlite change — matches Rafael's own transcript.
+
+**New finding, HIGH:** the documented recovery step, `cadence sync
+--reset-sync-base`, can silently discard a genuine unsynced local edit and
+report success, on the exact class of case its own docstring claims is
+safe ("can only turn a real edit into a conflicts entry ... never silently
+drop one" — not true).
+
+Repro: client A creates and pushes a task. Client B pulls it untouched.
+A edits it and pushes again. B's own `.history` gets externally rewritten
+(simulated: `git commit --amend` on B's HEAD). B, unaware, edits its own
+copy of the same task (a real, deliberate, never-yet-synced change). B
+syncs — guard correctly fires (`HistoryRewritten`, exit 2). B follows the
+error's own suggested recovery, `cadence sync --remote ... --reset-sync-base`
+— and the CLI reports `Synced with origin: pulled 1, pushed 0. Up to date.`,
+exit 0, no warning, no conflict. B's edit is simply gone; B's list now
+matches A's, byte for byte, as if B never touched the task.
+
+Root cause, confirmed by direct git inspection of B's own `--first-parent`
+log for the task's file: `--reset-sync-base` clears `refs/cadence/sync-base`
+so the same call's diff runs with `base_ref = None` — the code path meant
+for a client's true first-ever sync. That path's `_first_sync_task_base`
+picks the client's *most recent* self-authored commit for the row as a
+stand-in "base," which is only valid on a genuine first sync (where a
+client's current content and its pre-sync history are the same thing by
+definition). After a reset on an already-multi-synced store, that "most
+recent self commit" can *be* the very local edit under evaluation — here
+it was — making `mine_changed` read `False` when the row has actually
+diverged on both sides. The merge loop's `elif theirs_changed:` branch
+(no `mine_changed`) then pulls theirs over mine with no conflict raised.
+
+Not relay/hub-specific — general to any client that (a) has synced with
+peers before, (b) needs `--reset-sync-base` after a real external rewrite,
+and (c) has one unsynced local edit on a row the remote independently
+touched too. Same underlying `Store.sync()` is called from both `cli.py`
+and `mcp_server.py`'s `sync_tasks` (`reset_sync_base` param on both), so
+this affects the MCP agent surface identically, not just the CLI — same
+function, not re-implemented per surface, so not separately re-demonstrated.
+
+What held: reset with no divergent edit present at the time (correctly
+"Already in sync," no spurious conflicts, since the `m_fp == t_fp`
+shortcut skips the flawed base lookup for any row that already agrees);
+the core rewrite guard on both `sync` and `undo`; a never-synced
+single-client store is unaffected by any of this (guarded by `sync_base
+is not None` / `base_ref is not None`).
+
+Full repro, root-cause trace, and suggested fix direction (not fixed by
+Red Team):
+`/workspace/redteam_0234_indep/findings/2026-09-05-0234-reset-sync-base-silent-overwrite.md`.
+Ranked above every other currently-open finding (there are none) — this is
+the one I'd fix first: it defeats, silently, the safety promise of the
+recovery path 0.2.34 shipped specifically for the chairman's own question.
