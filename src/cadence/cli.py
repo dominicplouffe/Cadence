@@ -782,6 +782,29 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_export_file(path: str, payload: str) -> None:
+    """Write export JSON to `path`, turning a bad path into a field error
+    (§4.4: two sentences, exit 1) instead of letting it fall through to
+    main()'s internal-error handler. Export never touches the task store,
+    so a bad --out path is always the caller's mistake, never Cadence's."""
+    try:
+        with open(path, "w") as f:
+            f.write(payload + "\n")
+    except IsADirectoryError:
+        _err(
+            f"can't write to '{path}': it's a directory, not a file. "
+            f"Try: cadence export --out {path.rstrip('/')}/tasks.json"
+        )
+    except FileNotFoundError:
+        parent = os.path.dirname(path) or "."
+        _err(
+            f"can't write to '{path}': directory '{parent}' doesn't exist. "
+            f"Try: mkdir -p {parent} && cadence export --out {path}"
+        )
+    except OSError as exc:
+        _err(f"can't write to '{path}': {exc.strerror or exc}. Check the path and try again.")
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     fmt = args.format or "json"
     if fmt not in ("json", "table"):
@@ -797,13 +820,11 @@ def cmd_export(args: argparse.Namespace) -> int:
         return 0
     payload = json.dumps(tasks, indent=2)
     if args.out:
-        with open(args.out, "w") as f:
-            f.write(payload + "\n")
+        _write_export_file(args.out, payload)
         print(f"Exported {len(tasks)} tasks to {args.out}")
     else:
         default_name = f"cadence-export-{datetime.date.today().isoformat()}.json"
-        with open(default_name, "w") as f:
-            f.write(payload + "\n")
+        _write_export_file(default_name, payload)
         print(f"Exported {len(tasks)} tasks to {default_name}")
     return 0
 

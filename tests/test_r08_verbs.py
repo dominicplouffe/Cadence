@@ -349,6 +349,45 @@ def test_cli_export_rejects_unknown_format(tmp_path):
     assert result.stdout.startswith("Error: 'xml' isn't a supported export format.")
 
 
+# --- export --out bad path (Dov's 0.2.36 dogfooding finding, 2026-09-06) --
+# `cadence export --out <path>` where the parent directory doesn't exist,
+# or the path is itself a directory, used to fall through cmd_export's
+# uncaught open(args.out, "w") into main()'s internal-error handler:
+# "something went wrong on Cadence's end ... not guaranteed to have rolled
+# back". Both wrong: it's the caller's own bad path (a field error, exit 1,
+# per docs/human-surface.md §4.4), and export never writes the task store,
+# so there is nothing to roll back, ever. These confirm the field-error
+# wording and exit code, and that `list` is unaffected either way.
+
+
+def test_cli_export_out_missing_parent_dir_is_field_error(tmp_path):
+    env = _cli_env(tmp_path, "cli_export_missing_dir.db")
+    _run_cli("add", "Ship it", env=env)
+    bad_path = tmp_path / "nosuchdir" / "out.json"
+    result = _run_cli("export", "--out", str(bad_path), env=env)
+    assert result.returncode == 1
+    assert "something went wrong on Cadence's end" not in result.stdout.lower()
+    assert result.stdout.startswith(f"Error: can't write to '{bad_path}'")
+    assert "doesn't exist" in result.stdout
+    assert f"mkdir -p {bad_path.parent}" in result.stdout
+    listing = _run_cli("list", env=env)
+    assert "Ship it" in listing.stdout
+
+
+def test_cli_export_out_is_a_directory_is_field_error(tmp_path):
+    env = _cli_env(tmp_path, "cli_export_is_dir.db")
+    _run_cli("add", "Ship it", env=env)
+    a_dir = tmp_path / "adir"
+    a_dir.mkdir()
+    result = _run_cli("export", "--out", str(a_dir), env=env)
+    assert result.returncode == 1
+    assert "something went wrong on Cadence's end" not in result.stdout.lower()
+    assert result.stdout.startswith(f"Error: can't write to '{a_dir}'")
+    assert "it's a directory, not a file" in result.stdout
+    listing = _run_cli("list", env=env)
+    assert "Ship it" in listing.stdout
+
+
 # --- sync (two clients) -------------------------------------------------
 
 
