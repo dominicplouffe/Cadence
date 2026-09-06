@@ -4714,3 +4714,71 @@ claimed to.
 Board's empty for Red Team.
 
 ---
+
+## 2026-09-06 (Rafael Okonkwo, Build) — 0.2.37: fix cmd_export misclassifying a bad --out path as an internal error (Dov's MEDIUM finding)
+
+Fixed the classification/wording bug from Dov's week-3 pass above.
+`cmd_export` (`cli.py` ~L785-807) wrote the export file with a bare,
+uncaught `open(path, "w")` — once for `--out`, once for the default
+timestamped filename. Any `OSError` from either (missing parent
+directory, path is a directory, permission denied) fell through to
+`main()`'s last-resort `except Exception` handler (~L1007-1014), built
+for genuine internal/store breakage: "something went wrong on
+Cadence's end ... not guaranteed to have rolled back," exit 2. Wrong
+twice over — a bad `--out` path is the caller's own mistake, fixable by
+editing the request (a field error per §4.4, exit 1), and `export`
+never writes the task store (`store.export()` only reads, via
+`self.list(status="all")`), so there is nothing to roll back on this
+path, ever.
+
+Fix: new `_write_export_file(path, payload)` wraps both `open(...,
+"w")` sites and turns `FileNotFoundError` / `IsADirectoryError` /
+other `OSError` into a two-sentence field error (exit 1) naming the
+path and an exact runnable fix, wording from Noor:
+
+```
+Error: can't write to 'nosuchdir/out.json': directory 'nosuchdir'
+doesn't exist. Try: mkdir -p nosuchdir && cadence export --out
+nosuchdir/out.json
+
+Error: can't write to 'adir': it's a directory, not a file. Try:
+cadence export --out adir/tasks.json
+```
+
+Added two regression tests in `tests/test_r08_verbs.py` (missing
+parent dir, path is a directory): assert exit 1, the field-error
+wording, no "something went wrong" text, and `cadence list` unaffected
+either way — verifying export's read-only claim rather than assuming
+it. Full suite: 175 passed (`venv/bin/python -m pytest -q`).
+
+Published 0.2.37 to PyPI via the version-bump-triggers-publish CI path
+(push to main, commit 58e2609): CI green
+(https://github.com/dominicplouffe/Cadence/actions/runs/34015999964),
+Publish green
+(https://github.com/dominicplouffe/Cadence/actions/runs/34016000017),
+live at https://pypi.org/project/cadence-todo/0.2.37/.
+
+Re-ran Dov's exact repro against the real published wheel, fresh venv
+outside the repo:
+
+```
+$ cadence add "x"
+$ cadence export --out nosuchdir/out.json; echo exit=$?
+Error: can't write to '.../nosuchdir/out.json': directory
+'.../nosuchdir' doesn't exist. Try: mkdir -p .../nosuchdir && cadence
+export --out .../nosuchdir/out.json
+exit=1
+
+$ mkdir -p adir && cadence export --out adir; echo exit=$?
+Error: can't write to '.../adir': it's a directory, not a file. Try:
+cadence export --out .../adir/tasks.json
+exit=1
+
+$ cadence list
+  [ ]    1   x
+```
+
+No "something went wrong on Cadence's end" text either time, exit 1
+both times, `list` shows the task untouched. task_01a075581cdfe7660c147d9e.
+
+---
