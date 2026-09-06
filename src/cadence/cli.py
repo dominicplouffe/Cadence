@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib.metadata
 import json
 import os
 import shutil
@@ -859,9 +860,23 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cadence_version() -> str:
+    try:
+        return importlib.metadata.version("cadence-todo")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown (not installed as a package)"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cadence", description="Cadence: a todo list for people and agents."
+    )
+    parser.add_argument(
+        "--version",
+        "-V",
+        action="version",
+        version=f"cadence {_cadence_version()}",
+        help="Print the installed Cadence version and exit.",
     )
     sub = parser.add_subparsers(dest="cmd")
 

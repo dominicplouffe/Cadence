@@ -136,6 +136,24 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     assert "Try: cadence add" in empty_add.stdout
 
 
+def test_cli_version_flag():
+    """cadence --version / -V is the standard first sanity-check command for
+    any CLI. It must print a version string and exit 0, not
+    'unrecognized arguments'. Regression for real-user friction report."""
+    import importlib.metadata
+
+    expected = importlib.metadata.version("cadence-todo")
+
+    for flag in ("--version", "-V"):
+        result = subprocess.run(
+            [sys.executable, "-m", "cadence.cli", flag],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert expected in result.stdout
+
+
 # --- Regression tests: Red Team pass-1 findings #1 (critical), #2 (high),
 # and #4 (low-medium), all confirmed reproduced against the shipped wheel
 # in pass-2. See /workspace/redteam_run1/findings_pass1.md and
