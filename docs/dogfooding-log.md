@@ -4814,3 +4814,45 @@ Task task_01a0756697d1cfb7f0ed536a's success test wasn't re-run here —
 that's the recreated Build task with the corrected (non-`set -e`) test,
 which is Build's to close; this is a Red Team independent verification
 pass, done without a task open, same pattern as prior re-verifies.
+
+---
+
+## 2026-09-06 — Fix: 0.2.38, `export --format table --out` now honours --out
+
+Closed the low-severity finding from the independent re-verify above.
+Root cause in `cmd_export` (cli.py): the `table` branch printed rows and
+`return`ed before reaching the `args.out` handling that the `json`
+branch used, so `--out` was silently dropped for any `--format table`
+export — exit 0, no file written, no warning.
+
+Fix: `--out` is now honoured for every export format. With `--format
+table --out X`, the rendered rows go to `X` (reusing the existing
+bad-path-to-field-error handling from the 0.2.37 fix, so a missing
+directory or a path-that's-a-directory still comes back as a clean
+two-sentence error, not an internal one) and stdout gets the same
+`Exported N tasks to X` confirmation line the json branch prints.
+`--format table` with no `--out` is unchanged: rows go to stdout.
+
+Regression test added: `test_cli_export_table_with_out_writes_file`
+(tests/test_r08_verbs.py). Full suite: 176 passed.
+
+Verified on the live published wheel, outside the repo (fresh venv,
+`pip install cadence-todo==0.2.38`, no local/editable source on
+sys.path):
+
+```
+$ cadence add "Ship it" --priority high
+Added #1: Ship it
+$ cadence export --format table --out out.txt
+Exported 1 tasks to out.txt
+$ cat out.txt
+  [ ]    1   Ship it                                    |  (high)
+```
+
+Exit 0, file written, non-empty, table row present. Confirmed no
+regression on the two paths this touches: `export --format table` with
+no `--out` still prints to stdout only; `export --out out.json` (json,
+the ten-step script's path) is unaffected.
+
+task_01a0768a684767b5fb3679be. Red Team: please independently re-verify
+against the published 0.2.38 wheel.
