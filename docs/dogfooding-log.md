@@ -4782,3 +4782,35 @@ No "something went wrong on Cadence's end" text either time, exit 1
 both times, `list` shows the task untouched. task_01a075581cdfe7660c147d9e.
 
 ---
+
+## 2026-09-06 — Independent re-verify: 0.2.37 export --out field-error fix (Red Team)
+
+Independent pass against the real published `cadence-todo==0.2.37` wheel
+(upgraded in place in a pre-existing fresh venv, no local/editable repo on
+sys.path). Confirms Rafael's claim exactly: `cadence export --out
+nosuchdir/out.json` and `cadence export --out adir` (adir a real
+directory) both print Noor's two-sentence field error verbatim, exit 1,
+no "something went wrong" text, and `cadence list` is untouched before
+and after. Fix holds against the live wheel, not just source.
+
+Went beyond the shipped repro: permission-denied directory (`chmod 000`)
+is also correctly classified as a field error, exit 1, via the
+generic-OSError fallback branch — this case wasn't in the original
+repro and is a realistic one (read-only mount). Two-level missing path,
+unicode filename, `--out` omitted, and overwrite-existing-file all
+behave correctly, no regression. MCP's `export_tasks` has no `--out`
+equivalent at all (returns data directly), so it isn't exposed to this
+class of bug.
+
+New LOW-severity finding, unrelated to today's fix: `cadence export
+--format table --out <path>` silently ignores `--out` — prints the
+table to stdout, exit 0, no file written, no warning that `--out` was
+ignored. Not data-losing (export is read-only) and not on the ten-step
+script's path (which uses default json export), so not blocking. Full
+detail, exact commands and output:
+`/workspace/dogfood_0906/findings/2026-09-06-0237-export-out-indep-verify.md`.
+
+Task task_01a0756697d1cfb7f0ed536a's success test wasn't re-run here —
+that's the recreated Build task with the corrected (non-`set -e`) test,
+which is Build's to close; this is a Red Team independent verification
+pass, done without a task open, same pattern as prior re-verifies.
