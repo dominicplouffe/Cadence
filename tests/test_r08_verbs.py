@@ -341,6 +341,24 @@ def test_cli_export_table_reuses_list_row_format(tmp_path):
     assert exported.stdout.strip() == listing.stdout.strip()
 
 
+def test_cli_export_table_with_out_writes_file(tmp_path):
+    # Dov's 0.2.37 dogfooding finding: `export --format table --out X` used
+    # to print the table to stdout, return 0, and write nothing to X at all
+    # — a silent no-op on the flag the caller actually gave. --out must now
+    # be honoured for every format: the rendered rows go to the file, and
+    # only the confirmation line goes to stdout.
+    env = _cli_env(tmp_path, "cli_export_table_out.db")
+    _run_cli("add", "Ship it", "--priority", "high", env=env)
+    out_path = tmp_path / "out.txt"
+    result = _run_cli("export", "--format", "table", "--out", str(out_path), env=env)
+    assert result.returncode == 0, result.stderr
+    assert out_path.exists()
+    content = out_path.read_text()
+    assert content.strip() != ""
+    assert "Ship it" in content
+    assert result.stdout.strip() == f"Exported 1 tasks to {out_path}"
+
+
 def test_cli_export_rejects_unknown_format(tmp_path):
     env = _cli_env(tmp_path, "cli_export_bad.db")
     _run_cli("add", "Ship it", env=env)

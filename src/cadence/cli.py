@@ -815,8 +815,13 @@ def cmd_export(args: argparse.Namespace) -> int:
         width = shutil.get_terminal_size(fallback=(80, 24)).columns
         from cadence.store import Task as _Task
 
-        for t in tasks:
-            print(_render_row(_Task(**t), width))
+        rows = [_render_row(_Task(**t), width) for t in tasks]
+        if args.out:
+            _write_export_file(args.out, "\n".join(rows))
+            print(f"Exported {len(tasks)} tasks to {args.out}")
+        else:
+            for row in rows:
+                print(row)
         return 0
     payload = json.dumps(tasks, indent=2)
     if args.out:
