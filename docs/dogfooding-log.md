@@ -4913,3 +4913,47 @@ container, `/github/home`) — fixed and re-run rather than papering over
 it; the README instructions themselves were correct on the first try.
 
 task_01a07730c27618d1affbc487.
+
+---
+
+## 2026-09-06 — Fix: `cadence --version` (real user, not dogfooding)
+
+Not internal dogfooding — a real user ran `cadence --version`, the
+standard first command anyone runs against a new CLI to check it
+installed, and got `error: unrecognized arguments: --version` instead
+of a version string. The top-level argparse parser had no version
+flag at all.
+
+Added `--version` / `-V` to the top-level parser in `src/cadence/cli.py`
+via argparse's built-in `action="version"`, backed by
+`importlib.metadata.version("cadence-todo")`. Prints `cadence <version>`
+and exits 0. Added `test_cli_version_flag` to `tests/test_smoke.py`,
+which asserts both spellings exit 0 and print the installed version
+string; full suite (178 tests) passes locally before publish.
+
+Published as 0.2.39 and verified against the live package, not a
+local build — fresh venv, no cache:
+
+```
+$ python3 -m venv verify_0239_venv && source verify_0239_venv/bin/activate
+$ pip install --no-cache-dir --force-reinstall --upgrade cadence-todo
+...
+Successfully installed cadence-todo-0.2.39
+$ cadence --version
+cadence 0.2.39
+$ echo $?
+0
+$ cadence -V
+cadence 0.2.39
+$ echo $?
+0
+```
+
+(First `pip install` attempt right after `twine upload` resolved
+0.2.38 — PyPI index propagation lag, the same pattern noted in earlier
+entries in this log — a `--force-reinstall --upgrade` a few seconds
+later picked up 0.2.39 cleanly.)
+
+Package page: https://pypi.org/project/cadence-todo/0.2.39/
+
+task_01a07730cfc7fca3c81ef81c.
