@@ -4625,3 +4625,92 @@ until someone happened to cross-check it against a different spec
 document. Worth a standing check whenever a sync/conflict-shaped fix
 ships: re-run the ten-step transcript before calling the fix done, not
 after something else notices the doc disagrees with the code.
+## 2026-09-06 (Dov Ferreira, Red Team) — week-3 dogfooding pass on live 0.2.36: schedule/decompose field errors clean, new MEDIUM finding on `export --out`
+
+Fresh venv, real PyPI `cadence-todo==0.2.36`, no repo on path
+(`/workspace/dogfood_0906/venv`, `pip install cadence-todo==0.2.36`,
+confirmed via `pip show` before running). No task open, straight to the
+log per usual for this series. Focus this pass: the script steps least
+recently exercised — decompose, schedule, export, malformed-request
+recovery — rather than sync/reset-sync-base again, which the last eight
+entries already covered in depth.
+
+**Confirmed clean**: schedule and decompose field errors match
+docs/human-surface.md §4.4 and §4.7 to the letter on the live wheel —
+
+```
+$ cadence schedule 1 tomorrow-ish
+Error: can't parse 'tomorrow-ish' as a date. Try: cadence schedule 1 2026-09-01
+$ cadence schedule 999 2026-09-01
+Error: no task with id 999. Run 'cadence list' to see valid ids.
+$ cadence decompose 1
+Error: 'decompose' needs at least one subtask. Try: cadence decompose 1 --into "Buy flour" "Buy eggs"
+$ cadence decompose 999 --into "x"
+Error: no task with id 999. Run 'cadence list' to see valid ids.
+$ cadence decompose 1 --into t1 t2 ... t21   # 21 subtasks
+Error: 'decompose' takes at most 20 subtasks per call, got 21. Split into two decompose calls.
+```
+
+All exit 1, all the documented two-sentence shape, no stack traces. No
+change needed.
+
+**New finding, MEDIUM**: `cadence export --out <bad-path>` is misclassified
+as an internal/server error (exit 2, Class C wording) when it is a plain
+field error the caller can fix by editing the request — exactly the
+distinction §4.4 exists to enforce. Worse, the wording it gets is false
+for this command specifically: it warns "this is not guaranteed to have
+rolled back... run 'cadence list' to check your tasks," but `export`
+never opens or writes the task store at all, so there is nothing to roll
+back, ever, on this path.
+
+```
+$ cadence add "task for schedule test"
+Added #1: task for schedule test
+
+$ cadence export --out nosuchdir/out.json; echo exit=$?
+Error: something went wrong on Cadence's end (FileNotFoundError: [Errno 2] No such file or directory: 'nosuchdir/out.json'). Unlike a failed sync or undo, this is not guaranteed to have rolled back -- run 'cadence list' to check your tasks before retrying, or check CADENCE_DB_PATH.
+exit=2
+
+$ mkdir -p adir && cadence export --out adir; echo exit=$?
+Error: something went wrong on Cadence's end (IsADirectoryError: [Errno 21] Is a directory: 'adir'). Unlike a failed sync or undo, this is not guaranteed to have rolled back -- run 'cadence list' to check your tasks before retrying, or check CADENCE_DB_PATH.
+exit=2
+
+$ cadence list
+  [ ]    1   task for schedule test
+```
+
+`list` unaffected both times, as it always would be — `cmd_export`
+(cli.py ~L785-807) only ever reads via `store.export()`, then writes the
+`--out` file with a bare, uncaught `open(args.out, "w")`. Any `OSError`
+from that line (bad directory, path is a directory, permission denied)
+falls straight through to `main()`'s last-resort `except Exception`
+(~L1007-1014) — the net meant for genuine internal breakage — instead of
+being caught locally and raised as a field error naming the path and the
+fix. Practical cost: an agent scripting its own `--out` path (exactly
+what the ten-step script's export step does) reads exit 2 and Class C
+wording for its own typo, and per the project's documented exit-code
+contract has no signal that correcting its own argument would help. A
+human reading the rollback warning for a pure path typo gets sent to
+audit task data that was never touched.
+
+No data loss, no corruption — this is a classification/wording bug, not
+a safety one, ranked below every sync/reset-sync-base finding in this log
+for that reason. Full repro, root cause and suggested fix:
+`/workspace/dogfood_0906/findings/2026-09-06-export-out-misclassified-internal-error.md`.
+Not fixed by me. Filed for Build.
+
+**Tried and found nothing new**: unicode task titles
+(`买牛奶 🥛 — call José's café`) through add/schedule/export round-trip
+clean — JSON export escapes to `\uXXXX` (standard `json.dumps` default),
+decodes back to the exact original string, nothing lost or mangled;
+duplicate `--into` subtask titles on decompose are accepted as two
+distinct subtasks with distinct ids (no dedup promised anywhere, not a
+bug); `export --format table` on an empty store prints zero rows and
+exits 0 with no summary line at all (unlike `--format json`'s "Exported 0
+tasks to...") — quiet, not wrong, and unrelated to `list`'s own separate
+"No tasks yet" empty-state hint, which export doesn't share and isn't
+claimed to.
+
+Board's empty for Red Team.
+
+---
