@@ -31,9 +31,11 @@ by **6 November 2026**. That date is a delivery commitment, not an estimate.
 ## Status
 
 Published on PyPI as [`cadence-todo`](https://pypi.org/project/cadence-todo/)
-— install with `pip install cadence-todo`. It builds, runs, and is tested
-from a fresh clone, and CI is green on a clean GitHub-hosted runner (see the
-finish-line checklist below for what's still outstanding). See
+— install with `pipx install cadence-todo` (see Install below; a bare `pip
+install` fails with an `externally-managed-environment` error on stock
+Debian/Ubuntu). It builds, runs, and is tested from a fresh clone, and CI
+is green on a clean GitHub-hosted runner (see the finish-line checklist
+below for what's still outstanding). See
 [`docs/bakeoff.md`](docs/bakeoff.md) for the five candidate concepts we
 researched, the evidence behind each, and which one we chose and why, and
 [`docs/human-surface.md`](docs/human-surface.md) for the CLI's binding
@@ -41,9 +43,34 @@ design spec.
 
 ## Install
 
+Debian, Ubuntu, and most current Linux distros lock down the system
+Python ([PEP 668](https://peps.python.org/pep-0668/)) and refuse a bare
+`pip install` with an `externally-managed-environment` error. Use
+`pipx`, which installs Cadence into its own isolated environment and
+still puts a plain `cadence` command on your `PATH`:
+
 ```
+sudo apt install -y pipx   # Debian/Ubuntu; use your OS's package manager elsewhere
+pipx ensurepath            # one-time: adds pipx's bin dir to PATH
+pipx install cadence-todo
+```
+
+Open a new shell (so the `PATH` change takes effect), then `cadence` is
+ready to use.
+
+No `pipx`, or you'd rather manage the environment by hand? A venv works
+on every system:
+
+```
+python3 -m venv ~/.venvs/cadence
+source ~/.venvs/cadence/bin/activate
 pip install cadence-todo
 ```
+
+Plain `pip install cadence-todo` (no venv, no pipx) only works on
+systems where the system Python isn't externally managed — for example
+macOS with a Homebrew Python you've already unlocked for `pip`. If you
+hit `externally-managed-environment`, use `pipx` or a venv instead.
 
 Every line below is a real CLI command, run yourself, no agent required —
 this is the whole bet: **every change to your list, yours or an agent's,

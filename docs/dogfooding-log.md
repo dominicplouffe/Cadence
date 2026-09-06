@@ -4856,3 +4856,60 @@ the ten-step script's path) is unaffected.
 
 task_01a0768a684767b5fb3679be. Red Team: please independently re-verify
 against the published 0.2.38 wheel.
+
+---
+
+## 2026-09-06 — Fix: README install docs, `pipx`-first (real user, not dogfooding)
+
+Not internal dogfooding — the chairman tested the README verbatim on a
+stock Ubuntu server and hit a real bug in our docs: `pip install --user
+cadence-todo`, the README's own first instruction, fails with PEP 668's
+`error: externally-managed-environment` on any current Debian/Ubuntu.
+The package itself was never broken; the instructions we told people to
+run were.
+
+Rewrote the README's Status line and Install section to lead with
+`pipx install cadence-todo` (isolated environment, `cadence` still lands
+on `PATH`), with a `python3 -m venv` fallback for anyone without `pipx`.
+Plain `pip install cadence-todo` is now presented as the option that
+only works on systems whose Python isn't externally managed, with the
+PEP 668 error named so anyone who hits it knows to use one of the other
+two paths.
+
+Verified on an actual clean image, not a GitHub-hosted runner with
+python/pip/pipx already on it: a one-off job with `container: image:
+ubuntu:24.04` (bare, no pipx pre-installed — confirmed with `command -v
+pipx` failing before the install steps), running the exact README
+commands (`apt install -y pipx`, `pipx ensurepath`, `pipx install
+cadence-todo`, then a fresh-shell `cadence list`). No local Docker was
+available to run this project's sandbox, so a scratch GitHub Actions
+workflow on a throwaway branch (`verify-pipx-scratch`, deleted after)
+stood in for `docker run -it ubuntu:24.04` — same clean-container
+guarantee, same base image, publicly-auditable run log instead of a
+local transcript:
+https://github.com/dominicplouffe/Cadence/actions/runs/34040568782
+
+Real output from that run, in full:
+
+```
+$ apt install -y pipx
+...
+installed package cadence-todo 0.2.38, installed using Python 3.12.3
+These apps are now globally available
+    - cadence
+$ . "$HOME/.profile"   # what a real new login shell does automatically
+$ which cadence
+/github/home/.local/bin/cadence
+$ cadence list
+No tasks yet. Add one:
+  cadence add "Buy milk"
+```
+
+No `externally-managed-environment` error anywhere in the run. First
+attempt (run 34040468211, same branch) failed for an unrelated reason —
+the verification script guessed pipx's install path wrong
+(`/root/.local/bin` instead of the real `$HOME` inside a GH Actions
+container, `/github/home`) — fixed and re-run rather than papering over
+it; the README instructions themselves were correct on the first try.
+
+task_01a07730c27618d1affbc487.
