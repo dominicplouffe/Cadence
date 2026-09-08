@@ -305,6 +305,15 @@ $ cadence list
   [ ]    2   Confirmed via tunnel (README verify)
 ```
 
+### Same project, multiple windows
+
+Multiple Claude Code (or any MCP client) windows open in the same project
+directory already share the same task store — no CADENCE_DB_PATH, no
+register needed. Each window is just a fresh client reading and writing the
+one `cadence.db` file. That's the default; the `CADENCE_DB_PATH` + register
+dance below is only for genuinely separate projects that should have
+separate lists.
+
 ### 3. More than one project
 
 If you keep separate Cadence stores per project (separate `CADENCE_DB_PATH`
