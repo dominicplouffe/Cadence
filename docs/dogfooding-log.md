@@ -4957,3 +4957,77 @@ later picked up 0.2.39 cleanly.)
 Package page: https://pypi.org/project/cadence-todo/0.2.39/
 
 task_01a07730cfc7fca3c81ef81c.
+
+---
+
+## 2026-09-11 (Dov Ferreira, Red Team) — week-3 dogfooding, day 1: clean pass
+
+Week 3 starts today: the company's real queue is R-07 itself (every
+other requirement is MET, the platform board has nothing else open),
+tracked in the live-installed store at `/workspace/company_queue`
+(cadence-todo 0.2.39 from PyPI, fresh venv, no repo on `sys.path` —
+confirmed `import cadence` fails in that venv's plain `python3`, only
+`pip show cadence-todo` resolves it).
+
+Today's actual use, against that real store:
+
+```
+$ cadence list
+  [ ]    1   R-07: log week-3 dogfooding friction daily in
+             docs/dogfooding-log.md (09-11 onward)  |  due 2026-09-18
+
+$ cadence decompose 1 --into "Day 1 (09-11): write dated log entry" \
+    "Day 2 (09-12): write dated log entry" \
+    "Day 3 (09-15): write dated log entry, close R-07"
+Decomposed #1 into 3 subtasks: #2, #3, #4
+
+$ cadence schedule 2 09-11
+Error: can't parse '09-11' as a date. Try: cadence schedule 2 2026-09-01
+$ echo $?
+1
+$ cadence schedule 2 2026-09-11
+Scheduled #2 for 2026-09-11: Day 1 (09-11): write dated log entry
+
+$ cadence reprioritise 2 high
+Reprioritised #2 (none → high): Day 1 (09-11): write dated log entry
+
+$ cadence done 2
+Done #2: Day 1 (09-11): write dated log entry
+$ cadence undo
+Undid: Done #2 → reopened "Day 1 (09-11): write dated log entry"
+$ cadence done 2
+Done #2: Day 1 (09-11): write dated log entry
+
+$ cadence export --format json --out export-2026-09-11.json
+Exported 4 tasks to export-2026-09-11.json
+
+$ cadence why 1
+#1 R-07: ... — history (newest first):
+  -  none     1d ago   Scheduled for 2026-09-18 ...
+  -  none     1d ago   Created
+```
+
+This is decompose (a vague "log friction daily" turned into three real
+dated subtasks), schedule with a deliberately malformed date first,
+reprioritise, done, undo, redo, query (`list`/`why`), and export —
+seven of the ten-step script's operations, run against the real
+open item rather than synthetic data.
+
+Found nothing wrong. The malformed-date rejection is exactly the
+shape the finish line wants: exit 1, names the bad input verbatim,
+shows the correct form as a next step, no stack trace. `undo` reversed
+exactly the one prior change (the `done`) and nothing else — the two
+sibling subtasks and the parent's own history were untouched. Export
+produced valid, complete JSON including the two subtasks created this
+same run and the priority/due fields set on #2.
+
+One earlier, already-known limitation re-confirmed rather than
+rediscovered: there is no `cadence show <id>` — `list` (which prints
+the whole tree) is the only way to look at one task, `why <id>` is
+close but shows history, not current field values. Not new, not
+blocking today's use, noting it again only because it is a genuine
+piece of friction a real user still hits (raised previously, not yet
+filed as its own fix task).
+
+Net for today: clean pass, no new defect. #2 (Day 1) is done; #3 and
+#4 remain for the rest of the week.
