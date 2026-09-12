@@ -108,8 +108,11 @@ Undid: Reprioritised #2 (none → high) undone: Book a venue
 
 That `why` line is the payoff: a straight answer to "why did this change,"
 without you ever opening git, a hidden folder, or asking your agent to
-explain itself. `cadence list` and `cadence done <id>` work exactly the
-way you'd expect from any todo CLI — full command reference below.
+explain itself. Want just one task's current fields instead of its whole
+history, or the whole tree `list` prints? `cadence show 2` prints task 2's
+title, status, priority, due date, and any parent/subtask links, nothing
+else. `cadence list` and `cadence done <id>` work exactly the way you'd
+expect from any todo CLI — full command reference below.
 
 By default tasks live in `~/.cadence/cadence.db` (a local SQLite file) with
 a git-backed history alongside it. Set `CADENCE_DB_PATH` to point at a
@@ -117,7 +120,7 @@ scratch file instead (used by the test suite and useful for an agent that
 wants an isolated store).
 
 Start the MCP server (agent surface) over stdio, exposing tools such as
-`add_task`, `list_tasks`, `complete_task`, `schedule_task`,
+`add_task`, `list_tasks`, `show_task`, `complete_task`, `schedule_task`,
 `decompose_task`, `reprioritise_task`, `undo`, and `sync_tasks` with
 structured JSON returns:
 

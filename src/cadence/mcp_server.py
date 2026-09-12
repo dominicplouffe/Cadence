@@ -570,6 +570,44 @@ def reprioritise_task(id: int, priority: str, reason: Optional[str] = None) -> d
 
 
 @mcp.tool()
+def show_task(id: int) -> dict:
+    """Show one task's current fields: title, status, priority, due date,
+    and any parent/subtask links. Not history -- use why_task(id) for the
+    change log; this is just "what does task 7 look like right now".
+
+    Args:
+        id: Numeric task id, as returned by add_task or list_tasks.
+
+    Returns:
+        {"ok": true, "task": {id, title, status, priority, due,
+        created_at, completed_at, parent_id}, "parent": {"id", "title"} or
+        null, "subtasks": [{"id", "title", "status"}, ...]} on success, or
+        {"ok": false, "error": "task_not_found", "message", "hint"} if the
+        id doesn't exist.
+    """
+    try:
+        store = Store()
+        task = store.get(id)
+        all_tasks = store.list(status="all")
+        parent = None
+        if task.parent_id is not None:
+            parent = next((t for t in all_tasks if t.id == task.parent_id), None)
+        children = sorted(
+            (t for t in all_tasks if t.parent_id == task.id), key=lambda t: t.id
+        )
+        return {
+            "ok": True,
+            "task": task.to_dict(),
+            "parent": {"id": parent.id, "title": parent.title} if parent else None,
+            "subtasks": [{"id": c.id, "title": c.title, "status": c.status} for c in children],
+        }
+    except CadenceError as exc:
+        return _err(exc)
+    except Exception as exc:
+        return _err_unexpected(exc)
+
+
+@mcp.tool()
 def why_task(id: int) -> dict:
     """Show a task's git-backed change history as a plain-language timeline.
 

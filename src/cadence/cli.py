@@ -15,6 +15,7 @@ Usage:
     cadence schedule <id> <due-date>
     cadence decompose <id> --into "Subtask A" "Subtask B"
     cadence reprioritise <id> <low|med|high>
+    cadence show <id>                # show this task's current fields (no history)
     cadence why <id>                # show this task's history, plain language
     cadence undo
     cadence sync [--remote PATH] [--keep-mine ID | --keep-theirs ID]
@@ -505,6 +506,44 @@ def cmd_reprioritise(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_show(args: argparse.Namespace) -> int:
+    """`cadence show <id>`: one task's current fields, no history.
+
+    Dogfooding 2026-09-11 (R-07, day 1): `list` prints the whole tree and
+    `why` prints history, not current state -- neither answers "what are
+    task 7's fields right now" on its own. This is that single-item view:
+    id, title, status, priority, due date, and parent/subtask links,
+    nothing else -- `why <id>` is still the place for the change log.
+    """
+    task_id = _require_id(args.id)
+    store = Store()
+    try:
+        task = store.get(task_id)
+    except CadenceError as exc:
+        _err(_format_err(exc))
+    all_tasks = store.list(status="all")
+    parent = None
+    if task.parent_id is not None:
+        parent = next((t for t in all_tasks if t.id == task.parent_id), None)
+    children = sorted((t for t in all_tasks if t.parent_id == task.id), key=lambda t: t.id)
+
+    print(f"#{task.id} {task.title}")
+    print(f"  status:    {task.status}")
+    print(f"  priority:  {task.priority or 'none'}")
+    print(f"  due:       {task.due or '(none)'}")
+    if parent is not None:
+        print(f"  parent:    #{parent.id} ({parent.title})")
+    elif task.parent_id is not None:
+        # Parent id recorded but the row itself is gone -- shouldn't happen
+        # in practice (tasks are never hard-deleted), but naming the raw id
+        # beats silently dropping the link.
+        print(f"  parent:    #{task.parent_id} (not found)")
+    if children:
+        child_list = ", ".join(f"#{c.id} ({c.status})" for c in children)
+        print(f"  subtasks:  {child_list}")
+    return 0
+
+
 def cmd_why(args: argparse.Namespace) -> int:
     task_id = _require_id(args.id)
     store = Store()
@@ -942,6 +981,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_repri.add_argument("priority")
     p_repri.add_argument("--reason", help="Optional: why, for 'cadence why' to show later")
     p_repri.set_defaults(func=cmd_reprioritise)
+
+    p_show = sub.add_parser(
+        "show",
+        help="Show one task's current fields (no history). Example: cadence show 2",
+    )
+    p_show.add_argument("id")
+    p_show.set_defaults(func=cmd_show)
 
     p_why = sub.add_parser(
         "why", help="Show why a task changed. Example: cadence why 2"
