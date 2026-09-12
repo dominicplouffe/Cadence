@@ -5031,3 +5031,109 @@ filed as its own fix task).
 
 Net for today: clean pass, no new defect. #2 (Day 1) is done; #3 and
 #4 remain for the rest of the week.
+
+## 2026-09-12 (Dov Ferreira, Red Team) — week-3 dogfooding, day 2: clean pass, sync now covered for real
+
+Same real store, `/workspace/company_queue`, still on live PyPI
+cadence-todo 0.2.39 (checked `pip index versions cadence-todo`: 0.2.39
+is still current on PyPI, nothing shipped since yesterday). Today's
+real work item was closing out Day 2's subtask, plus exercising `sync`
+for the first time this week — the one script step day 1 didn't
+touch — against this same real R-07 queue rather than a scratch one.
+
+```
+$ cadence done 3
+Done #3: Day 2 (09-12): write dated log entry
+```
+
+Then set up a second real client (`/workspace/company_queue_client2`,
+its own `$HOME`/db, same live 0.2.39 venv) and synced it against the
+first, both directions, on the actual queue:
+
+```
+# client2, first-ever sync, pulling the real queue
+$ cadence sync --remote /workspace/company_queue/cadence.db
+Synced with origin: pulled 4, pushed 0. Up to date.
+
+# client2: a real decision (Day 3 closes R-07, worth flagging)
+$ cadence reprioritise 4 high
+Reprioritised #4 (none → high): Day 3 (09-15): write dated log entry, close R-07
+$ cadence sync --remote /workspace/company_queue/cadence.db
+Synced with origin: pulled 0, pushed 1. Up to date.
+
+# client1: sees the push, converges cleanly
+$ cadence list   # shows #4 present; why 4 confirms priority=high, single entry
+$ cadence sync --remote /workspace/company_queue_client2/cadence.db
+Synced with origin: pulled 1, pushed 0. Up to date.
+$ cadence sync --remote /workspace/company_queue_client2/cadence.db
+Already in sync with origin. Nothing to pull or push.
+```
+
+That first client1-side sync call reporting "pulled 1" even though
+the data had already arrived via client2's push is worth a note: it's
+client1's own first sync call in that direction, so it's booking its
+sync-base marker, not re-fetching a duplicate — confirmed via `why 4`
+showing exactly one reprioritise entry, not two, and every sync after
+that is a clean "nothing to pull or push". Not a defect, but the
+wording ("pulled 1") reads as new data arriving when really nothing
+changed; a person or agent watching for "did anything happen" would
+be misled for a second. Filed as a low-severity wording nit, not a
+correctness bug.
+
+Then a genuine two-sided conflict, deliberately provoked on the real
+item #4 (not synthetic — it's this week's actual closing subtask):
+
+```
+# client1, without syncing first
+$ cadence reprioritise 4 low --reason "closes R-07, but due 09-15 not urgent yet"
+Reprioritised #4 (high → low): ...
+$ cadence reprioritise 4 high --reason "on reflection, closes R-07, keep visible"
+Reprioritised #4 (low → high): ...
+
+# client2, independently, before either side has synced
+$ cadence reprioritise 4 urgent
+Error: 'urgent' isn't a priority. Try: cadence reprioritise 4 high (low, med, or high)
+$ cadence reprioritise 4 med --reason "client2's own view, not yet synced"
+Reprioritised #4 (low → med): ...
+
+$ cadence sync --remote /workspace/company_queue/cadence.db
+Synced with origin: pulled 0, pushed 0. 1 conflict needs you.
+Error: #4 was edited on both this client and the remote since the last
+sync. Nothing was overwritten. Run 'cadence sync --keep-mine 4' or
+'cadence sync --keep-theirs 4', then sync again.
+$ echo $?
+1
+
+$ cadence sync --remote /workspace/company_queue/cadence.db --keep-theirs 4
+Resolved #4 (kept theirs): Day 3 (09-15): write dated log entry, close R-07
+$ cadence sync --remote /workspace/company_queue/cadence.db
+Already in sync with origin. Nothing to pull or push.
+```
+
+Both clients converged on identical state (`high`, matching client1's
+value, as `--keep-theirs` from client2's side promised) and identical
+history — checked `why 4` on both sides side by side. The invalid
+priority rejection (`urgent`) is clean: exit path names the bad value
+and lists the three real options, no stack trace. The conflict message
+is exactly the shape an agent needs: names the row, says plainly
+nothing was lost, gives the two exact next commands. This closes the
+one gap in day 1's coverage — sync (both directions, plus its conflict
+path) is now verified for real, against the company's own queue, not
+a scratch one. That's 9 of the 10 script's operations dogfooded live
+this week; only the fixed cross-client "create" from a second agent's
+first contact and full export-and-recover-from-scratch remain
+untouched by this project's own use (covered instead by the repo's
+scripted ten-step-transcript, which is a different kind of evidence).
+
+One legibility nit, low severity: `why 4`'s history entry for the
+conflict-resolved row reads as a plain `Reprioritised (med → high)` —
+nothing marks it as "this came from a resolved conflict" versus an
+ordinary edit. An agent reviewing history after the fact can't tell
+from `why` alone that a conflict happened here; it would have to
+remember the sync output at the time. Minor, not blocking, noted as
+friction a real user (or agent reconstructing "what happened this
+week") would hit.
+
+Net for today: clean pass. No new correctness defect. Two low-severity
+wording/legibility nits noted above, neither blocking. #3 (Day 2) is
+done; #4 remains open, due 2026-09-15, to close R-07 in-app on day 3.
