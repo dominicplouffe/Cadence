@@ -77,6 +77,18 @@ def test_cli_show_parent_lists_its_subtasks(tmp_path):
     assert "parent:" not in out
 
 
+def test_cli_home_flag_scopes_store_like_cadence_home_env(tmp_path):
+    home = tmp_path / "scratch_home"
+    env = {**os.environ}
+    env.pop("CADENCE_DB_PATH", None)
+    added = _run_cli("--home", str(home), "add", "verify show command", env=env)
+    assert added.returncode == 0
+    shown = _run_cli("--home", str(home), "show", "1", env=env)
+    assert shown.returncode == 0
+    assert shown.stdout.startswith("#1 verify show command\n")
+    assert (home / "cadence.db").exists()
+
+
 def test_cli_show_subtask_names_its_parent(tmp_path):
     env = _cli_env(tmp_path)
     _run_cli("add", "Plan the party", env=env)

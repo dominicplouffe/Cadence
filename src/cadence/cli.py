@@ -7,7 +7,10 @@ who holds veto on this surface) -- diff against that doc before changing
 any wording here; do not restate it from memory.
 
 Usage:
-    cadence add "Buy milk" [--due 2026-09-01] [--priority high|med|low]
+    cadence [--home DIR] add "Buy milk" [--due 2026-09-01] [--priority high|med|low]
+                                     # --home DIR: use DIR as CADENCE_HOME for
+                                     # this command only (any subcommand can
+                                     # take it); same as setting $CADENCE_HOME
     cadence list
     cadence register                # add this project's store to ~/.config/cadence/projects.txt
     cadence overdue [--all-projects]
@@ -917,6 +920,15 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"cadence {_cadence_version()}",
         help="Print the installed Cadence version and exit.",
     )
+    parser.add_argument(
+        "--home",
+        help=(
+            "Use this directory as CADENCE_HOME for this command only (tasks "
+            "and git history live under it), instead of ~/.cadence or "
+            "$CADENCE_HOME. Same effect as setting CADENCE_HOME yourself; "
+            "handy for a one-off scratch run without touching your real data."
+        ),
+    )
     sub = parser.add_subparsers(dest="cmd")
 
     p_add = sub.add_parser("add", help='Add a task. Example: cadence add "Buy milk"')
@@ -1084,6 +1096,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "home", None):
+        # CADENCE_DB_PATH (if set) still wins inside default_db_path() --
+        # --home only fills in CADENCE_HOME, the same override store.py
+        # already reads directly, so every module that derives a path from
+        # it (store.py, history.py, registry.py) sees one consistent home
+        # for this process without each needing its own --home plumbing.
+        os.environ["CADENCE_HOME"] = args.home
     if not hasattr(args, "func"):
         parser.print_help()
         return 1
