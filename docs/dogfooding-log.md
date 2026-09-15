@@ -5137,3 +5137,76 @@ week") would hit.
 Net for today: clean pass. No new correctness defect. Two low-severity
 wording/legibility nits noted above, neither blocking. #3 (Day 2) is
 done; #4 remains open, due 2026-09-15, to close R-07 in-app on day 3.
+
+## 2026-09-15 (Vera Sandoval, CEO) — week-3 dogfooding, day 3: closes R-07
+
+First real use of an upgrade in place: the live store at
+`/workspace/company_queue` was still on cadence-todo 0.2.39 (no
+`--home` flag, no `show` command). Upgraded it live from PyPI —
+`pip install --upgrade cadence-todo==0.2.41` into the same venv, no
+repo checkout involved — and picked back up against the real data,
+same `cadence.db`, same task ids, nothing lost:
+
+```
+$ cadence show 4
+#4 Day 3 (09-15): write dated log entry, close R-07
+  status:    pending
+  priority:  high
+  due:       (none)
+  parent:    #1 (R-07: log week-3 dogfooding friction daily in
+             docs/dogfooding-log.md (09-11 onward))
+
+$ cadence why 4
+#4 ... — history (newest first):
+  -  high     2d ago   Reprioritised (low → high) "on reflection,
+                        closes R-07, keep visible" — you, via CLI
+  -  low      2d ago   Reprioritised (high → low) "closes R-07, but
+                        due 09-15 not urgent yet" — you, via CLI
+  -  high     2d ago   Reprioritised (none → high)
+  -  none     3d ago   Created as subtask of #1
+
+$ cadence done 4 --reason "day-3 dated entry written, closes R-07's week-3 daily-log subtask"
+usage: cadence [-h] [--version] [--home HOME]
+               {add,list,register,overdue,done,schedule,decompose,
+                reprioritise,show,why,undo,sync,export,mcp} ...
+cadence: error: unrecognized arguments: --reason day-3 dated entry
+written, closes R-07's week-3 daily-log subtask
+
+$ cadence done 4
+Done #4: Day 3 (09-15): write dated log entry, close R-07
+
+$ cadence show 1
+#1 R-07: log week-3 dogfooding friction daily in docs/dogfooding-log.md
+   (09-11 onward)
+  status:    pending
+  subtasks:  #2 (done), #3 (done), #4 (done)
+
+$ cadence overdue
+No overdue tasks.
+
+$ cadence done 1
+Done #1: R-07: log week-3 dogfooding friction daily in
+docs/dogfooding-log.md (09-11 onward)
+```
+
+One real defect surfaced by real use, not synthetic: `done` has no
+`--reason` flag — `reprioritise` and `schedule` both take one, `done`
+silently rejects it as an unrecognized argument instead of accepting
+it or explaining that this command has no reason field. An agent
+scripting "complete this and say why" the way it would for
+`reprioritise` hits an error it has to guess the cause of. Filed as a
+MEDIUM legibility gap for Build: either add `--reason` to `done` (a
+completion is exactly the kind of change worth a reason on) or make
+the "this command takes no reason" case a clear error rather than
+argparse's generic "unrecognized arguments".
+
+That's the third and closing dated entry for week 3 (09-11, 09-12,
+09-15), each written the day the real use happened, against the
+company's own live queue rather than a scratch one — the pattern
+`docs/dogfooding-log.md` describes for R-07. #1 and all three of its
+subtasks are now closed in the app itself, mirroring the platform
+task board where R-07 is the one open item and every other
+requirement (R-01–R-06, R-08) is already met. This closes R-07's
+acceptance test: three dated entries between 09-11 and 09-18, each
+naming friction from running the company's own queue in the app, with
+the app itself (not an external tracker) as the record.
